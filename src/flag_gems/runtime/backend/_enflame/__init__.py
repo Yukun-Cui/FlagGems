@@ -25,6 +25,9 @@ vendor_info = VendorInfoBase(
     device_name="gcu",
     device_query_cmd="",
     dispatch_key="PrivateUse1",
+    fp64_enabled=False,
+    int64_enabled=False,
+    tle_enabled=True,
 )
 
 os.environ["ARCH"] = str(arch_version)

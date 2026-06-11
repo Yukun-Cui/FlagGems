@@ -4,6 +4,7 @@ vendor_info = VendorInfoBase(
     vendor_name="nvidia",
     device_name="cuda",
     device_query_cmd="",
+    tle_enabled=True,
 )
 
 ARCH_MAP = {
