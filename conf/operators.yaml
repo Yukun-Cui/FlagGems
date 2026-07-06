@@ -8242,6 +8242,17 @@ ops:
       - Math
     stages:
       - stable: '2.1'
+  - id: unbind
+    description: Removes a tensor dimension and returns a tuple of all slices along that dimension.
+    for:
+      - unbind.int
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Tensor
+    stages:
+      - alpha: '5.1'
   - id: unbind_copy
     description: Removes a tensor dimension and returns a tuple of all slices along a given dimension as copies.
     for:
