@@ -5354,7 +5354,7 @@ ops:
     kind:
       - Tensor
     stages:
-      - alpha: '5.1'
+      - alpha: '5.4'
   - id: narrow_copy
     description: Triton kernel implementation for narrow_copy.
     for:
