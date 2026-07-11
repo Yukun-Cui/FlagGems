@@ -38,6 +38,8 @@ def test_unbind(shape, dim, dtype):
 
     for res, ref in zip(res_out, ref_out):
         utils.gems_assert_equal(res, ref)
+        # unbind is a view op: every slice must share storage with the input.
+        assert res.untyped_storage().data_ptr() == inp.untyped_storage().data_ptr()
 
 
 @pytest.mark.unbind

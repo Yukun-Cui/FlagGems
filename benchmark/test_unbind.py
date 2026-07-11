@@ -1,39 +1,31 @@
 import pytest
 import torch
 
-from flag_gems.utils import shape_utils
-
 from . import base, consts
 
+UNBIND_SHAPES = [
+    (2, 3),
+    (4, 8),
+    (16, 32),
+    (4, 8, 16),
+    (32, 64, 128),
+    (2, 4, 8, 16),
+]
 
-class UnbindBenchmark(base.GenericBenchmark):
-    """Benchmark for unbind operator.
-    Overrides set_shapes to use shapes suitable for unbind operations."""
+
+class UnbindBenchmark(base.Benchmark):
+    """Benchmark for unbind operation (zero-copy view)."""
+
+    DEFAULT_SHAPE_DESC = "input shape"
 
     def set_shapes(self, shape_file_path=None):
-        UNBIND_SHAPES = (
-            (2, 3),
-            (4, 8),
-            (16, 32),
-            (4, 8, 16),
-            (32, 64, 128),
-            (2, 4, 8, 16),
-        )
         self.shapes = UNBIND_SHAPES
 
-    def set_more_metrics(self):
-        return ["gbps"]
-
-    def get_gbps(self, bench_fn_args, latency):
-        inp = bench_fn_args[0]
-        io_amount = shape_utils.size_in_bytes(inp) * 2
-        return io_amount * 1e-9 / (latency * 1e-3)
-
-
-def _input_fn(shape, dtype, device):
-    inp = torch.randn(shape, dtype=dtype, device=device)
-    dim = 0
-    yield inp, dim
+    def get_input_iter(self, dtype):
+        for shape in self.shapes:
+            inp = torch.randn(shape, dtype=dtype, device=self.device)
+            dim = 0
+            yield inp, dim
 
 
 @pytest.mark.unbind
@@ -41,7 +33,6 @@ def test_unbind():
     bench = UnbindBenchmark(
         op_name="unbind",
         torch_op=torch.unbind,
-        input_fn=_input_fn,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
