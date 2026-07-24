@@ -4765,18 +4765,6 @@ ops:
       - LinearAlg
     stages:
       - alpha: '5.4'
-  - id: linalg_svd
-    description: Computes the singular value decomposition (SVD) of a matrix.
-    for:
-      - linalg_svd
-    labels:
-      - aten
-      - KernelGen
-    kind:
-      - BLAS
-    stages:
-      - alpha: '5.4'
-  - id: linear
   - id: linalg_ldl_factor_ex
     description: |
       Computes the LDL factorization with pivot information for a symmetric or Hermitian matrix.
@@ -4799,6 +4787,17 @@ ops:
       - KernelGen
     kind:
       - LinearAlg
+    stages:
+      - alpha: '5.4'
+  - id: linalg_svd
+    description: Computes the singular value decomposition (SVD) of a matrix.
+    for:
+      - linalg_svd
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - BLAS
     stages:
       - alpha: '5.4'
   - id: linalg_svdvals
