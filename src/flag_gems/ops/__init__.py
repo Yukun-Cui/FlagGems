@@ -326,11 +326,11 @@ from flag_gems.ops.index_select_backward import index_select_backward
 from flag_gems.ops.is_nonzero import is_nonzero
 from flag_gems.ops.isclose import allclose, isclose
 from flag_gems.ops.isfinite import isfinite
-from flag_gems.ops.istft import istft
 from flag_gems.ops.isin import isin
 from flag_gems.ops.isinf import isinf
 from flag_gems.ops.isnan import isnan
 from flag_gems.ops.isneginf import isneginf, isneginf_out
+from flag_gems.ops.istft import istft
 from flag_gems.ops.kron import kron
 from flag_gems.ops.kthvalue import kthvalue
 from flag_gems.ops.layernorm import layer_norm, layer_norm_backward
@@ -1033,12 +1033,12 @@ __all__ = [
     "is_nonzero",
     "isclose",
     "isfinite",
-    "istft",
     "isin",
     "isinf",
     "isnan",
     "isneginf",
     "isneginf_out",
+    "istft",
     "kron",
     "kthvalue",
     "layer_norm",
