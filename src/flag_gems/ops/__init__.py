@@ -22,6 +22,7 @@ from flag_gems.ops.__xor__ import (  # noqa: F401
     xor_scalar_,
     xor_scalar_tensor,
 )
+from flag_gems.ops._adaptive_avg_pool2d_backward import _adaptive_avg_pool2d_backward
 from flag_gems.ops._add_relu import _add_relu
 from flag_gems.ops._amp_foreach_non_finite_check_and_unscale_ import (
     _amp_foreach_non_finite_check_and_unscale_,
@@ -81,10 +82,6 @@ from flag_gems.ops.absolute import absolute
 from flag_gems.ops.acos import acos
 from flag_gems.ops.acosh import acosh, acosh_
 from flag_gems.ops.adaptive_avg_pool2d import adaptive_avg_pool2d
-from flag_gems.ops._adaptive_avg_pool2d_backward import (
-    _adaptive_avg_pool2d_backward,
-    _adaptive_avg_pool2d_backward_out,
-)
 from flag_gems.ops.adaptive_max_pool3d_backward import adaptive_max_pool3d_backward
 from flag_gems.ops.add import add, add_
 from flag_gems.ops.addcdiv import addcdiv, addcdiv_, addcdiv_out
@@ -686,6 +683,7 @@ __all__ = [
     "__ilshift__",
     "__irshift__",
     "__lshift__",
+    "_adaptive_avg_pool2d_backward",
     "_add_relu",
     "_amp_foreach_non_finite_check_and_unscale_",
     "_assert_async",
@@ -737,8 +735,6 @@ __all__ = [
     "acosh",
     "acosh_",
     "adaptive_avg_pool2d",
-    "_adaptive_avg_pool2d_backward",
-    "_adaptive_avg_pool2d_backward_out",
     "adaptive_max_pool3d_backward",
     "add",
     "add_",
