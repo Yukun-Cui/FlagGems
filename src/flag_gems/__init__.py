@@ -479,6 +479,7 @@ _FULL_CONFIG = (
     ("is_nonzero", is_nonzero),
     ("isclose", isclose),
     ("isfinite", isfinite),
+    ("istft", istft),
     ("isin.Scalar_Tensor", isin),
     ("isin.Tensor_Scalar", isin),
     ("isin.Tensor_Tensor", isin),
