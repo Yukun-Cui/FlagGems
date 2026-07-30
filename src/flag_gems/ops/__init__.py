@@ -69,6 +69,7 @@ from flag_gems.ops._unsafe_masked_index_put_accumulate import (
     _unsafe_masked_index_put_accumulate,
 )
 from flag_gems.ops._unsafe_view import _unsafe_view
+from flag_gems.ops._weight_norm import _weight_norm
 from flag_gems.ops._upsample_bilinear2d_aa import _upsample_bilinear2d_aa
 from flag_gems.ops._upsample_nearest_exact1d import _upsample_nearest_exact1d
 from flag_gems.ops._upsample_nearest_exact2d import _upsample_nearest_exact2d
@@ -719,6 +720,7 @@ __all__ = [
     "_unsafe_masked_index",
     "_unsafe_masked_index_put_accumulate",
     "_unsafe_view",
+    "_weight_norm",
     "_upsample_bicubic2d_aa",
     "_upsample_bicubic2d_aa_backward",
     "_upsample_bilinear2d_aa",
