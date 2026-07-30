@@ -693,6 +693,11 @@ _FULL_CONFIG = (
     ("replication_pad1d", replication_pad1d),
     ("replication_pad1d.out", replication_pad1d_out),
     ("replication_pad3d", replication_pad3d),
+    ("replication_pad3d_backward", replication_pad3d_backward),
+    (
+        "replication_pad3d_backward.grad_input",
+        replication_pad3d_backward_grad_input,
+    ),
     ("resize", resize),
     ("resize_", resize_),
     ("resize_as", resize_as),
