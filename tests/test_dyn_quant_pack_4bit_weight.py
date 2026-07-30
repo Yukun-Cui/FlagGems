@@ -1,48 +1,69 @@
 # Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import pytest
 import torch
 
 import flag_gems
 
+from . import accuracy_utils as utils
 
+
+@pytest.mark.dyn_quant_pack_4bit_weight
+# Covers a single full-width block and multiple 32-element quantization groups.
 @pytest.mark.parametrize(
-    "block_size, in_features, out_features", [(64, 64, 8), (32, 128, 4)]
+    "block_size,in_features,out_features", [(64, 64, 8), (32, 128, 4)]
 )
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_dyn_quant_pack_4bit_weight(block_size, in_features, out_features, with_bias):
+# The packed scale/zero and output representation is float32.
+@pytest.mark.parametrize("scale_dtype", [torch.float32])
+def test_dyn_quant_pack_4bit_weight(
+    block_size, in_features, out_features, with_bias, scale_dtype
+):
     weights_cpu = torch.randint(
-        0, 256, (out_features, in_features // 2), dtype=torch.uint8
+        0,
+        256,
+        (out_features, in_features // 2),
+        dtype=torch.uint8,
     )
     groups = in_features // block_size
-    scales_cpu = torch.randn((out_features, groups), dtype=torch.float32)
-    bias_cpu = torch.randn(out_features) if with_bias else None
+    scales_cpu = torch.randn((out_features, groups), dtype=scale_dtype)
+    bias_cpu = torch.randn(out_features, dtype=scale_dtype) if with_bias else None
     expected = torch.ops.aten._dyn_quant_pack_4bit_weight(
-        weights_cpu,
-        scales_cpu,
-        bias_cpu,
+        utils.to_reference(weights_cpu),
+        utils.to_reference(scales_cpu),
+        utils.to_reference(bias_cpu),
         block_size,
         in_features,
         out_features,
-    )
+    ).to(flag_gems.device)
+    weights = weights_cpu.to(flag_gems.device)
+    scales = scales_cpu.to(flag_gems.device)
+    bias = None if bias_cpu is None else bias_cpu.to(flag_gems.device)
 
-    weights = weights_cpu.cuda()
-    scales = scales_cpu.cuda()
-    bias = None if bias_cpu is None else bias_cpu.cuda()
-    with flag_gems.use_gems(include=["_dyn_quant_pack_4bit_weight"]):
+    with flag_gems.use_gems():
         actual = torch.ops.aten._dyn_quant_pack_4bit_weight(
             weights, scales, bias, block_size, in_features, out_features
         )
 
     assert actual.dtype == torch.float32
-    torch.testing.assert_close(actual.cpu(), expected)
+    utils.gems_assert_close(actual, expected, torch.float32)
 
 
+@pytest.mark.dyn_quant_pack_4bit_weight
 def test_dyn_quant_pack_4bit_weight_rejects_float_weights():
-    weights = torch.randn((4, 32), device="cuda")
-    scales = torch.randn((4, 1), device="cuda")
-    with (
-        flag_gems.use_gems(include=["_dyn_quant_pack_4bit_weight"]),
-        pytest.raises(RuntimeError, match="uint8"),
-    ):
+    weights = torch.randn((4, 32), device=flag_gems.device)
+    scales = torch.randn((4, 1), device=flag_gems.device)
+    with flag_gems.use_gems(), pytest.raises(RuntimeError, match="uint8"):
         torch.ops.aten._dyn_quant_pack_4bit_weight(weights, scales, None, 64, 64, 4)
