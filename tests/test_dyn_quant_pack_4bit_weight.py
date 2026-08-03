@@ -40,6 +40,8 @@ def test_dyn_quant_pack_4bit_weight(
     groups = in_features // block_size
     scales_cpu = torch.randn((out_features, groups), dtype=scale_dtype)
     bias_cpu = torch.randn(out_features, dtype=scale_dtype) if with_bias else None
+    # Reference runs on the to_reference device (CPU under --ref=cpu), so the
+    # packed output stays there; do not force it onto flag_gems.device.
     expected = torch.ops.aten._dyn_quant_pack_4bit_weight(
         utils.to_reference(weights_cpu),
         utils.to_reference(scales_cpu),
@@ -47,7 +49,7 @@ def test_dyn_quant_pack_4bit_weight(
         block_size,
         in_features,
         out_features,
-    ).to(flag_gems.device)
+    )
     weights = weights_cpu.to(flag_gems.device)
     scales = scales_cpu.to(flag_gems.device)
     bias = None if bias_cpu is None else bias_cpu.to(flag_gems.device)
@@ -58,6 +60,11 @@ def test_dyn_quant_pack_4bit_weight(
         )
 
     assert actual.dtype == torch.float32
+    # Align devices with the quick-cpu reference convention (see test_addmm.py).
+    if utils.TO_CPU:
+        actual = actual.to("cpu")
+    else:
+        expected = expected.to(flag_gems.device)
     utils.gems_assert_close(actual, expected, torch.float32)
 
 
