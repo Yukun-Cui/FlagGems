@@ -486,7 +486,7 @@ _FULL_CONFIG = (
     ("isnan", isnan),
     ("isneginf", isneginf),
     ("isneginf.out", isneginf_out),
-    ("istft", istft),
+    ("istft", istft, None, (AUTOGRAD_DISPATCH_KEY,)),
     ("kron", kron),
     ("kthvalue", kthvalue),
     ("lcm", lcm),
