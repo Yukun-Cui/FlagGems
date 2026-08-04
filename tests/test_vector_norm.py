@@ -116,5 +116,5 @@ def test_accuracy_linalg_vector_norm_flatten(shape, dtype):
         res_out = torch.linalg.vector_norm(inp)
 
     utils.gems_assert_close(
-        res_out, ref_out, dtype, reduce_dim=_get_reduce_dim(shape)
+        res_out, ref_out, dtype, reduce_dim=_get_reduce_dim(shape, None)
     )
