@@ -87,8 +87,8 @@ _FULL_CONFIG = (
     ("_chunk_cat", _chunk_cat),
     ("_conj", _conj),
     ("_conv_depthwise2d", _conv_depthwise2d),
-    ("_dyn_quant_pack_4bit_weight", _dyn_quant_pack_4bit_weight),
     ("_convert_weight_to_int4pack", _convert_weight_to_int4pack),
+    ("_dyn_quant_pack_4bit_weight", _dyn_quant_pack_4bit_weight),
     ("_efficient_attention_backward", efficient_attention_backward),
     ("_embedding_bag_dense_backward", _embedding_bag_dense_backward),
     (
