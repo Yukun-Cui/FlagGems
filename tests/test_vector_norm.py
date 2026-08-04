@@ -94,12 +94,13 @@ def test_accuracy_linalg_vector_norm(shape, ord, dim, keepdim, dtype):
     inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp, True)
 
-    # Exercise the aten-facing entry point torch.linalg.vector_norm directly.
     ref_out = torch.linalg.vector_norm(ref_inp, ord, dim, keepdim)
     with flag_gems.use_gems():
         res_out = torch.linalg.vector_norm(inp, ord, dim, keepdim)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    utils.gems_assert_close(
+        res_out, ref_out, dtype, reduce_dim=_get_reduce_dim(shape, dim)
+    )
 
 
 @pytest.mark.linalg_vector_norm
@@ -114,4 +115,6 @@ def test_accuracy_linalg_vector_norm_flatten(shape, dtype):
     with flag_gems.use_gems():
         res_out = torch.linalg.vector_norm(inp)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    utils.gems_assert_close(
+        res_out, ref_out, dtype, reduce_dim=_get_reduce_dim(shape)
+    )
