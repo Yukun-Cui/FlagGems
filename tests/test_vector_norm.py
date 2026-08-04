@@ -69,7 +69,9 @@ def test_accuracy_vectornorm(shape, ord, dim, keepdim, dtype):
     with flag_gems.use_gems():
         res_out = torch.linalg.vector_norm(inp, ord, dim, keepdim)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    utils.gems_assert_close(
+        res_out, ref_out, dtype, reduce_dim=_get_reduce_dim(shape, dim)
+    )
 
 
 @pytest.mark.linalg_vector_norm
