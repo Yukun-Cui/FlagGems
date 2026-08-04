@@ -19,15 +19,17 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-# The Triton FFT implementation supports complex64 input and float32 output.
-ISTFT_DTYPES = [dtype for dtype in utils.COMPLEX_DTYPES if dtype == torch.complex64]
-ISTFT_REAL_DTYPES = [dtype for dtype in utils.FLOAT_DTYPES if dtype == torch.float32]
+# The Triton FFT implementation supports complex64 input and float32 output;
+# these dtypes are fixed and independent of the (mode-dependent) dtype lists in
+# accuracy_utils, so they are hard-coded rather than filtered from those lists.
+ISTFT_COMPLEX_DTYPE = torch.complex64
+ISTFT_REAL_DTYPE = torch.float32
 
 
 def _complex_randn(shape):
-    real = torch.randn(shape, device=flag_gems.device, dtype=ISTFT_REAL_DTYPES[0])
+    real = torch.randn(shape, device=flag_gems.device, dtype=ISTFT_REAL_DTYPE)
     imag = torch.randn_like(real)
-    return torch.complex(real, imag).to(ISTFT_DTYPES[0])
+    return torch.complex(real, imag).to(ISTFT_COMPLEX_DTYPE)
 
 
 @pytest.mark.istft
