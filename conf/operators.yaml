@@ -9921,7 +9921,7 @@ ops:
       - BLAS
     stages:
       - alpha: '5.3'
-  - id: weight_norm
+  - id: _weight_norm
     description: |
       Reparameterizes a module's weight tensor by decoupling its magnitude (g)
       from its direction (v). It is a hook that compute the actual weight before
@@ -9932,6 +9932,19 @@ ops:
       - aten
       - fused
       - KernelGen
+    kind:
+      - NeuralNetwork
+    stages:
+      - stable: '3.0'
+  - id: weight_norm
+    description: |
+      Reparameterizes a module's weight tensor by decoupling its magnitude (g)
+      from its direction (v). It is a hook that compute the actual weight before
+      each forward pass.
+    for:
+      - weight_norm
+    labels:
+      - fused
     kind:
       - NeuralNetwork
     stages:
