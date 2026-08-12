@@ -34,7 +34,7 @@ CHOLESKY_SOLVE_CASES = [((5, 3), (5, 5)), ((2, 5, 3), (2, 5, 5)), ((2, 5, 3), (5
 @pytest.mark.parametrize("rhs_shape,factor_shape", CHOLESKY_SOLVE_CASES)
 @pytest.mark.parametrize("upper", [False, True])
 # The generated Triton triangular solve currently supports float32 only.
-@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_cholesky_solve_helper(rhs_shape, factor_shape, upper, dtype):
     factor = _factor(factor_shape, dtype)
     if upper:
@@ -42,7 +42,7 @@ def test_cholesky_solve_helper(rhs_shape, factor_shape, upper, dtype):
     rhs = torch.randn(rhs_shape, device=flag_gems.device, dtype=dtype)
     ref_rhs = utils.to_reference(rhs)
     ref_factor = utils.to_reference(factor)
-    expected = torch.cholesky_solve(ref_rhs, ref_factor, upper=upper)
+    expected = torch.ops.aten._cholesky_solve_helper(ref_rhs, ref_factor, upper)
 
     with flag_gems.use_gems():
         actual = torch.ops.aten._cholesky_solve_helper(rhs, factor, upper)

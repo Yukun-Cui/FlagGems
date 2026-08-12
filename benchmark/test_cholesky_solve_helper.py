@@ -41,7 +41,7 @@ class CholeskySolveHelperBenchmark(base.Benchmark):
 def test_cholesky_solve_helper():
     bench = CholeskySolveHelperBenchmark(
         op_name="cholesky_solve_helper",
-        torch_op=torch.cholesky_solve,
+        torch_op=torch.ops.aten._cholesky_solve_helper,
         # CUDA Cholesky solve does not support Half/BFloat16.
         dtypes=[torch.float32],
     )
