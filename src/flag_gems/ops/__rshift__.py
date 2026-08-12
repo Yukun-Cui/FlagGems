@@ -43,3 +43,11 @@ def __rshift__(self: torch.Tensor, other, *, out=None) -> torch.Tensor:
         return kernel(self, other)
     kernel(self, other, out0=out)
     return out
+
+
+def __rshift___out(self: torch.Tensor, other, *, out) -> torch.Tensor:
+    """Apply arithmetic or logical right shift for tensor and scalar operands (out variant)."""
+    logger.debug("GEMS RSHIFT OUT")
+    kernel = _rshift_tensor_kernel if torch.is_tensor(other) else _rshift_scalar_kernel
+    kernel(self, other, out0=out)
+    return out

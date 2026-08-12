@@ -33,11 +33,52 @@ class RshiftBenchmark(base.Benchmark):
             yield value, shift
 
 
+class RshiftScalarBenchmark(base.Benchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [(1024,), (1024, 1024), (16, 512, 256)]
+        self.shape_desc = "SHAPE"
+
+    def get_input_iter(self, cur_dtype) -> Generator:
+        for shape in self.shapes:
+            value = torch.randint(0, 100, shape, dtype=cur_dtype, device=self.device)
+            yield value, 3
+
+
 @pytest.mark.rshift__
 def test_rshift__():
     bench = RshiftBenchmark(
         op_name="rshift__",
         torch_op=torch.ops.aten.__rshift__.Tensor,
+        dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
+    )
+    bench.run()
+
+
+@pytest.mark.rshift__
+def test_rshift__scalar():
+    bench = RshiftScalarBenchmark(
+        op_name="rshift__scalar",
+        torch_op=torch.ops.aten.__rshift__.Scalar,
+        dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
+    )
+    bench.run()
+
+
+@pytest.mark.rshift__
+def test_rshift__tensor_out():
+    bench = RshiftBenchmark(
+        op_name="rshift__tensor_out",
+        torch_op=torch.ops.aten.__rshift__.Tensor_out,
+        dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
+    )
+    bench.run()
+
+
+@pytest.mark.rshift__
+def test_rshift__scalar_out():
+    bench = RshiftScalarBenchmark(
+        op_name="rshift__scalar_out",
+        torch_op=torch.ops.aten.__rshift__.Scalar_out,
         dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
     )
     bench.run()
