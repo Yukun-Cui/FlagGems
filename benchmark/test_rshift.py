@@ -44,40 +44,40 @@ class RshiftScalarBenchmark(base.Benchmark):
             yield value, 3
 
 
-@pytest.mark.rshift__
-def test_rshift__():
+@pytest.mark.rshift
+def test_rshift():
     bench = RshiftBenchmark(
-        op_name="rshift__",
+        op_name="rshift",
         torch_op=torch.ops.aten.__rshift__.Tensor,
         dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
     )
     bench.run()
 
 
-@pytest.mark.rshift__
-def test_rshift__scalar():
+@pytest.mark.rshift
+def test_rshift_scalar():
     bench = RshiftScalarBenchmark(
-        op_name="rshift__scalar",
+        op_name="rshift_scalar",
         torch_op=torch.ops.aten.__rshift__.Scalar,
         dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
     )
     bench.run()
 
 
-@pytest.mark.rshift__
-def test_rshift__tensor_out():
+@pytest.mark.rshift
+def test_rshift_tensor_out():
     bench = RshiftBenchmark(
-        op_name="rshift__tensor_out",
+        op_name="rshift_tensor_out",
         torch_op=torch.ops.aten.__rshift__.Tensor_out,
         dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
     )
     bench.run()
 
 
-@pytest.mark.rshift__
-def test_rshift__scalar_out():
+@pytest.mark.rshift
+def test_rshift_scalar_out():
     bench = RshiftScalarBenchmark(
-        op_name="rshift__scalar_out",
+        op_name="rshift_scalar_out",
         torch_op=torch.ops.aten.__rshift__.Scalar_out,
         dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
     )
