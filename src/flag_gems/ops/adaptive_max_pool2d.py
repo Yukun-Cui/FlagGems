@@ -152,12 +152,6 @@ def adaptive_max_pool2d(
 
     in_n, in_c, in_h, in_w = input.shape
 
-    # Handle None output_size (means same as input)
-    if out_h is None:
-        out_h = in_h
-    if out_w is None:
-        out_w = in_w
-
     output = torch.empty(
         (in_n, in_c, out_h, out_w), device=input.device, dtype=input.dtype
     )
