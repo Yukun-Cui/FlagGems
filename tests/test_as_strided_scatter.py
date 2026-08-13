@@ -58,9 +58,9 @@ def test_as_strided_scatter_preserves_storage_geometry():
     base = torch.arange(20, device=flag_gems.device, dtype=torch.float32)
     inp = base[3:15]
     src = torch.tensor([91.0, 92.0, 93.0], device=flag_gems.device)
-    expected = torch.ops.aten.as_strided_scatter(
-        utils.to_reference(inp), utils.to_reference(src), (3,), (2,), None
-    )
+    # Don't use to_reference() here because it would lose the storage_offset
+    # when moving inp (a slice view with offset=3) to CPU.
+    expected = torch.ops.aten.as_strided_scatter(inp, src, (3,), (2,), None)
 
     with flag_gems.use_gems():
         actual = torch.ops.aten.as_strided_scatter(inp, src, (3,), (2,), None)
@@ -68,6 +68,10 @@ def test_as_strided_scatter_preserves_storage_geometry():
     assert actual.stride() == expected.stride()
     assert actual.storage_offset() == expected.storage_offset()
     assert actual.untyped_storage().nbytes() == expected.untyped_storage().nbytes()
+    # Manual device conversion to preserve storage geometry
+    if utils.TO_CPU:
+        actual = actual.to("cpu")
+        expected = expected.to("cpu")
     utils.gems_assert_close(actual, expected, torch.float32)
 
 
@@ -75,10 +79,14 @@ def test_as_strided_scatter_preserves_storage_geometry():
 def test_as_strided_scatter_noncontiguous_self():
     inp = torch.randn((5, 7), device=flag_gems.device).mT
     src = torch.randn((2, 2), device=flag_gems.device)
-    expected = torch.ops.aten.as_strided_scatter(
-        utils.to_reference(inp), utils.to_reference(src), (2, 2), (1, 5), None
-    )
+    # Don't use to_reference() here because it would lose the non-contiguous
+    # stride pattern when moving inp to CPU.
+    expected = torch.ops.aten.as_strided_scatter(inp, src, (2, 2), (1, 5), None)
     with flag_gems.use_gems():
         actual = torch.ops.aten.as_strided_scatter(inp, src, (2, 2), (1, 5), None)
     assert actual.stride() == expected.stride()
+    # Manual device conversion to preserve stride pattern
+    if utils.TO_CPU:
+        actual = actual.to("cpu")
+        expected = expected.to("cpu")
     utils.gems_assert_close(actual, expected, torch.float32)
