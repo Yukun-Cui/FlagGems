@@ -135,9 +135,7 @@ def as_strided_scatter(
         stride[i] == math.prod(size[i + 1 :]) for i in range(len(size))
     )
     covers_storage = (
-        target_offset == 0
-        and expected_numel == storage_numel
-        and is_contiguous_view
+        target_offset == 0 and expected_numel == storage_numel and is_contiguous_view
     )
 
     # A 1024-element tile for better parallelism and reduced launch overhead.
