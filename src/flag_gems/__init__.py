@@ -126,6 +126,7 @@ _FULL_CONFIG = (
     ("_fused_adam", _fused_adam),
     ("_fused_adam_", _fused_adam_),
     ("_fused_rms_norm", _fused_rms_norm),
+    ("_fused_rms_norm_backward", _fused_rms_norm_backward),
     ("_grouped_mm", group_mm),
     (
         "_has_compatible_shallow_copy_type",
