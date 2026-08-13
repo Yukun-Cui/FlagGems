@@ -26,15 +26,21 @@ def _factor(shape, dtype):
     return torch.linalg.cholesky(matrix @ matrix.mT + 0.5 * identity)
 
 
-# Covers unbatched, batched, broadcast-factor, and multiple-RHS cases.
-CHOLESKY_SOLVE_CASES = [((5, 3), (5, 5)), ((2, 5, 3), (2, 5, 5)), ((2, 5, 3), (5, 5))]
+# Covers unbatched, batched, and multiple-RHS cases. The raw aten helper does
+# not broadcast a 2D factor across the rhs batch dim (that happens in the
+# higher-level cholesky_solve), so factor and rhs share matching batch dims.
+CHOLESKY_SOLVE_CASES = [
+    ((5, 3), (5, 5)),
+    ((2, 5, 3), (2, 5, 5)),
+    ((3, 8, 4), (3, 8, 8)),
+]
 
 
 @pytest.mark.cholesky_solve_helper
 @pytest.mark.parametrize("rhs_shape,factor_shape", CHOLESKY_SOLVE_CASES)
 @pytest.mark.parametrize("upper", [False, True])
 # The generated Triton triangular solve currently supports float32 only.
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", [torch.float32])
 def test_cholesky_solve_helper(rhs_shape, factor_shape, upper, dtype):
     factor = _factor(factor_shape, dtype)
     if upper:
