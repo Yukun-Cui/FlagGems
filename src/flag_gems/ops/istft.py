@@ -28,6 +28,43 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
+def _prepare_spectrum_kernel_complex(
+    input_ptr,  # complex tensor stored as interleaved [real, imag, real, imag, ...]
+    spectrum_real,
+    spectrum_imag_conj,
+    n_freq,
+    n_frames,
+    N_FFT: tl.constexpr,
+    ONESIDED: tl.constexpr,
+):
+    """Optimized version that reads complex tensor directly without contiguous() copy."""
+    row = tl.program_id(0)
+    batch = row // n_frames
+    frame = row % n_frames
+    freq = tl.arange(0, N_FFT)
+
+    if ONESIDED:
+        mirrored = freq >= n_freq
+        source_freq = tl.where(mirrored, N_FFT - freq, freq)
+    else:
+        mirrored = tl.full(freq.shape, False, tl.int1)
+        source_freq = freq
+
+    # Complex tensor layout: [real0, imag0, real1, imag1, ...]
+    # Each complex element takes 2 float32 slots
+    source = ((batch * n_freq + source_freq) * n_frames + frame) * 2
+    real = tl.load(input_ptr + source)
+    imag = tl.load(input_ptr + source + 1)
+    full_imag = tl.where(mirrored, -imag, imag)
+
+    destination = row * N_FFT + freq
+    tl.store(spectrum_real + destination, real)
+    # IFFT(x) = conj(FFT(conj(x))) / N.  Store conj(x) directly so the
+    # following FFT does not need an extra elementwise kernel.
+    tl.store(spectrum_imag_conj + destination, -full_imag)
+
+
+@triton.jit
 def _prepare_spectrum_kernel(
     input_real,
     input_imag,
@@ -60,6 +97,49 @@ def _prepare_spectrum_kernel(
     # IFFT(x) = conj(FFT(conj(x))) / N.  Store conj(x) directly so the
     # following FFT does not need an extra elementwise kernel.
     tl.store(spectrum_imag_conj + destination, -full_imag)
+
+
+@triton.jit
+def _overlap_add_kernel_complex(
+    fft_ptr,  # complex tensor stored as interleaved [real, imag, real, imag, ...]
+    window,
+    output_real,
+    output_imag,
+    envelope,
+    n_frames,
+    full_length,
+    hop_length,
+    inverse_scale,
+    N_FFT: tl.constexpr,
+    RETURN_COMPLEX: tl.constexpr,
+):
+    """Optimized version that reads complex FFT output directly without contiguous() copy."""
+    row = tl.program_id(0)
+    batch = row // n_frames
+    frame = row % n_frames
+    offset = tl.arange(0, N_FFT)
+    output_offset = frame * hop_length + offset
+    mask = output_offset < full_length
+
+    window_value = tl.load(window + offset)
+    # Complex tensor layout: [real0, imag0, real1, imag1, ...]
+    frame_offset = (row * N_FFT + offset) * 2
+    real = tl.load(fft_ptr + frame_offset) * window_value * inverse_scale
+    output_offset_batched = batch * full_length + output_offset
+    tl.atomic_add(output_real + output_offset_batched, real, mask=mask)
+
+    if RETURN_COMPLEX:
+        imag = -tl.load(fft_ptr + frame_offset + 1) * window_value * inverse_scale
+        tl.atomic_add(output_imag + output_offset_batched, imag, mask=mask)
+
+    # The window is shared by all batches, so a single batch constructs the
+    # normalization envelope.
+    envelope_mask = mask & (batch == 0)
+    tl.atomic_add(
+        envelope + output_offset,
+        window_value * window_value,
+        mask=envelope_mask,
+    )
 
 
 @triton.jit
@@ -227,17 +307,17 @@ def istft(
             window, (left_padding, right_padding)
         ).contiguous()
 
-    input_real = self.real.contiguous()
-    input_imag = self.imag.contiguous()
+    # Use optimized complex kernel to avoid contiguous() copy
+    # Pass the underlying float32 view of complex tensor
+    input_as_float = self.view(torch.float32)
     spectrum_real = torch.empty(
         (n_rows, n_fft), dtype=torch.float32, device=self.device
     )
     spectrum_imag_conj = torch.empty_like(spectrum_real)
 
     with torch_device_fn.device(self.device):
-        _prepare_spectrum_kernel[(n_rows,)](
-            input_real,
-            input_imag,
+        _prepare_spectrum_kernel_complex[(n_rows,)](
+            input_as_float,  # Pass as float32 view
             spectrum_real,
             spectrum_imag_conj,
             n_freq,
@@ -248,8 +328,9 @@ def istft(
         )
 
     transformed = _fft(torch.complex(spectrum_real, spectrum_imag_conj))
-    transformed_real = transformed.real.contiguous()
-    transformed_imag = transformed.imag.contiguous()
+    # Use optimized complex kernel to avoid contiguous() copy
+    # Pass the underlying float32 view of complex tensor
+    transformed_as_float = transformed.view(torch.float32)
     inverse_scale = math.sqrt(n_fft) / n_fft if normalized else 1.0 / n_fft
     overlap_real = torch.zeros(
         (batch_size, full_length), dtype=torch.float32, device=self.device
@@ -258,9 +339,8 @@ def istft(
     envelope = torch.zeros(full_length, dtype=torch.float32, device=self.device)
 
     with torch_device_fn.device(self.device):
-        _overlap_add_kernel[(n_rows,)](
-            transformed_real,
-            transformed_imag,
+        _overlap_add_kernel_complex[(n_rows,)](
+            transformed_as_float,  # Pass as float32 view
             padded_window,
             overlap_real,
             overlap_imag,
