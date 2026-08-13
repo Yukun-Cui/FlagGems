@@ -44,6 +44,35 @@ class RshiftScalarBenchmark(base.Benchmark):
             yield value, 3
 
 
+class RshiftOutBenchmark(base.Benchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [(1024,), (1024, 1024), (16, 512, 256)]
+        self.shape_desc = "SHAPE"
+
+    def get_input_iter(self, cur_dtype) -> Generator:
+        # The ``.Tensor_out`` overload requires the ``out`` tensor to be passed
+        # as a keyword argument; yield it as a dict so the benchmark harness
+        # forwards it via kwargs.
+        for shape in self.shapes:
+            value = torch.randint(0, 100, shape, dtype=cur_dtype, device=self.device)
+            shift = torch.randint(0, 8, shape, dtype=cur_dtype, device=self.device)
+            out = torch.empty_like(value)
+            yield value, shift, {"out": out}
+
+
+class RshiftScalarOutBenchmark(base.Benchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [(1024,), (1024, 1024), (16, 512, 256)]
+        self.shape_desc = "SHAPE"
+
+    def get_input_iter(self, cur_dtype) -> Generator:
+        # The ``.Scalar_out`` overload also requires the ``out`` keyword arg.
+        for shape in self.shapes:
+            value = torch.randint(0, 100, shape, dtype=cur_dtype, device=self.device)
+            out = torch.empty_like(value)
+            yield value, 3, {"out": out}
+
+
 @pytest.mark.rshift
 def test_rshift():
     bench = RshiftBenchmark(
@@ -66,7 +95,7 @@ def test_rshift_scalar():
 
 @pytest.mark.rshift
 def test_rshift_tensor_out():
-    bench = RshiftBenchmark(
+    bench = RshiftOutBenchmark(
         op_name="rshift_tensor_out",
         torch_op=torch.ops.aten.__rshift__.Tensor_out,
         dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
@@ -76,7 +105,7 @@ def test_rshift_tensor_out():
 
 @pytest.mark.rshift
 def test_rshift_scalar_out():
-    bench = RshiftScalarBenchmark(
+    bench = RshiftScalarOutBenchmark(
         op_name="rshift_scalar_out",
         torch_op=torch.ops.aten.__rshift__.Scalar_out,
         dtypes=consts.INT_DTYPES + consts.EXTRA_INT_DTYPES,
