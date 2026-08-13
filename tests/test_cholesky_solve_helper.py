@@ -39,8 +39,7 @@ CHOLESKY_SOLVE_CASES = [
 @pytest.mark.cholesky_solve_helper
 @pytest.mark.parametrize("rhs_shape,factor_shape", CHOLESKY_SOLVE_CASES)
 @pytest.mark.parametrize("upper", [False, True])
-# The generated Triton triangular solve currently supports float32 only.
-@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_cholesky_solve_helper(rhs_shape, factor_shape, upper, dtype):
     factor = _factor(factor_shape, dtype)
     if upper:

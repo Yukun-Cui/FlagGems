@@ -55,13 +55,13 @@ def _cholesky_solve_lower_kernel(
 
     # Forward substitution: factor @ y = b.
     for row in range(n):
-        acc = 0.0
+        diagonal = tl.load(factor_base + row * factor_stride_n + row)
+        acc = diagonal * 0.0
         for col in range(row):
             factor_value = tl.load(factor_base + row * factor_stride_n + col)
             y_value = tl.load(out_base + col * out_stride_n + rhs_idx * out_stride_rhs)
             acc += factor_value * y_value
         b_value = tl.load(b_base + row * b_stride_n + rhs_idx * b_stride_rhs)
-        diagonal = tl.load(factor_base + row * factor_stride_n + row)
         tl.store(
             out_base + row * out_stride_n + rhs_idx * out_stride_rhs,
             (b_value - acc) / diagonal,
@@ -70,13 +70,13 @@ def _cholesky_solve_lower_kernel(
     # Backward substitution: factor.T @ x = y.
     for row_offset in range(n):
         row = n - row_offset - 1
-        acc = 0.0
+        diagonal = tl.load(factor_base + row * factor_stride_n + row)
+        acc = diagonal * 0.0
         for col in range(row + 1, n):
             factor_value = tl.load(factor_base + col * factor_stride_n + row)
             x_value = tl.load(out_base + col * out_stride_n + rhs_idx * out_stride_rhs)
             acc += factor_value * x_value
         y_value = tl.load(out_base + row * out_stride_n + rhs_idx * out_stride_rhs)
-        diagonal = tl.load(factor_base + row * factor_stride_n + row)
         tl.store(
             out_base + row * out_stride_n + rhs_idx * out_stride_rhs,
             (y_value - acc) / diagonal,
@@ -112,13 +112,13 @@ def _cholesky_solve_upper_kernel(
 
     # Forward substitution: factor.T @ y = b.
     for row in range(n):
-        acc = 0.0
+        diagonal = tl.load(factor_base + row * factor_stride_n + row)
+        acc = diagonal * 0.0
         for col in range(row):
             factor_value = tl.load(factor_base + col * factor_stride_n + row)
             y_value = tl.load(out_base + col * out_stride_n + rhs_idx * out_stride_rhs)
             acc += factor_value * y_value
         b_value = tl.load(b_base + row * b_stride_n + rhs_idx * b_stride_rhs)
-        diagonal = tl.load(factor_base + row * factor_stride_n + row)
         tl.store(
             out_base + row * out_stride_n + rhs_idx * out_stride_rhs,
             (b_value - acc) / diagonal,
@@ -127,13 +127,13 @@ def _cholesky_solve_upper_kernel(
     # Backward substitution: factor @ x = y.
     for row_offset in range(n):
         row = n - row_offset - 1
-        acc = 0.0
+        diagonal = tl.load(factor_base + row * factor_stride_n + row)
+        acc = diagonal * 0.0
         for col in range(row + 1, n):
             factor_value = tl.load(factor_base + row * factor_stride_n + col)
             x_value = tl.load(out_base + col * out_stride_n + rhs_idx * out_stride_rhs)
             acc += factor_value * x_value
         y_value = tl.load(out_base + row * out_stride_n + rhs_idx * out_stride_rhs)
-        diagonal = tl.load(factor_base + row * factor_stride_n + row)
         tl.store(
             out_base + row * out_stride_n + rhs_idx * out_stride_rhs,
             (y_value - acc) / diagonal,
@@ -145,8 +145,10 @@ def _cholesky_solve_helper(
 ) -> torch.Tensor:
     """Solve a positive-definite system from its Cholesky factor."""
     logger.debug("GEMS _CHOLESKY_SOLVE_HELPER")
-    if self.dtype != torch.float32:
-        raise RuntimeError("_cholesky_solve_helper currently supports float32 only")
+    if self.dtype not in (torch.float32, torch.float64):
+        raise RuntimeError(
+            "_cholesky_solve_helper currently supports float32 and float64 only"
+        )
     if self.dtype != A.dtype or self.device != A.device:
         raise RuntimeError("self and A must have the same dtype and device")
     if self.ndim < 2 or A.ndim < 2 or A.shape[-1] != A.shape[-2]:
