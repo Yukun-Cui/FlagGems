@@ -38,8 +38,8 @@ def test_as_strided_scatter(dtype, size, stride, storage_offset, self_len):
     inp = torch.randn(self_len, device=flag_gems.device, dtype=dtype)
     src = torch.randn(size, device=flag_gems.device, dtype=dtype)
     expected = torch.ops.aten.as_strided_scatter(
-        utils.to_reference(inp),
-        utils.to_reference(src),
+        inp,
+        src,
         size,
         stride,
         storage_offset,
