@@ -572,7 +572,7 @@ _FULL_CONFIG = (
     ("isneginf", isneginf),
     ("isneginf.out", isneginf_out),
     ("isposinf", isposinf),
-    ("istft", istft, None, (AUTOGRAD_DISPATCH_KEY,)),
+    ("istft", istft),
     ("kron", kron),
     ("kthvalue", kthvalue),
     ("lcm", lcm),

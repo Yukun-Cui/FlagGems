@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
+import flag_gems
 from flag_gems.ops.fft import fft as _fft
 from flag_gems.runtime import torch_device_fn
 
@@ -229,8 +230,10 @@ def _validate_istft_arguments(
         raise RuntimeError("istft currently supports complex64 input only")
     if self.ndim not in (2, 3):
         raise RuntimeError("istft expected a 2D or 3D input tensor")
-    if not self.is_cuda:
-        raise RuntimeError("istft expected a CUDA input tensor")
+    if self.device.type != flag_gems.device:
+        raise RuntimeError(
+            f"istft expected input on {flag_gems.device}, but got {self.device.type}"
+        )
     if n_fft <= 0 or n_fft > 1024 or n_fft & (n_fft - 1):
         raise RuntimeError("n_fft must be a power of two no larger than 1024")
     if not 0 < hop_length <= win_length:
