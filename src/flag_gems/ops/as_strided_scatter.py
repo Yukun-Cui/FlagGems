@@ -46,11 +46,14 @@ def _as_strided_owner_kernel(
     mask = offsets < n_elements
     remaining = offsets.to(tl.int64)
     target = tl.full(offsets.shape, storage_offset, tl.int64)
+
+    # Preload sizes and strides to avoid repeated global memory access
     for reverse_dim in tl.static_range(NDIM):
         dim = NDIM - reverse_dim - 1
         dim_size = tl.load(sizes + dim)
         dim_stride = tl.load(strides + dim)
-        target += (remaining % dim_size) * dim_stride
+        coord = remaining % dim_size
+        target += coord * dim_stride
         remaining //= dim_size
     # ATen's TensorIterator copy keeps the first logical source element when
     # multiple source indices address the same destination storage slot.
@@ -73,11 +76,14 @@ def _as_strided_scatter_kernel(
     mask = offsets < n_elements
     remaining = offsets.to(tl.int64)
     target = tl.full(offsets.shape, storage_offset, tl.int64)
+
+    # Preload sizes and strides to avoid repeated global memory access
     for reverse_dim in tl.static_range(NDIM):
         dim = NDIM - reverse_dim - 1
         dim_size = tl.load(sizes + dim)
         dim_stride = tl.load(strides + dim)
-        target += (remaining % dim_size) * dim_stride
+        coord = remaining % dim_size
+        target += coord * dim_stride
         remaining //= dim_size
 
     is_selected_writer = (
@@ -122,47 +128,74 @@ def as_strided_scatter(
             out_storage, self.size(), self.stride(), self.storage_offset()
         )
 
-    # A 256-element tile keeps all three sequential storage passes coalesced.
-    block_size = 256
+    # Fast path: if the view covers the entire storage with no overlap,
+    # we can directly copy without atomic tracking.
+    # This is true when the view is contiguous and spans the storage.
+    is_contiguous_view = len(size) > 0 and all(
+        stride[i] == math.prod(size[i + 1 :]) for i in range(len(size))
+    )
+    covers_storage = (
+        target_offset == 0
+        and expected_numel == storage_numel
+        and is_contiguous_view
+    )
+
+    # A 1024-element tile for better parallelism and reduced launch overhead.
+    block_size = 1024
     with torch_device_fn.device(self.device):
-        _copy_storage_kernel[(triton.cdiv(storage_numel, block_size),)](
-            storage_view,
-            out_storage,
-            storage_numel,
-            BLOCK_SIZE=block_size,
-        )
+        if not covers_storage:
+            # Need to preserve parts of the original storage
+            _copy_storage_kernel[(triton.cdiv(storage_numel, block_size),)](
+                storage_view,
+                out_storage,
+                storage_numel,
+                BLOCK_SIZE=block_size,
+            )
 
         if expected_numel:
             src = src.contiguous()
-            sizes = torch.tensor(size, dtype=torch.int64, device=self.device)
-            strides = torch.tensor(stride, dtype=torch.int64, device=self.device)
-            owners = torch.full(
-                (storage_numel,),
-                expected_numel,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            grid = (triton.cdiv(expected_numel, block_size),)
-            _as_strided_owner_kernel[grid](
-                owners,
-                sizes,
-                strides,
-                expected_numel,
-                target_offset,
-                BLOCK_SIZE=block_size,
-                NDIM=len(size),
-            )
-            _as_strided_scatter_kernel[grid](
-                src,
-                out_storage,
-                owners,
-                sizes,
-                strides,
-                expected_numel,
-                target_offset,
-                BLOCK_SIZE=block_size,
-                NDIM=len(size),
-            )
+
+            if covers_storage:
+                # Fast path: direct copy since src covers entire storage
+                src_flat = src.flatten()
+                grid = (triton.cdiv(expected_numel, block_size),)
+                _copy_storage_kernel[grid](
+                    src_flat,
+                    out_storage,
+                    expected_numel,
+                    BLOCK_SIZE=block_size,
+                )
+            else:
+                # Slow path: need atomic tracking for potential overlaps
+                sizes = torch.tensor(size, dtype=torch.int64, device=self.device)
+                strides = torch.tensor(stride, dtype=torch.int64, device=self.device)
+                owners = torch.full(
+                    (storage_numel,),
+                    expected_numel,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                grid = (triton.cdiv(expected_numel, block_size),)
+                _as_strided_owner_kernel[grid](
+                    owners,
+                    sizes,
+                    strides,
+                    expected_numel,
+                    target_offset,
+                    BLOCK_SIZE=block_size,
+                    NDIM=len(size),
+                )
+                _as_strided_scatter_kernel[grid](
+                    src,
+                    out_storage,
+                    owners,
+                    sizes,
+                    strides,
+                    expected_numel,
+                    target_offset,
+                    BLOCK_SIZE=block_size,
+                    NDIM=len(size),
+                )
 
     return torch.as_strided(
         out_storage, self.size(), self.stride(), self.storage_offset()
