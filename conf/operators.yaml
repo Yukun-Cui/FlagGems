@@ -1768,6 +1768,13 @@ ops:
     description: Compute inverse of symmetric positive-definite matrix from Cholesky factor.
     for:
       - cholesky_inverse
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
   - id: cholesky_solve_helper
     description: |
       Solves a positive-definite linear system using its lower- or upper-triangular
@@ -1790,7 +1797,6 @@ ops:
       - KernelGen
     kind:
       - Math
-      - LinearAlg
     stages:
       - alpha: '5.4'
   - id: chunk_cat
