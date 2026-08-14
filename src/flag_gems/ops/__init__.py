@@ -27,6 +27,9 @@ from flag_gems.ops._add_relu import _add_relu
 from flag_gems.ops._amp_foreach_non_finite_check_and_unscale_ import (
     _amp_foreach_non_finite_check_and_unscale_,
 )
+from flag_gems.ops._batch_norm_impl_index_backward import (
+    _batch_norm_impl_index_backward,
+)
 from flag_gems.ops._batch_norm_no_update import _batch_norm_no_update
 from flag_gems.ops._chunk_cat import chunk_cat as _chunk_cat
 from flag_gems.ops._conj import _conj
@@ -814,6 +817,7 @@ __all__ = [
     "_add_relu",
     "_amp_foreach_non_finite_check_and_unscale_",
     "_assert_async",
+    "_batch_norm_impl_index_backward",
     "_batch_norm_no_update",
     "_functional_assert_async",
     "_cdist_backward",
