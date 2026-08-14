@@ -96,6 +96,7 @@ _FULL_CONFIG = (
         "_amp_foreach_non_finite_check_and_unscale_",
         _amp_foreach_non_finite_check_and_unscale_,
     ),
+    ("_add_relu_.Tensor", _add_relu_),
     ("_assert_async", _assert_async),
     ("_batch_norm_no_update", _batch_norm_no_update),
     ("_functional_assert_async.msg", _functional_assert_async),
