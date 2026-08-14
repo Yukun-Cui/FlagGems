@@ -45,11 +45,13 @@ from .fill import (
 )
 from .gelu import gelu, gelu_
 from .hadamard_transform import hadamard_transform
+from .index_add import index_add, index_add_
 from .isin import isin
 from .matmul_bf16 import matmul_bf16
 from .matmul_int8 import matmul_int8
 from .mm import mm
 from .mul import mul, mul_
+from .nansum import nansum, nansum_out
 from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quant_fp8
 from .pow import (
     pow_scalar,
@@ -59,6 +61,10 @@ from .pow import (
     pow_tensor_tensor_,
 )
 from .randperm import randperm
+from .replication_pad2d_backward import (
+    replication_pad2d_backward,
+    replication_pad2d_backward_grad_input,
+)
 from .silu import silu, silu_, silu_backward
 from .sort import sort, sort_stable
 from .unique import _unique2
@@ -87,12 +93,16 @@ __all__ = [
     "gelu",
     "gelu_",
     "hadamard_transform",
+    "index_add",
+    "index_add_",
     "isin",
     "matmul_bf16",
     "matmul_int8",
     "mul",
     "mul_",
     "mm",
+    "nansum",
+    "nansum_out",
     "per_token_group_quant_fp8",
     "pow_scalar",
     "pow_tensor_scalar",
@@ -102,6 +112,8 @@ __all__ = [
     "randperm",
     "remainder",
     "remainder_",
+    "replication_pad2d_backward",
+    "replication_pad2d_backward_grad_input",
     "scaled_dot_product_attention",
     "scaled_dot_product_attention_backward",
     "scaled_dot_product_attention_forward",
