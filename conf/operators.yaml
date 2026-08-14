@@ -1038,6 +1038,20 @@ ops:
       - Tensor
     stages:
       - stable: '5.3'
+  - id: cslt_compress
+    description: |
+      Compresses a 2:4 structured-sparse matrix into a packed
+      (compressed-values | per-group 2:4 pattern metadata) representation suitable
+      for cuSPARSELt-style sparse matrix multiplication.
+    for:
+      - _cslt_compress
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Tensor
+    stages:
+      - beta: '5.0'
   - id: functional_assert_async
     description: |
       Functional version of _assert_async that takes a dependency token and returns a new token.
