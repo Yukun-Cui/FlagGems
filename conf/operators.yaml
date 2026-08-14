@@ -1038,6 +1038,22 @@ ops:
       - Tensor
     stages:
       - stable: '5.3'
+  - id: convolution_double_backward
+    description: |
+      Second-order backward of a 2D convolution: given the gradients of the
+      first-order gradients (ggI, ggW, ggb) and the output gradient (gO), returns
+      the gradients of the scalar `<gX, ggI> + <gW, ggW> + <gB, ggb>` with respect
+      to (gO, input, weight). Implemented with Triton conv / conv-transpose kernels
+      plus a custom Triton weight-gradient correlation kernel.
+    for:
+      - _convolution_double_backward
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Convolution
+    stages:
+      - alpha: '5.4'
   - id: functional_assert_async
     description: |
       Functional version of _assert_async that takes a dependency token and returns a new token.
