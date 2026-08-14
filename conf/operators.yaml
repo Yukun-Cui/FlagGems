@@ -1038,6 +1038,20 @@ ops:
       - Tensor
     stages:
       - stable: '5.3'
+  - id: cslt_sparse_mm_search
+    description: |
+      Searches for a cuSPARSELt matmul algorithm id for a 2:4 structured sparse
+      matrix multiplication and returns it as a Python int. The returned id can
+      be passed as `alg_id` to `torch._cslt_sparse_mm`.
+    for:
+      - _cslt_sparse_mm_search
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
   - id: functional_assert_async
     description: |
       Functional version of _assert_async that takes a dependency token and returns a new token.
