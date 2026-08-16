@@ -29,12 +29,12 @@ def test_conj_copy():
     bench.run()
 
 
-@pytest.mark.underscore_conj_copy_out
-def test__conj_copy_out():
+@pytest.mark.conj_copy_out
+def test_conj_copy_out():
     # _conj_copy.out variant writes the conjugated copy into the `out` tensor.
     bench = base.UnaryPointwiseOutBenchmark(
         op_name="_conj_copy_out",
-        torch_op=torch._conj_copy,
+        torch_op=torch._conj_copy.out,
         dtypes=consts.COMPLEX_DTYPES,
     )
     bench.run()
