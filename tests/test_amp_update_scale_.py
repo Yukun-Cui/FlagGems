@@ -104,16 +104,27 @@ def test_amp_update_scale__growth_walk():
     scale_val = 4.0
 
     def step(use_gems, scale, tracker):
-        found_inf = torch.tensor(0.0, device=flag_gems.device, dtype=torch.float32)
+        found_inf = torch.tensor(
+            0.0,
+            device=scale.device,
+            dtype=torch.float32,
+        )
         if use_gems:
             with flag_gems.use_gems():
                 torch._amp_update_scale_(scale, tracker, found_inf, 2.0, 0.5, interval)
         else:
             torch._amp_update_scale_(scale, tracker, found_inf, 2.0, 0.5, interval)
 
-    # Reference walk
-    ref_scale = torch.tensor(scale_val, device=flag_gems.device, dtype=torch.float32)
-    ref_tracker = torch.tensor(0, device=flag_gems.device, dtype=torch.int32)
+    # Reference walk.  ``to_reference`` moves the scalars to the CPU reference
+    # device under ``--ref=cpu`` so the subsequent ``gems_assert_equal`` ``to_cpu``
+    # contract (``ref`` already on CPU) holds; the PyTorch native update then runs
+    # on the CPU reference device while the GEMS walk stays on the GPU.
+    ref_scale = utils.to_reference(
+        torch.tensor(scale_val, device=flag_gems.device, dtype=torch.float32)
+    )
+    ref_tracker = utils.to_reference(
+        torch.tensor(0, device=flag_gems.device, dtype=torch.int32)
+    )
     for _ in range(interval):
         step(False, ref_scale, ref_tracker)
     # After `interval` no-inf steps the scale should have doubled once and the
@@ -136,14 +147,23 @@ def test_amp_update_scale__backoff_then_recover():
     """Backoff on an inf, then grow back over an interval."""
     interval = 2
 
-    # Reference
-    ref_scale = torch.tensor(8.0, device=flag_gems.device, dtype=torch.float32)
-    ref_tracker = torch.tensor(0, device=flag_gems.device, dtype=torch.int32)
+    # Reference.  ``to_reference`` moves the scalars to the CPU reference device
+    # under ``--ref=cpu`` so the ``gems_assert_equal`` ``to_cpu`` contract holds;
+    # the PyTorch native update then runs on the CPU reference device while the
+    # GEMS walk stays on the GPU.
+    ref_scale = utils.to_reference(
+        torch.tensor(8.0, device=flag_gems.device, dtype=torch.float32)
+    )
+    ref_tracker = utils.to_reference(
+        torch.tensor(0, device=flag_gems.device, dtype=torch.int32)
+    )
     # Step 1: inf found -> backoff to 4.0, tracker reset.
     torch._amp_update_scale_(
         ref_scale,
         ref_tracker,
-        torch.tensor(1.0, device=flag_gems.device, dtype=torch.float32),
+        utils.to_reference(
+            torch.tensor(1.0, device=flag_gems.device, dtype=torch.float32)
+        ),
         2.0,
         0.5,
         interval,
@@ -154,7 +174,9 @@ def test_amp_update_scale__backoff_then_recover():
         torch._amp_update_scale_(
             ref_scale,
             ref_tracker,
-            torch.tensor(0.0, device=flag_gems.device, dtype=torch.float32),
+            utils.to_reference(
+                torch.tensor(0.0, device=flag_gems.device, dtype=torch.float32)
+            ),
             2.0,
             0.5,
             interval,
@@ -193,11 +215,19 @@ def test_amp_update_scale__intervals(interval):
     """The scale grows exactly when the tracker is one below the interval."""
     # Tracker just below the interval -> grow.
     for tracker_val in (interval - 1, interval):
-        ref_scale = torch.tensor(100.0, device=flag_gems.device, dtype=torch.float32)
-        ref_tracker = torch.tensor(
-            tracker_val, device=flag_gems.device, dtype=torch.int32
+        # ``to_reference`` moves the scalars to the CPU reference device under
+        # ``--ref=cpu`` so the ``gems_assert_equal`` ``to_cpu`` contract holds;
+        # the PyTorch native update runs on the CPU reference device while the
+        # GEMS update stays on the GPU.
+        ref_scale = utils.to_reference(
+            torch.tensor(100.0, device=flag_gems.device, dtype=torch.float32)
         )
-        ref_found_inf = torch.tensor(0.0, device=flag_gems.device, dtype=torch.float32)
+        ref_tracker = utils.to_reference(
+            torch.tensor(tracker_val, device=flag_gems.device, dtype=torch.int32)
+        )
+        ref_found_inf = utils.to_reference(
+            torch.tensor(0.0, device=flag_gems.device, dtype=torch.float32)
+        )
         torch._amp_update_scale_(
             ref_scale, ref_tracker, ref_found_inf, 3.0, 0.25, interval
         )
