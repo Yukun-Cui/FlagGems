@@ -54,6 +54,9 @@ def test_coalesced_(nnd, nnz, size, coalesced, dtype):
     # the two in-place mutations don't alias each other.
     inp1 = _make_sparse_coo(nnd, nnz, size, dtype, flag_gems.device, seed=7)
     ref_inp1 = _make_sparse_coo(nnd, nnz, size, dtype, flag_gems.device, seed=7)
+    # Move the reference onto the configured reference device (CPU under
+    # quick-cpu mode) so ``gems_assert_close`` can compare across devices.
+    ref_inp1 = utils.to_reference(ref_inp1)
 
     ref_out = ref_inp1._coalesced_(coalesced)
     with flag_gems.use_gems():
@@ -77,6 +80,9 @@ def test_coalesced__toggle(nnd, nnz, size, dtype):
     # Setting then un-setting must leave the flag as the last value requested.
     inp1 = _make_sparse_coo(nnd, nnz, size, dtype, flag_gems.device, seed=11)
     ref_inp1 = _make_sparse_coo(nnd, nnz, size, dtype, flag_gems.device, seed=11)
+    # Move the reference onto the configured reference device (CPU under
+    # quick-cpu mode) so ``gems_assert_close`` can compare across devices.
+    ref_inp1 = utils.to_reference(ref_inp1)
 
     with flag_gems.use_gems():
         out1 = inp1._coalesced_(True)._coalesced_(False)._coalesced_(True)
