@@ -54,9 +54,9 @@ def test_compute_linear_combination():
 @pytest.mark.compute_linear_combination_out
 def test_compute_linear_combination_out():
     bench = ComputeLinearCombinationBenchmark(
-        op_name="_compute_linear_combination_out",
+        op_name="compute_linear_combination_out",
         input_fn=_input_fn_out,
-        torch_op=torch._compute_linear_combination.out,
+        torch_op=torch.ops.aten._compute_linear_combination.out,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()

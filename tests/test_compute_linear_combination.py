@@ -86,7 +86,11 @@ def test_compute_linear_combination_out(m, n, k, dtype):
     ref_inp = utils.to_reference(inp, True)
     ref_coeffs = utils.to_reference(coeffs, True)
 
-    ref_out = torch.ops.aten._compute_linear_combination.out(ref_inp, ref_coeffs)
+    # ``aten::_compute_linear_combination.out`` accumulates into ``out`` rather
+    # than overwriting it, so the reference buffer must be zero-initialised;
+    # ``torch.empty`` would leak stale values into the result.
+    ref_out = torch.zeros((m, k), dtype=ref_inp.dtype, device=ref_inp.device)
+    torch.ops.aten._compute_linear_combination.out(ref_inp, ref_coeffs, out=ref_out)
     out = torch.zeros((m, k), dtype=dtype, device=flag_gems.device)
     with flag_gems.use_gems():
         res_out = torch.ops.aten._compute_linear_combination.out(inp, coeffs, out=out)
