@@ -1038,23 +1038,6 @@ ops:
       - Tensor
     stages:
       - stable: '5.3'
-  - id: convolution_mode
-    description: |
-      Low-level dispatcher backing the string-padding form of convolution.
-      Given an input, a weight, an optional bias, stride, a string padding mode
-      (`valid` or `same`), dilation and groups, it computes the N-D convolution
-      by dispatching to the FlagGems `conv1d`/`conv2d`/`conv3d` Triton kernels
-      based on the spatial dimensionality of the weight tensor. `same` padding
-      requires unit strides.
-    for:
-      - _convolution_mode
-    labels:
-      - aten
-      - KernelGen
-    kind:
-      - Convolution
-    stages:
-      - alpha: '5.4'
   - id: functional_assert_async
     description: |
       Functional version of _assert_async that takes a dependency token and returns a new token.
@@ -2222,6 +2205,23 @@ ops:
       - KernelGen
     kind:
       - Math
+    stages:
+      - alpha: '5.4'
+  - id: convolution_mode
+    description: |
+      Low-level dispatcher backing the string-padding form of convolution.
+      Given an input, a weight, an optional bias, stride, a string padding mode
+      (`valid` or `same`), dilation and groups, it computes the N-D convolution
+      by dispatching to the FlagGems `conv1d`/`conv2d`/`conv3d` Triton kernels
+      based on the spatial dimensionality of the weight tensor. `same` padding
+      requires unit strides.
+    for:
+      - _convolution_mode
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Convolution
     stages:
       - alpha: '5.4'
   - id: copy
