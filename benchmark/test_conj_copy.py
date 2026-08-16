@@ -33,7 +33,7 @@ def test_conj_copy():
 def test_conj_copy_out():
     # _conj_copy.out variant writes the conjugated copy into the `out` tensor.
     bench = base.UnaryPointwiseOutBenchmark(
-        op_name="_conj_copy_out",
+        op_name="conj_copy_out",
         torch_op=torch.ops.aten._conj_copy.out,
         dtypes=consts.COMPLEX_DTYPES,
     )
