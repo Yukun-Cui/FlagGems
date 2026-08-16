@@ -77,19 +77,19 @@ def test_compute_linear_combination_extreme(m, n, k, dtype):
     utils.gems_assert_close(res_out, ref_out, dtype, reduce_dim=n)
 
 
-@pytest.mark.underscore_compute_linear_combination_out
+@pytest.mark.compute_linear_combination_out
 @pytest.mark.parametrize("m, n, k", MNK_SHAPES)
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test__compute_linear_combination_out(m, n, k, dtype):
+def test_compute_linear_combination_out(m, n, k, dtype):
     inp = torch.randn((n, k), dtype=dtype, device=flag_gems.device)
     coeffs = torch.randn((m, n), dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp, True)
     ref_coeffs = utils.to_reference(coeffs, True)
 
-    ref_out = torch._compute_linear_combination(ref_inp, ref_coeffs)
+    ref_out = torch.ops.aten._compute_linear_combination.out(ref_inp, ref_coeffs)
     out = torch.zeros((m, k), dtype=dtype, device=flag_gems.device)
     with flag_gems.use_gems():
-        res_out = torch._compute_linear_combination(inp, coeffs, out=out)
+        res_out = torch.ops.aten._compute_linear_combination.out(inp, coeffs, out=out)
 
     assert res_out is out
     utils.gems_assert_close(out, ref_out, dtype, reduce_dim=n)
