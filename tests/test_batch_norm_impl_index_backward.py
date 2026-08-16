@@ -6,6 +6,7 @@ import torch
 import flag_gems
 
 from . import accuracy_utils as utils
+from . import conftest as cfg
 
 # Shapes representative of common batch-norm workloads (2D up to 5D).  The
 # feature dimension is always ``shape[1]``.
@@ -72,6 +73,16 @@ def _forward_save_stats(shape, dtype, device, weight, bias, train, impl_index):
 @pytest.mark.parametrize("affine", [True, False])
 def test_batch_norm_impl_index_backward_train(shape, dtype, impl_index, affine):
     """Training-mode backward: the saved statistics hold the inverse std."""
+    # The cudnn backend (impl_index == 1) has no CPU implementation of
+    # ``aten::cudnn_batch_norm_backward`` (CUDA-only), so under ``--ref=cpu`` the
+    # reference (which runs on the CPU reference device) cannot dispatch it.
+    # Skip this combination in quick-cpu mode; the native backend
+    # (impl_index == 0) and the eval-mode cudnn path both have CPU references.
+    if cfg.TO_CPU and impl_index == 1:
+        pytest.skip(
+            "cudnn_batch_norm_backward has no CPU backend; "
+            "skip train + impl_index=1 under --ref=cpu"
+        )
     C = shape[1]
     if affine:
         weight = torch.randn(C, dtype=dtype, device=flag_gems.device)
