@@ -51,12 +51,12 @@ def test_compute_linear_combination():
     bench.run()
 
 
-@pytest.mark.underscore_compute_linear_combination_out
-def test__compute_linear_combination_out():
+@pytest.mark.compute_linear_combination_out
+def test_compute_linear_combination_out():
     bench = ComputeLinearCombinationBenchmark(
         op_name="_compute_linear_combination_out",
         input_fn=_input_fn_out,
-        torch_op=torch._compute_linear_combination,
+        torch_op=torch._compute_linear_combination.out,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
