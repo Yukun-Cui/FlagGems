@@ -1038,31 +1038,6 @@ ops:
       - Tensor
     stages:
       - stable: '5.3'
-  - id: conj_copy
-    description: |
-      Computes the element-wise conjugate of a complex `input` tensor and
-      returns it as a new (copied) tensor. For non-complex tensors this op
-      is not supported.
-    for:
-      - _conj_copy
-    labels:
-      - aten
-      - KernelGen
-    kind:
-      - Math
-    stages:
-      - alpha: '5.4'
-  - id: _conj_copy_out
-    description: A variant of `_conj_copy()` that writes the result into the `out` tensor.
-    for:
-      - _conj_copy.out
-    labels:
-      - aten
-      - KernelGen
-    kind:
-      - Math
-    stages:
-      - alpha: '5.4'
   - id: functional_assert_async
     description: |
       Functional version of _assert_async that takes a dependency token and returns a new token.
@@ -2078,6 +2053,31 @@ ops:
       For non-complex tensors, returns the input unchanged.
     for:
       - _conj
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
+  - id: conj_copy
+    description: |
+      Computes the element-wise conjugate of a complex `input` tensor and
+      returns it as a new (copied) tensor. For non-complex tensors this op
+      is not supported.
+    for:
+      - _conj_copy
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Math
+    stages:
+      - alpha: '5.4'
+  - id: conj_copy_out
+    description: A variant of `_conj_copy()` that writes the result into the `out` tensor.
+    for:
+      - _conj_copy.out
     labels:
       - aten
       - KernelGen
