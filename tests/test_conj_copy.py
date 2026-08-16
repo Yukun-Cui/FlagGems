@@ -38,10 +38,10 @@ def test_conj_copy(shape, dtype):
     utils.gems_assert_close(res_out, ref_out, dtype)
 
 
-@pytest.mark.underscore_conj_copy_out
+@pytest.mark.conj_copy_out
 @pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.COMPLEX_DTYPES)
-def test__conj_copy_out(shape, dtype):
+def test_conj_copy_out(shape, dtype):
     real = torch.randn(shape, dtype=torch.float32, device=flag_gems.device)
     imag = torch.randn(shape, dtype=torch.float32, device=flag_gems.device)
     inp = torch.complex(real, imag).to(dtype)
@@ -49,9 +49,9 @@ def test__conj_copy_out(shape, dtype):
     ref_inp = utils.to_reference(inp)
     ref_out = torch.empty_like(ref_inp)
 
-    torch._conj_copy(ref_inp, out=ref_out)
+    torch.ops.aten._conj_copy.out(ref_inp, out=ref_out)
     with flag_gems.use_gems():
-        torch._conj_copy(inp, out=out)
+        torch.ops.aten._conj_copy.out(inp, out=out)
 
     utils.gems_assert_close(out, ref_out, dtype)
 
