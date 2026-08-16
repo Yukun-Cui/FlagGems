@@ -98,6 +98,8 @@ _FULL_CONFIG = (
     ),
     ("_assert_async", _assert_async),
     ("_batch_norm_no_update", _batch_norm_no_update),
+    ("_compute_linear_combination", _compute_linear_combination),
+    ("_compute_linear_combination.out", _compute_linear_combination_out),
     ("_functional_assert_async.msg", _functional_assert_async),
     ("_cdist_backward", _cdist_backward),
     ("_cdist_forward", _cdist_forward),
