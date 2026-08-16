@@ -4,6 +4,7 @@ import torch
 import flag_gems
 
 from . import accuracy_utils as utils
+from . import conftest as cfg
 
 # cuSPARSELt structured (2:4) sparse matmul search expects CUDA inputs and
 # supports the half-precision dtypes that cuSPARSELt is tuned for. float32 is
@@ -76,8 +77,14 @@ def test_cslt_sparse_mm_search(shape, dtype):
 
     # Use the searched id to actually run the sparse matmul and verify it
     # matches the dense reference computed from the pruned sparse matrix.
+    # cuSPARSELt only runs on CUDA, so ``res_out`` stays on the GPU; the dense
+    # reference (a plain ``torch.mm``) is computed on the CPU reference device
+    # when ``--ref=cpu`` is in effect so ``gems_assert_close``'s ``to_cpu``
+    # contract (``ref`` already on CPU) holds.
     res_out = torch._cslt_sparse_mm(compressed_a, dense_b, alg_id=alg_id)
-    ref_out = torch.mm(dense_a_pruned, dense_b)
+    ref_dense_a = utils.to_reference(dense_a_pruned)
+    ref_dense_b = utils.to_reference(dense_b)
+    ref_out = torch.mm(ref_dense_a, ref_dense_b)
 
     # cuSPARSELt selects a numerically valid but not necessarily bit-identical
     # algorithm; compare in the native half-precision dtype with a permissive
@@ -97,7 +104,16 @@ def test_cslt_sparse_mm_search_with_bias(dtype):
     validate consistency against the native cuSPARSELt path: both the Gems and
     the native search select a valid algorithm, and the resulting matmuls must
     agree to the cuSPARSELt precision for this dtype.
+
+    ``--ref=cpu`` is not meaningful here: both sides are cuSPARSELt outputs
+    (CUDA-only, no CPU kernel), so there is nothing to compare on the CPU
+    reference device. Skip in that mode.
     """
+    if cfg.TO_CPU:
+        pytest.skip(
+            "cuSPARSELt fused bias epilogue has no CPU reference; "
+            "skip under --ref=cpu"
+        )
     m, k, n = 128, 128, 64
     _, compressed_a, dense_b = _make_compressed_and_dense(
         m, k, n, dtype, flag_gems.device
@@ -125,9 +141,17 @@ def test_cslt_sparse_mm_search_with_alpha(dtype):
     """The search op honors the ``alpha`` scaling argument.
 
     Validated against the native cuSPARSELt path (see
-    ``test__cslt_sparse_mm_search_with_bias`` for rationale): both searches
+    ``test_cslt_sparse_mm_search_with_bias`` for rationale): both searches
     return a valid algorithm and the fused matmuls must agree.
+
+    Skipped under ``--ref=cpu`` for the same reason as the bias variant: both
+    sides are cuSPARSELt (CUDA-only) outputs with no CPU reference.
     """
+    if cfg.TO_CPU:
+        pytest.skip(
+            "cuSPARSELt fused alpha epilogue has no CPU reference; "
+            "skip under --ref=cpu"
+        )
     m, k, n = 128, 128, 128
     _, compressed_a, dense_b = _make_compressed_and_dense(
         m, k, n, dtype, flag_gems.device
