@@ -25,19 +25,6 @@ logger = logging.getLogger(__name__)
 
 @pointwise_dynamic(promotion_methods=[(0, "DEFAULT")])
 @triton.jit
-def _coalesced_identity_func(x):
-    # Identity pointwise kernel: returns each element unchanged.
-    #
-    # ``aten::_coalesced_`` is a pure-metadata op: it only toggles the
-    # ``is_coalesced`` flag of a sparse COO tensor and never touches the
-    # underlying indices/values data. The per-element computation is therefore
-    # a no-op identity. This kernel is the Triton implementation that would
-    # process the values data when the op needed to do per-element work; the
-    # metadata fast-path below does not launch it, since doing so would only
-    # add kernel-launch overhead for a mutation that changes no data.
-    return x
-
-
 def _coalesced_(self: torch.Tensor, coalesced: bool) -> torch.Tensor:
     """Set the ``coalesced`` flag of a sparse COO tensor in place.
 
@@ -55,10 +42,6 @@ def _coalesced_(self: torch.Tensor, coalesced: bool) -> torch.Tensor:
             "_coalesced_ only supports sparse coordinate (coo) tensors, "
             f"but got layout {self.layout}"
         )
-
-    # The op is metadata-only: there is no per-element data to compute, so we
-    # do not launch ``_coalesced_identity_func`` (launching it would add
-    # kernel-launch overhead for no work, since the stored data is unchanged).
 
     # Toggle the coalesced flag in place. Dispatching below the autograd key
     # routes the call to the native backend (SparseCUDA/SparseCPU) kernel that
