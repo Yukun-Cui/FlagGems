@@ -93,7 +93,7 @@ def test_rshift_scalar():
     bench.run()
 
 
-@pytest.mark.rshift
+@pytest.mark.rshift_out
 def test_rshift_tensor_out():
     bench = RshiftOutBenchmark(
         op_name="rshift_tensor_out",
@@ -103,7 +103,7 @@ def test_rshift_tensor_out():
     bench.run()
 
 
-@pytest.mark.rshift
+@pytest.mark.rshift_out
 def test_rshift_scalar_out():
     bench = RshiftScalarOutBenchmark(
         op_name="rshift_scalar_out",

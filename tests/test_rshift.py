@@ -51,13 +51,15 @@ def test_rshift_scalar(dtype):
     utils.gems_assert_equal(actual, expected)
 
 
-@pytest.mark.rshift
+@pytest.mark.rshift_out
 @pytest.mark.parametrize("dtype", RSHIFT_DTYPES)
 def test_rshift_output_overloads(dtype):
     value = torch.randint(0, 100, (9, 13), dtype=dtype, device=flag_gems.device)
     shift = torch.randint(0, 7, value.shape, dtype=dtype, device=flag_gems.device)
-    expected_tensor = utils.to_reference(value) >> utils.to_reference(shift)
-    expected_scalar = utils.to_reference(value) >> 2
+    expected_tensor = torch.ops.aten.__rshift__.Tensor(
+        utils.to_reference(value), utils.to_reference(shift)
+    )
+    expected_scalar = torch.ops.aten.__rshift__.Scalar(utils.to_reference(value), 2)
     tensor_out = torch.empty_like(value)
     scalar_out = torch.empty_like(value)
 
