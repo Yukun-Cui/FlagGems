@@ -27,12 +27,6 @@ logger = logging.getLogger(__name__)
 NNZ_PER_GROUP = 2
 GROUP_SIZE = 4
 
-# Canonical 2:4 pattern code (in [0, 5]) for each of the six valid non-zero masks.
-# Index into this table with the raw 4-bit mask  b0*1 + b1*2 + b2*4 + b3*8
-# (only masks 3, 5, 6, 9, 10, 12 are valid 2:4 patterns).
-_PATTERN_TABLE = [3, 5, 6, 9, 10, 12]
-_CODE_OF_MASK = {3: 0, 5: 1, 6: 2, 9: 3, 10: 4, 12: 5}
-
 
 @libentry()
 @triton.jit
@@ -215,47 +209,3 @@ def _cslt_compress(input: torch.Tensor) -> torch.Tensor:
         BLOCK_N=BLOCK_N,
     )
     return out
-
-
-def _cslt_compress_ref(input: torch.Tensor) -> torch.Tensor:
-    """Reference (pure PyTorch) implementation of :func:`_cslt_compress`.
-
-    Used by the accuracy test because the cuSPARSELt-backed ``torch._cslt_compress``
-    only has a CUDA implementation and therefore cannot run on the CPU reference
-    device.
-    """
-    M, N = input.shape
-    assert N % 4 == 0
-    n_groups = N // 4
-    n_packed = N // 2
-
-    g = input.view(M, n_groups, 4)
-    nonzero = g != 0
-    raw = nonzero.to(torch.int32)
-    raw_code = raw[..., 0] * 1 + raw[..., 1] * 2 + raw[..., 2] * 4 + raw[..., 3] * 8
-
-    meta = torch.zeros((M, n_groups), dtype=torch.float32, device=input.device)
-    for mask, code in _CODE_OF_MASK.items():
-        meta = torch.where(raw_code == mask, torch.full_like(meta, float(code)), meta)
-
-    first = torch.where(
-        nonzero[..., 0],
-        g[..., 0],
-        torch.where(
-            nonzero[..., 1],
-            g[..., 1],
-            torch.where(nonzero[..., 2], g[..., 2], g[..., 3]),
-        ),
-    )
-    second = torch.where(
-        nonzero[..., 3],
-        g[..., 3],
-        torch.where(
-            nonzero[..., 2],
-            g[..., 2],
-            torch.where(nonzero[..., 1], g[..., 1], g[..., 0]),
-        ),
-    )
-    packed = torch.stack([first, second], dim=-1).reshape(M, n_packed).to(input.dtype)
-
-    return torch.cat([packed, meta.to(input.dtype)], dim=1)
