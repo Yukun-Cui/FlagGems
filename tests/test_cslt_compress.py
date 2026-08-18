@@ -2,7 +2,6 @@ import pytest
 import torch
 
 import flag_gems
-from flag_gems.ops._cslt_compress import _cslt_compress_ref
 
 from . import accuracy_utils as utils
 
@@ -35,11 +34,10 @@ def _make_24_sparse(x):
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_cslt_compress(shape, dtype):
     res_inp = _make_24_sparse(torch.randn(shape, dtype=dtype, device=flag_gems.device))
-    # The cuSPARSELt-backed torch._cslt_compress has no CPU implementation, so the
-    # reference is our pure-PyTorch `_cslt_compress_ref` (which runs on CPU at
-    # higher precision after utils.to_reference).
-    ref_inp = utils.to_reference(res_inp, upcast=True)
-    ref_out = _cslt_compress_ref(ref_inp)
+    # `torch._cslt_compress` is CUDA-only (cuSPARSELt backend), so the reference
+    # stays on GPU via the NoCPU label and is computed with the native op.
+    ref_inp = utils.to_reference(res_inp)
+    ref_out = torch._cslt_compress(ref_inp)
 
     with flag_gems.use_gems():
         res_out = torch._cslt_compress(res_inp)
@@ -58,8 +56,8 @@ def test_cslt_compress_all_patterns(dtype):
             a[r, g * 4 + p0] = (g + 1) * 10 + 0.5
             a[r, g * 4 + p1] = (g + 1) * 10 + 1.5
 
-    ref_inp = utils.to_reference(a, upcast=True)
-    ref_out = _cslt_compress_ref(ref_inp)
+    ref_inp = utils.to_reference(a)
+    ref_out = torch._cslt_compress(ref_inp)
 
     with flag_gems.use_gems():
         res_out = torch._cslt_compress(a)
@@ -74,8 +72,8 @@ def test_cslt_compress_large_dim_tiling(dtype):
     res_inp = _make_24_sparse(
         torch.randn((8, 8192), dtype=dtype, device=flag_gems.device)
     )
-    ref_inp = utils.to_reference(res_inp, upcast=True)
-    ref_out = _cslt_compress_ref(ref_inp)
+    ref_inp = utils.to_reference(res_inp)
+    ref_out = torch._cslt_compress(ref_inp)
 
     with flag_gems.use_gems():
         res_out = torch._cslt_compress(res_inp)

@@ -2373,6 +2373,7 @@ ops:
     labels:
       - aten
       - KernelGen
+      - NoCPU
     kind:
       - Tensor
     stages:
