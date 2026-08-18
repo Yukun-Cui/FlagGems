@@ -16,43 +16,8 @@
 import logging
 
 import torch
-import triton
-import triton.language as tl
-
-from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
-
-
-@libentry()
-@triton.jit
-def _cslt_sparse_mm_search_proxy_kernel(
-    compressed_a_ptr,
-    out_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Proxy Triton kernel that touches the compressed sparse matrix buffer.
-
-    ``_cslt_sparse_mm_search`` is a meta operator: it queries cuSPARSELt for a
-    suitable matmul algorithm id and returns it as a Python ``int``. There is
-    no element-wise arithmetic to reimplement in Triton. This kernel acts as a
-    buffer-management layer (mirroring the pattern used by other library-backed
-    ops such as ``_linalg_eigvals``): it reads from the compressed matrix so the
-    op runs through the Triton runtime, while the actual algorithm selection is
-    delegated to the underlying cuSPARSELt library. Only a single block is
-    launched because the kernel exists to exercise the Triton path, not to
-    transform the data; a full copy would add avoidable latency on top of the
-    cuSPARSELt search.
-    """
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    val = tl.load(compressed_a_ptr + offsets, mask=mask, other=0.0)
-    tl.store(out_ptr + offsets, val, mask=mask)
 
 
 def _cslt_sparse_mm_search(
@@ -70,37 +35,19 @@ def _cslt_sparse_mm_search(
     matrix ``dense_B``. The returned id can be passed as ``alg_id`` to
     ``torch._cslt_sparse_mm``.
 
-    The op is a library-backed search with no numeric computation to replace,
-    so a Triton proxy kernel is used to drive the operation through the Triton
-    runtime, and the algorithm selection itself is delegated to cuSPARSELt via
-    ``torch._C._cusparselt.mm_search`` (the non-recursive, lower-level entry
-    point recommended by PyTorch in place of the deprecated
-    ``torch._cslt_sparse_mm_search``). The public ``aten`` op would otherwise
-    redispatch back into this implementation, so the lower-level entry point is
-    used to avoid infinite recursion.
+    This is a meta operator with no numeric computation to reimplement: the
+    only work is querying cuSPARSELt for a suitable algorithm id, which is
+    delegated to ``torch._C._cusparselt.mm_search``. The lower-level entry point
+    is used instead of the public ``aten`` ``_cslt_sparse_mm_search`` to avoid
+    infinite recursion: once this op is registered, the public op redispatches
+    back into this implementation.
     """
     logger.debug("GEMS _CSLT_SPARSE_MM_SEARCH")
 
     if not compressed_A.is_cuda:
         raise RuntimeError("_cslt_sparse_mm_search expects CUDA inputs")
 
-    # Drive the op through the Triton runtime with a proxy kernel that reads a
-    # single block from the compressed buffer. This satisfies the requirement
-    # that the operator exercises a Triton kernel while keeping overhead low:
-    # the real work (algorithm selection) is performed by cuSPARSELt below.
-    BLOCK_SIZE = 128
-    grid = (1,)
-    proxy_out = torch.empty_like(compressed_A)
-    with torch_device_fn.device(compressed_A.device):
-        _cslt_sparse_mm_search_proxy_kernel[grid](
-            compressed_A,
-            proxy_out,
-            BLOCK_SIZE,
-            BLOCK_SIZE,
-        )
-
-    # Delegate the algorithm search to cuSPARSELt via the lower-level entry
-    # point. ``mm_search`` returns a 4-tuple of ints; the first element is the
+    # ``mm_search`` returns a 4-tuple of ints; the first element is the
     # algorithm id, matching the single-int return value of the aten op.
     alg_id, _, _, _ = torch._C._cusparselt.mm_search(
         compressed_A,
