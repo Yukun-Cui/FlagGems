@@ -409,6 +409,64 @@ def _convolution_double_backward_2d(
     return grad_ggO, grad_self, grad_weight
 
 
+def _convolution_double_backward_1d(
+    ggI,
+    ggW,
+    ggb,
+    gO,
+    weight,
+    self,
+    stride,
+    padding,
+    dilation,
+    transposed,
+    output_padding,
+    groups,
+    output_mask,
+):
+    """Second-order backward of a 1D convolution.
+
+    1D convolutions (3-D operands ``[N, C, L]``) are handled by routing through
+    the 2D implementation: a trailing spatial axis is unsqueezed
+    (``[N, C, L]`` -> ``[N, C, L, 1]``), the 2D path runs, and the extra axis is
+    squeezed back on every output. This mirrors how ``conv1d`` delegates to
+    ``conv2d``. ``ggb`` is a 1-D channel vector and is passed through unchanged.
+    """
+
+    # Widen the lone spatial axis to a (degenerate) 2D one and pass it to the
+    # 2D path. Scalar/int 1D params become length-2 lists with the second axis
+    # set to identity (stride 1, no padding, dilation 1, no output padding).
+    def _widen(param, fill):
+        if param is None:
+            return None
+        if isinstance(param, (list, tuple)):
+            return [param[0], fill]
+        return [param, fill]
+
+    def _unsqueeze(t):
+        return t.unsqueeze(-1) if t is not None else None
+
+    def _squeeze(t):
+        return t.squeeze(-1) if t is not None else None
+
+    res_2d = _convolution_double_backward_2d(
+        _unsqueeze(ggI),
+        _unsqueeze(ggW),
+        ggb,
+        _unsqueeze(gO),
+        _unsqueeze(weight),
+        _unsqueeze(self),
+        _widen(stride, 1),
+        _widen(padding, 0),
+        _widen(dilation, 1),
+        transposed,
+        _widen(output_padding, 0),
+        groups,
+        output_mask,
+    )
+    return tuple(_squeeze(r) for r in res_2d)
+
+
 def _convolution_double_backward(
     ggI,
     ggW,
@@ -426,26 +484,47 @@ def _convolution_double_backward(
 ):
     logger.debug("GEMS _CONVOLUTION_DOUBLE_BACKWARD")
 
-    # The Triton implementation below targets 2D convolutions (4-D operands).
-    if self.ndim != 4 or weight.ndim != 4 or gO.ndim != 4:
-        raise NotImplementedError(
-            "_convolution_double_backward: FlagGems only supports 2D convolutions "
-            "(4-D input/weight/grad_output), got ndim "
-            f"self={self.ndim}, weight={weight.ndim}, gO={gO.ndim}."
+    # Dispatch by spatial arity (matches the convention used by
+    # ``_convolution_mode``: ``spatial_ndim = weight.ndim - 2``). 1D convolutions
+    # are routed through the 2D path by unsqueezing the lone spatial axis
+    # (mirroring ``conv1d``, which delegates to ``conv2d`` the same way).
+    spatial_ndim = weight.ndim - 2
+    if spatial_ndim == 2:
+        return _convolution_double_backward_2d(
+            ggI,
+            ggW,
+            ggb,
+            gO,
+            weight,
+            self,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+            output_mask,
+        )
+    if spatial_ndim == 1:
+        return _convolution_double_backward_1d(
+            ggI,
+            ggW,
+            ggb,
+            gO,
+            weight,
+            self,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+            output_mask,
         )
 
-    return _convolution_double_backward_2d(
-        ggI,
-        ggW,
-        ggb,
-        gO,
-        weight,
-        self,
-        stride,
-        padding,
-        dilation,
-        transposed,
-        output_padding,
-        groups,
-        output_mask,
+    raise NotImplementedError(
+        "_convolution_double_backward: FlagGems supports 1D (3-D operands) and "
+        "2D (4-D operands) convolutions, but 3D (5-D operands) is not yet "
+        "implemented. got ndim "
+        f"self={self.ndim}, weight={weight.ndim}, gO={gO.ndim}."
     )

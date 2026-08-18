@@ -21,6 +21,25 @@ CONV_CASES = [
     ((1, 3, 7, 7), (3, 2, 3, 3), 1, 3, 1, 1, True, (2, 2)),
 ]
 
+# 1D convolution cases: shapes are (N, C, L); weights are
+# (out_channels, in_channels/groups, kL) for non-transposed and
+# (in_channels, out_channels/groups, kL) for transposed. Stride / padding /
+# dilation / output_padding are scalars (length-1 spatial).
+CONV1D_CASES = [
+    # non-transposed
+    ((1, 2, 9), (4, 2, 3), 1, 2, 1, 1, False, 0),
+    ((1, 2, 9), (4, 2, 3), 1, 1, 1, 1, False, 0),
+    ((2, 3, 9), (4, 3, 3), 1, 2, 1, 1, False, 0),
+    ((2, 4, 8), (4, 2, 3), 2, 2, 1, 1, False, 0),
+    ((1, 3, 7), (2, 3, 3), 1, 1, 1, 2, False, 0),
+    # transposed (weight shape is (in_channels, out_channels, kL))
+    ((1, 2, 5), (2, 3, 3), 1, 1, 1, 1, True, 0),
+    ((2, 4, 5), (4, 3, 3), 1, 2, 1, 1, True, 0),
+    ((2, 4, 5), (4, 3, 3), 1, 2, 1, 1, True, 1),
+    ((2, 4, 8), (4, 2, 3), 2, 2, 1, 1, True, 0),
+    ((1, 3, 7), (3, 2, 3), 1, 3, 1, 1, True, 2),
+]
+
 
 # Restricted dtype list: the generator limits the tested precisions for numerical-stability reasons (see worktree).
 FLOAT_DTYPES = [torch.float16, torch.float32]
@@ -37,6 +56,27 @@ GRAD_INPUT_PRESENCE = [
 
 
 def _forward(x, w, bias, stride, padding, dilation, transposed, output_padding, groups):
+    if x.ndim == 3:
+        if not transposed:
+            return torch.nn.functional.conv1d(
+                x,
+                w,
+                bias=bias,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+            )
+        return torch.nn.functional.conv_transpose1d(
+            x,
+            w,
+            bias=bias,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            output_padding=output_padding,
+            groups=groups,
+        )
     if not transposed:
         return torch.nn.functional.conv2d(
             x,
@@ -62,7 +102,7 @@ def _forward(x, w, bias, stride, padding, dilation, transposed, output_padding, 
 @pytest.mark.convolution_double_backward
 @pytest.mark.parametrize(
     "shape, weight_shape, groups, stride, padding, dilation, transposed, output_padding",
-    CONV_CASES,
+    CONV_CASES + CONV1D_CASES,
 )
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 @pytest.mark.parametrize("has_bias", [True, False])
@@ -85,14 +125,18 @@ def test_convolution_double_backward(
     has_ggW,
     has_ggb,
 ):
-    # Single-int params are broadcast to per-axis lists by the operator's _pair;
-    # build the 2D lists here for the forward / reference calls.
+    # Single-int params are broadcast to per-axis lists by the operator; build the
+    # per-axis lists here for the forward / reference calls, sized to the spatial
+    # arity (1D -> length-1, 2D -> length-2).
+    spatial_ndim = len(shape) - 2
     if isinstance(stride, int):
-        stride = (stride, stride)
+        stride = (stride,) * spatial_ndim
     if isinstance(padding, int):
-        padding = (padding, padding)
+        padding = (padding,) * spatial_ndim
     if isinstance(dilation, int):
-        dilation = (dilation, dilation)
+        dilation = (dilation,) * spatial_ndim
+    if isinstance(output_padding, int):
+        output_padding = (output_padding,) * spatial_ndim
 
     torch.backends.cudnn.allow_tf32 = False
 
