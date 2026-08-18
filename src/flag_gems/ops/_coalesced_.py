@@ -16,15 +16,10 @@
 import logging
 
 import torch
-import triton
-
-from flag_gems.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
 
-@pointwise_dynamic(promotion_methods=[(0, "DEFAULT")])
-@triton.jit
 def _coalesced_(self: torch.Tensor, coalesced: bool) -> torch.Tensor:
     """Set the ``coalesced`` flag of a sparse COO tensor in place.
 
@@ -34,6 +29,9 @@ def _coalesced_(self: torch.Tensor, coalesced: bool) -> torch.Tensor:
     (dispatched below the autograd key) so the actual in-place metadata
     mutation is performed by the native backend kernel, rather than
     re-entering this override (which would recurse).
+
+    Because this op performs no per-element computation, no Triton kernel is
+    needed; ``pointwise_dynamic``/``triton.jit`` are intentionally omitted.
     """
     logger.debug("GEMS _COALESCED_")
 
