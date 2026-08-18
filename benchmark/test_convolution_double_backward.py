@@ -21,55 +21,126 @@ CONV_DOUBLE_BACKWARD_SHAPES = [
     (8, 32, 16, 16, 32, 3, 3, 2, 1, 1, 2, True, (0, 0)),
 ]
 
+# Shapes for the second-order (double) backward of a 1D convolution. Each tuple
+# is
+#   (N, Cin, L, Cout, kL, stride, padding, dilation, groups, transposed, output_padding)
+# with scalar spatial params; weight layout follows ``transposed``. 1D reuses
+# the 2D path internally (unsqueeze the lone spatial axis), so this coverage
+# mirrors ``CONV1D_CASES`` in the accuracy test at benchmark-appropriate sizes.
+CONV_DOUBLE_BACKWARD_1D_SHAPES = [
+    # non-transposed convolutions
+    (16, 32, 1024, 64, 3, 1, 1, 1, 1, False, 0),
+    (16, 32, 1024, 64, 3, 2, 1, 1, 1, False, 0),
+    (8, 64, 512, 128, 3, 2, 1, 1, 1, False, 0),
+    (8, 32, 512, 32, 3, 1, 1, 1, 2, False, 0),
+    # transposed convolutions (weight is (Cin, Cout//groups, kL))
+    (8, 64, 256, 32, 3, 2, 1, 1, 1, True, 0),
+    (8, 64, 256, 32, 3, 2, 1, 1, 1, True, 1),
+    (8, 32, 256, 32, 3, 2, 1, 1, 2, True, 0),
+]
+
 
 class ConvDoubleBackwardBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
-        self.shapes = CONV_DOUBLE_BACKWARD_SHAPES
+        self.shapes = CONV_DOUBLE_BACKWARD_SHAPES + CONV_DOUBLE_BACKWARD_1D_SHAPES
 
     def get_input_iter(self, cur_dtype):
-        for (
-            n,
-            cin,
-            h,
-            w,
-            cout,
-            kh,
-            kw,
-            stride,
-            padding,
-            dilation,
-            groups,
-            transposed,
-            output_padding,
-        ) in self.shapes:
-            x = torch.randn((n, cin, h, w), dtype=cur_dtype, device=self.device)
-            if not transposed:
-                weight_shape = (cout, cin // groups, kh, kw)
+        for shape in self.shapes:
+            transposed = shape[-2]
+            if len(shape) == 13:
+                # 2D: (N, Cin, H, W, Cout, kH, kW, stride, padding, dilation,
+                #      groups, transposed, output_padding)
+                (
+                    n,
+                    cin,
+                    h,
+                    w,
+                    cout,
+                    kh,
+                    kw,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                    transposed,
+                    output_padding,
+                ) = shape
+                x = torch.randn((n, cin, h, w), dtype=cur_dtype, device=self.device)
+                if not transposed:
+                    weight_shape = (cout, cin // groups, kh, kw)
+                else:
+                    weight_shape = (cin, cout // groups, kh, kw)
+                weight = torch.randn(weight_shape, dtype=cur_dtype, device=self.device)
+                bias = torch.randn(cout, dtype=cur_dtype, device=self.device)
+                if not transposed:
+                    y = torch.nn.functional.conv2d(
+                        x,
+                        weight,
+                        bias=bias,
+                        stride=stride,
+                        padding=padding,
+                        dilation=dilation,
+                        groups=groups,
+                    )
+                else:
+                    y = torch.nn.functional.conv_transpose2d(
+                        x,
+                        weight,
+                        bias=bias,
+                        stride=stride,
+                        padding=padding,
+                        dilation=dilation,
+                        output_padding=output_padding,
+                        groups=groups,
+                    )
+                spatial_ndim = 2
+                opad = list(output_padding)
             else:
-                weight_shape = (cin, cout // groups, kh, kw)
-            weight = torch.randn(weight_shape, dtype=cur_dtype, device=self.device)
-            bias = torch.randn(cout, dtype=cur_dtype, device=self.device)
-            if not transposed:
-                y = torch.nn.functional.conv2d(
-                    x,
-                    weight,
-                    bias=bias,
-                    stride=stride,
-                    padding=padding,
-                    dilation=dilation,
-                    groups=groups,
-                )
-            else:
-                y = torch.nn.functional.conv_transpose2d(
-                    x,
-                    weight,
-                    bias=bias,
-                    stride=stride,
-                    padding=padding,
-                    dilation=dilation,
-                    output_padding=output_padding,
-                    groups=groups,
-                )
+                # 1D: (N, Cin, L, Cout, kL, stride, padding, dilation, groups,
+                #      transposed, output_padding)
+                (
+                    n,
+                    cin,
+                    l,
+                    cout,
+                    kl,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                    transposed,
+                    output_padding,
+                ) = shape
+                x = torch.randn((n, cin, l), dtype=cur_dtype, device=self.device)
+                if not transposed:
+                    weight_shape = (cout, cin // groups, kl)
+                else:
+                    weight_shape = (cin, cout // groups, kl)
+                weight = torch.randn(weight_shape, dtype=cur_dtype, device=self.device)
+                bias = torch.randn(cout, dtype=cur_dtype, device=self.device)
+                if not transposed:
+                    y = torch.nn.functional.conv1d(
+                        x,
+                        weight,
+                        bias=bias,
+                        stride=stride,
+                        padding=padding,
+                        dilation=dilation,
+                        groups=groups,
+                    )
+                else:
+                    y = torch.nn.functional.conv_transpose1d(
+                        x,
+                        weight,
+                        bias=bias,
+                        stride=stride,
+                        padding=padding,
+                        dilation=dilation,
+                        output_padding=output_padding,
+                        groups=groups,
+                    )
+                spatial_ndim = 1
+                opad = [output_padding] * spatial_ndim
             gO = torch.randn_like(y)
             ggI = torch.randn_like(x)
             ggW = torch.randn_like(weight)
@@ -82,11 +153,11 @@ class ConvDoubleBackwardBenchmark(base.Benchmark):
                 gO,
                 weight,
                 x,
-                [stride, stride],
-                [padding, padding],
-                [dilation, dilation],
+                [stride] * spatial_ndim,
+                [padding] * spatial_ndim,
+                [dilation] * spatial_ndim,
                 transposed,
-                list(output_padding),
+                opad,
                 groups,
                 output_mask,
             )
