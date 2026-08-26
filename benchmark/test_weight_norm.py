@@ -78,7 +78,7 @@ def test_weight_norm_dim_last():
 )
 def test_underscore_weight_norm_dim0():
     bench = base.GenericBenchmarkExcluse1D(
-        op_name="weight_norm",
+        op_name="_weight_norm",
         input_fn=weight_norm_input_fn,
         torch_op=torch.ops.aten._weight_norm.default,
         dtypes=consts.FLOAT_DTYPES,
@@ -92,7 +92,7 @@ def test_underscore_weight_norm_dim0():
 )
 def test_underscore_weight_norm_dim_last():
     bench = base.GenericBenchmarkExcluse1D(
-        op_name="weight_norm",
+        op_name="_weight_norm",
         input_fn=weight_norm_input_fn_last,
         torch_op=torch.ops.aten._weight_norm.default,
         dtypes=consts.FLOAT_DTYPES,
