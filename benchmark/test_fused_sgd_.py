@@ -17,11 +17,10 @@ import torch
 
 from . import base, consts
 
-# The two registered ATen variants are ``aten::_fused_sgd`` (out-of-place /
-# functional) and ``aten::_fused_sgd_`` (in-place).  pytest forbids marker
-# names that start with ``_``, so the leading-underscore ATen names cannot be
-# used as marks; the stripped, pytest-legal marks (``fused_sgd`` /
-# ``fused_sgd_``) are applied to the benchmark functions below, matching the
+# The registered ATen variant exercised here is ``aten::_fused_sgd_`` (in-place).
+# pytest forbids marker names that start with ``_``, so the leading-underscore
+# ATen name cannot be used as a mark; the stripped, pytest-legal mark
+# (``fused_sgd_``) is applied to the benchmark functions below, matching the
 # ``fused_adam`` convention.
 
 # Fused-SGD operates over a *list* of parameter tensors. Each shape is
@@ -101,11 +100,6 @@ def _torch_op(params, grads, momentum_bufs, **kwargs):
     torch._fused_sgd_(params, grads, momentum_bufs, **kwargs)
 
 
-def _torch_op_functional(params, grads, momentum_bufs, **kwargs):
-    # Functional (out-of-place) aten overload returns new tensor lists.
-    torch.ops.aten._fused_sgd.default(params, grads, momentum_bufs, **kwargs)
-
-
 def _torch_op_tensor_lr(params, grads, momentum_bufs, **kwargs):
     # The tensor-lr overload is reached via the aten namespace.
     torch.ops.aten._fused_sgd_.tensor_lr(params, grads, momentum_bufs, **kwargs)
@@ -117,18 +111,6 @@ def test_fused_sgd_():
         input_fn=_input_fn,
         op_name="fused_sgd_",
         torch_op=_torch_op,
-        dtypes=consts.FLOAT_DTYPES,
-    )
-    bench.shapes = list(SGD_SHAPES)
-    bench.run()
-
-
-@pytest.mark.fused_sgd
-def test_fused_sgd():
-    bench = FusedSgdBenchmark(
-        input_fn=_input_fn,
-        op_name="fused_sgd",
-        torch_op=_torch_op_functional,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.shapes = list(SGD_SHAPES)

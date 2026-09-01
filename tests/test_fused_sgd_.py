@@ -19,11 +19,10 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-# The two registered ATen variants are ``aten::_fused_sgd`` (out-of-place /
-# functional) and ``aten::_fused_sgd_`` (in-place).  pytest forbids marker
-# names that start with ``_``, so the leading-underscore ATen names cannot be
-# used as marks; the stripped, pytest-legal marks (``fused_sgd`` /
-# ``fused_sgd_``) are applied to the test functions below, matching the
+# The registered ATen variant exercised here is ``aten::_fused_sgd_`` (in-place).
+# pytest forbids marker names that start with ``_``, so the leading-underscore
+# ATen name cannot be used as a mark; the stripped, pytest-legal mark
+# (``fused_sgd_``) is applied to the test functions below, matching the
 # ``fused_adam`` convention.
 
 # SGD fused optimizer tensors are exercised on the flag_gems device (CUDA).
@@ -90,9 +89,9 @@ def _run_ref(op, params, grads, mbufs, **kwargs):
 def _run_gems(op, params, grads, mbufs, **kwargs):
     """Run the FlagGems implementation directly.
 
-    ``op`` is the FlagGems wrapper (``flag_gems._fused_sgd_`` or
-    ``flag_gems._fused_sgd``); calling it directly invokes the Triton kernel
-    without going through the aten dispatch machinery.
+    ``op`` is the FlagGems wrapper (``flag_gems._fused_sgd_``); calling it
+    directly invokes the Triton kernel without going through the aten dispatch
+    machinery.
     """
     return op(params, grads, mbufs, **kwargs)
 
@@ -285,58 +284,3 @@ def test_fused_sgd__found_inf():
     utils.gems_assert_close(res_p, p, dtype)
     utils.gems_assert_close(res_g, g, dtype)
     utils.gems_assert_close(res_mb, mb, dtype)
-
-
-@pytest.mark.fused_sgd
-@pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_fused_sgd(shape, dtype):
-    """Functional aten::_fused_sgd must not mutate inputs and returns new tensors."""
-    _skip_if_cpu_ref()
-    device = flag_gems.device
-    p, g, mb = _make_inputs(shape, dtype, device, momentum=0.9)
-    p_before = p.clone()
-    g_before = g.clone()
-    mb_before = mb.clone()
-
-    # The functional variant has no native aten overload, so the reference is
-    # the native in-place ``torch._fused_sgd_`` applied to clones (tuples reach
-    # the native CUDA fused-SGD op directly). The functional Gems wrapper must
-    # reproduce the same result without mutating its inputs.
-    ref_p, ref_g, ref_mb = p.clone(), g.clone(), mb.clone()
-    _run_ref(
-        torch._fused_sgd_,
-        [ref_p],
-        [ref_g],
-        [ref_mb],
-        weight_decay=0.01,
-        momentum=0.9,
-        lr=0.1,
-        dampening=0.0,
-        nesterov=False,
-        maximize=False,
-        is_first_step=False,
-    )
-    res_out = _run_gems(
-        flag_gems._fused_sgd,
-        [p],
-        [g],
-        [mb],
-        weight_decay=0.01,
-        momentum=0.9,
-        lr=0.1,
-        dampening=0.0,
-        nesterov=False,
-        maximize=False,
-        is_first_step=False,
-    )
-
-    # Functional must not mutate the caller's tensors.
-    assert torch.equal(p, p_before), "functional mutated param in place"
-    assert torch.equal(g, g_before), "functional mutated grad in place"
-    assert torch.equal(mb, mb_before), "functional mutated momentum buffer in place"
-
-    # The native in-place reference modified ref_p/ref_mb; the functional Gems
-    # result must reproduce those values (param and momentum buffer).
-    utils.gems_assert_close(res_out[0][0], ref_p, dtype)
-    utils.gems_assert_close(res_out[2][0], ref_mb, dtype)

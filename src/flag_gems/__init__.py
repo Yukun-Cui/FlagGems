@@ -149,7 +149,6 @@ _FULL_CONFIG = (
     ("_fused_moving_avg_obs_fq_helper", _fused_moving_avg_obs_fq_helper),
     ("_fused_rms_norm", _fused_rms_norm),
     ("_fused_rms_norm_backward", _fused_rms_norm_backward),
-    ("_fused_sgd", _fused_sgd),
     ("_fused_sgd_", _fused_sgd_),
     ("_grouped_mm", group_mm),
     (

@@ -5422,19 +5422,6 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
-- id: fused_sgd
-  description: |
-    Fused SGD optimizer step with optional momentum, dampening, nesterov, weight
-    decay, gradient scaling, and gradient maximize support.
-  for:
-  - _fused_sgd
-  labels:
-  - aten
-  - KernelGen
-  kind:
-  - Math
-  stages:
-  - alpha: '5.4'
 - id: fused_sgd_
   description: The in-place version of `fused_sgd()`.
   for:
