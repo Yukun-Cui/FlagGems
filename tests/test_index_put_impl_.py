@@ -100,7 +100,7 @@ def gen_indices_for_index_put(input_shape, indices_shape, accumulate, is_bool):
 
 
 # Tests for _index_put_impl_
-@pytest.mark.index_put_impl
+@pytest.mark.index_put_impl_
 @pytest.mark.parametrize(
     "input_shape, indices_shape, values_shape, is_bool", INDEX_PUT_SHAPE_ACC_FALSE
 )
@@ -134,7 +134,7 @@ def test__index_put_impl__acc_false(
     utils.gems_assert_close(inp, ref_inp, dtype)
 
 
-@pytest.mark.index_put_impl
+@pytest.mark.index_put_impl_
 @pytest.mark.parametrize(
     "input_shape, indices_shape, values_shape, is_bool", INDEX_PUT_SHAPE_ACC_TRUE
 )
@@ -170,7 +170,7 @@ def test__index_put_impl__acc_true(
     utils.gems_assert_close(inp, ref_inp, dtype)
 
 
-@pytest.mark.index_put_impl
+@pytest.mark.index_put_impl_
 @pytest.mark.parametrize("dtype", [torch.float32])
 @pytest.mark.parametrize("unsafe", [True, False])
 def test__index_put_impl__unsafe_param(dtype, unsafe):
@@ -191,7 +191,7 @@ def test__index_put_impl__unsafe_param(dtype, unsafe):
     utils.gems_assert_close(inp, ref_inp, dtype)
 
 
-@pytest.mark.index_put_impl
+@pytest.mark.index_put_impl_
 @pytest.mark.parametrize("dtype", [torch.float32])
 def test__index_put_impl__error_all_none(dtype):
     """Test error handling: all None indices for _index_put_impl_"""
