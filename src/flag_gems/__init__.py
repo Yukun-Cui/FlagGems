@@ -69,6 +69,7 @@ current_work_registrar = None
 AUTOGRAD_DISPATCH_KEY = torch._C.DispatchKey.Autograd.name
 CONJUGATE_DISPATCH_KEY = torch._C.DispatchKey.Conjugate.name
 SPARSE_CSR_DISPATCH_KEY = "SparseCsr" + backend_info.dispatch_key
+QUANTIZED_CUDA_DISPATCH_KEY = torch._C.DispatchKey.QuantizedCUDA.name
 
 
 def torch_ge(v):
@@ -480,8 +481,6 @@ _FULL_CONFIG = (
     ("deg2rad", deg2rad),
     ("deg2rad.out", deg2rad_out),
     ("deg2rad_", deg2rad_),
-    ("dsplit.int", dsplit),
-    ("dsplit.array", dsplit),
     ("dequantize", dequantize),
     ("dequantize.self", dequantize),
     ("diag", diag),
@@ -511,6 +510,8 @@ _FULL_CONFIG = (
     ("divide_.Tensor", true_divide_),
     ("divide_.Tensor_mode", div_mode_),
     ("dot", dot),
+    ("dsplit.array", dsplit),
+    ("dsplit.int", dsplit),
     ("elu", elu),
     ("elu_", elu_),
     ("elu_backward", elu_backward),
@@ -926,6 +927,18 @@ _FULL_CONFIG = (
     ("prod", prod),
     ("prod.dim_int", prod_dim),
     ("quantile", quantile),
+    (
+        "quantized_batch_norm",
+        quantized_batch_norm,
+        None,
+        (QUANTIZED_CUDA_DISPATCH_KEY,),
+    ),
+    (
+        "quantized_batch_norm.out",
+        quantized_batch_norm_out,
+        None,
+        (QUANTIZED_CUDA_DISPATCH_KEY,),
+    ),
     ("quantized_lstm.input", quantized_lstm),
     ("rad2deg", rad2deg),
     ("rad2deg_", rad2deg_),
