@@ -1249,8 +1249,6 @@ _FULL_CONFIG = (
     ("round", round),
     ("round.out", round_out),
     ("round_", round_),
-    ("rrelu_with_noise", rrelu_with_noise),
-    ("rrelu_with_noise_", rrelu_with_noise_),
     ("row_indices_copy", row_indices_copy, None, (SPARSE_CSR_CUDA_DISPATCH_KEY,)),
     (
         "row_indices_copy.out",
@@ -1258,6 +1256,8 @@ _FULL_CONFIG = (
         None,
         (SPARSE_CSR_CUDA_DISPATCH_KEY,),
     ),
+    ("rrelu_with_noise", rrelu_with_noise),
+    ("rrelu_with_noise_", rrelu_with_noise_),
     ("rrelu_with_noise_backward", rrelu_with_noise_backward),
     ("rrelu_with_noise_functional", rrelu_with_noise_functional),
     ("rsqrt", rsqrt),
