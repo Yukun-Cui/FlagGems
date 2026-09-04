@@ -117,7 +117,25 @@ def quantize_fused_singlepass_kernel(
     scale = (rmax - rmin) / (qmax - qmin)
     scale = tl.where(scale == 0.0, 0.1, scale)
     scale = tl.where(degenerate, 0.1, scale)
-    zp_float = qmin - rmin / scale
+
+    # PyTorch clamps the scale to SMALL_SCALE_THRESHOLD = 6.1e-5 (see
+    # ATen/native/quantized/cpu/QuantUtils.h). When the observed range is
+    # narrower than 6.1e-5 * (qmax - qmin), raise the scale to the threshold
+    # and adjust rmin/rmax accordingly before deriving the zero point, so the
+    # GPU matches the CPU reference on small-range tensors.
+    SMALL_SCALE_THRESHOLD = 6.1e-5
+    org_scale = scale
+    needs_clamp = scale < SMALL_SCALE_THRESHOLD
+    scale = tl.where(needs_clamp & ~degenerate, SMALL_SCALE_THRESHOLD, scale)
+    # When min==0 (all non-negative) widen rmax; when max==0 (all non-positive)
+    # widen rmin; otherwise amplify both by threshold/org_scale.
+    rmax_adj = tl.where((rmin == 0.0), SMALL_SCALE_THRESHOLD * (qmax - qmin), rmax)
+    rmin_adj = tl.where((rmax == 0.0), -SMALL_SCALE_THRESHOLD * (qmax - qmin), rmin)
+    amplifier = SMALL_SCALE_THRESHOLD / org_scale
+    rmax_adj = tl.where((rmin != 0.0) & (rmax != 0.0), rmax * amplifier, rmax_adj)
+    rmin_adj = tl.where((rmin != 0.0) & (rmax != 0.0), rmin * amplifier, rmin_adj)
+    rmin_eff = tl.where(needs_clamp & ~degenerate, rmin_adj, rmin)
+    zp_float = qmin - rmin_eff / scale
     # Round half to even (PyTorch's nearbyint / torch.round default).
     zp = tl_extra_shim.rint(zp_float)
     zp = tl.minimum(tl.maximum(zp, qmin), qmax)
@@ -173,6 +191,24 @@ def _choose_quant_params(rmin, rmax, qmin, qmax):
     scale = (rmax - rmin) / (qmax - qmin)
     if scale == 0.0:
         scale = 0.1
+    # PyTorch clamps the scale to a small-scale threshold (SMALL_SCALE_THRESHOLD
+    # = 6.1e-5f, see ATen/native/quantized/cpu/QuantUtils.h). When the observed
+    # range is narrower than SMALL_SCALE_THRESHOLD * (qmax - qmin), the scale is
+    # raised to the threshold and the min/max are adjusted accordingly before
+    # deriving the zero point; without this the GPU diverges from the CPU
+    # reference on small-range tensors (e.g. scalar ``randn`` values near 0).
+    SMALL_SCALE_THRESHOLD = 6.1e-5
+    if scale < SMALL_SCALE_THRESHOLD:
+        org_scale = scale
+        scale = SMALL_SCALE_THRESHOLD
+        if rmin == 0.0:
+            rmax = SMALL_SCALE_THRESHOLD * (qmax - qmin)
+        elif rmax == 0.0:
+            rmin = -SMALL_SCALE_THRESHOLD * (qmax - qmin)
+        else:
+            amplifier = SMALL_SCALE_THRESHOLD / org_scale
+            rmin *= amplifier
+            rmax *= amplifier
     zp_float = qmin - rmin / scale
     # Round half to even, then clamp into the quantized range.
     zp = int(torch.round(torch.tensor(zp_float)).item())
