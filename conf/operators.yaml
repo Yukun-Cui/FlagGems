@@ -11033,6 +11033,7 @@ ops:
   kind:
   - Math
   stages:
+  - alpha: '5.4'
 - id: row_indices_copy_out
   description: |
     A variant of row_indices_copy() that writes the result into the out tensor.
@@ -11044,6 +11045,7 @@ ops:
   kind:
   - Math
   stages:
+  - alpha: '5.4'
 - id: rrelu_with_noise_backward
   description: 'Computes the gradient of the Randomized Leaky ReLU (RReLU) activation
     function with respect to
