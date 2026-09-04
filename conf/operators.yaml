@@ -12001,13 +12001,6 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
-  labels:
-  - aten
-  - KernelGen
-  kind:
-  - NeuralNetwork
-  stages:
-  - alpha: '5.4'
 - id: rad2deg
   description: 'Converts each element from angles in radians to degrees.
 
