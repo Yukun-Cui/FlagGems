@@ -200,6 +200,5 @@ def test__index_put_impl__error_all_none(dtype):
     indices = [None, None]
     values = torch.randn((32, 64), dtype=dtype, device=flag_gems.device)
 
-    # PyTorch validates indices before dispatch, so TypeError is raised
-    with pytest.raises(TypeError):
-        torch._index_put_impl_(inp, indices, values, accumulate=False, unsafe=False)
+    with pytest.raises(ValueError):
+        flag_gems._index_put_impl_(inp, indices, values, accumulate=False, unsafe=False)
