@@ -10281,7 +10281,7 @@ ops:
   kind:
   - Tensor
   stages:
-  - stable: '2.2'
+  - alpha: '5.4'
 - id: put_out
   description: |
     A variant of `put()` that writes the result into the `out` tensor.
@@ -10293,7 +10293,7 @@ ops:
   kind:
   - Tensor
   stages:
-  - stable: '2.2'
+  - alpha: '5.4'
 - id: quantile
   description: Computes the q-th quantiles of each row of the `input` tensor along
     the dimension `dim`.

@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -11,17 +13,32 @@ PUT_BENCH_SHAPES = [
     (16, 128, 64, 60),
 ]
 
+# The out-of-place `put.out` variant allocates an extra `out` tensor the same size
+# as `self`, so peak memory is ~3x self (self + out + source). The default core
+# shapes include 1G-element tensors (~4 GiB each in fp32), which push the peak
+# past the CI runner's free memory and OOM at ~16 GiB. Cap the element count at
+# 2**28 (256 MiB -> ~1 GiB fp32 per tensor) so the peak stays well under budget.
+PUT_MAX_NUMEL = 2**28
+
 
 class PutBenchmark(base.GenericBenchmark):
     def set_more_shapes(self):
         self.shapes = PUT_BENCH_SHAPES
         return None
 
+    def set_shapes(self, shape_file_path=None):
+        super().set_shapes(shape_file_path)
+        self.shapes = [s for s in self.shapes if math.prod(s) < PUT_MAX_NUMEL]
+
 
 class PutOutBenchmark(base.GenericBenchmark):
     def set_more_shapes(self):
         self.shapes = PUT_BENCH_SHAPES
         return None
+
+    def set_shapes(self, shape_file_path=None):
+        super().set_shapes(shape_file_path)
+        self.shapes = [s for s in self.shapes if math.prod(s) < PUT_MAX_NUMEL]
 
 
 def put_input_fn(accumulate):
