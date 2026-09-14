@@ -5499,7 +5499,7 @@ ops:
   kind:
   - Tensor
   stages:
-  - alpha: '2.2'
+  - alpha: '5.4'
 - id: gcd
   description: Computes the element-wise greatest common divisor (GCD) of `input`
     and `other`.
