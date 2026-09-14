@@ -7001,7 +7001,7 @@ ops:
   kind:
   - Reduction
   stages:
-  - alpha: '5.0'
+  - alpha: '5.4'
 - id: hsplit
   description: 'Split a tensor into multiple sub-tensors horizontally (column-wise).
 
