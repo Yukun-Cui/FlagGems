@@ -98,9 +98,7 @@ def test_log_softmax_backward_data(shape, dtype, dim):
     ref_in_grad = torch._log_softmax_backward_data(
         ref_grad, ref_out, dim, ref_grad.dtype
     )
-    res_in_grad = flag_gems.log_softmax_backward(
-        res_grad, res_out, dim, dtype
-    )
+    res_in_grad = flag_gems.log_softmax_backward(res_grad, res_out, dim, dtype)
 
     utils.gems_assert_close(res_in_grad, ref_in_grad, dtype, reduce_dim=shape[dim])
 
@@ -126,7 +124,5 @@ def test_accuracy_log_softmax_backward_out(shape, dtype, dim):
     )
 
     res_in_grad = torch.empty(shape, dtype=dtype, device=flag_gems.device)
-    flag_gems.log_softmax_backward_out(
-        res_grad, res_out, dim, dtype, out=res_in_grad
-    )
+    flag_gems.log_softmax_backward_out(res_grad, res_out, dim, dtype, out=res_in_grad)
     utils.gems_assert_close(res_in_grad, ref_in_grad, dtype, reduce_dim=shape[dim])
