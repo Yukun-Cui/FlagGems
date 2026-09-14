@@ -111,18 +111,22 @@ def test_lu_with_info(shape, dtype, pivot):
     # reference bit-for-bit. Reconstructing A = P @ L @ U from each and
     # comparing those is the mathematically meaningful correctness check,
     # matching the precedent in test_linalg_lu_factor.
+    prev_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
-    if pivot:
-        res_p, res_l, res_u = torch.lu_unpack(res_lu, res_pivots)
-        ref_p, ref_l, ref_u = torch.lu_unpack(ref_lu, ref_pivots)
-        reconstructed = res_p @ res_l @ res_u
-        ref_reconstructed = ref_p @ ref_l @ ref_u
-    else:
-        res_l, res_u = _unpack_lu_no_pivot(res_lu)
-        ref_l, ref_u = _unpack_lu_no_pivot(ref_lu)
-        reconstructed = res_l @ res_u
-        ref_reconstructed = ref_l @ ref_u
-    utils.gems_assert_close(reconstructed, ref_reconstructed, dtype, reduce_dim=k)
+    try:
+        if pivot:
+            res_p, res_l, res_u = torch.lu_unpack(res_lu, res_pivots)
+            ref_p, ref_l, ref_u = torch.lu_unpack(ref_lu, ref_pivots)
+            reconstructed = res_p @ res_l @ res_u
+            ref_reconstructed = ref_p @ ref_l @ ref_u
+        else:
+            res_l, res_u = _unpack_lu_no_pivot(res_lu)
+            ref_l, ref_u = _unpack_lu_no_pivot(ref_lu)
+            reconstructed = res_l @ res_u
+            ref_reconstructed = ref_l @ ref_u
+        utils.gems_assert_close(reconstructed, ref_reconstructed, dtype, reduce_dim=k)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_tf32
     # info must agree with the reference for well-conditioned (non-singular) inputs
     utils.gems_assert_equal(res_info, ref_info)
 
@@ -142,6 +146,61 @@ def test_lu_with_info_singular(shape, dtype):
     # the reference and GEMS, and the two must agree exactly.
     assert (ref_info > 0).all()
     assert (res_info > 0).all()
+    utils.gems_assert_equal(res_info, ref_info)
+
+
+def _make_singular_at(shape, pos, device, dtype):
+    """Build a matrix with zero pivot at position `pos` after partial pivoting.
+
+    For pos=0: zero out row 0 directly. For pos>0: make row `pos` a linear
+    combination of earlier rows, forcing that pivot to collapse.
+    """
+    a = torch.randn(shape, dtype=dtype, device=device)
+    if pos == 0:
+        a[..., 0, :] = 0.0
+    else:
+        a[..., pos, :] = a[..., :pos, :].sum(dim=-2) * 0.5
+    return a
+
+
+@pytest.mark.lu_with_info
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+@pytest.mark.parametrize("pos", [0, 31, 63])  # first, middle, last
+@pytest.mark.parametrize("shape", [(64, 64), (2, 64, 64)])
+def test_lu_with_info_singular_positions(shape, pos, dtype):
+    """Zero pivots at first, intermediate, and last positions; check LU finiteness."""
+    inp = _make_singular_at(shape, pos, DEVICE, dtype)
+    ref_inp = utils.to_reference(inp)
+    ref_lu, ref_pivots, ref_info = torch._lu_with_info(ref_inp, pivot=True)
+    res_lu, res_pivots, res_info = flag_gems._lu_with_info(inp, pivot=True)
+    assert torch.isfinite(res_lu).all(), "LU contains non-finite values"
+    assert (res_info > 0).all(), "Expected nonzero info for singular input"
+    # Reconstruction check even for singular matrices (best-effort, validates numerics)
+    prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        res_p, res_l, res_u = torch.lu_unpack(res_lu, res_pivots)
+        ref_p, ref_l, ref_u = torch.lu_unpack(ref_lu, ref_pivots)
+        reconstructed = res_p @ res_l @ res_u
+        ref_reconstructed = ref_p @ ref_l @ ref_u
+        k = min(shape[-2], shape[-1])
+        utils.gems_assert_close(reconstructed, ref_reconstructed, dtype, reduce_dim=k)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+
+
+@pytest.mark.lu_with_info
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+@pytest.mark.parametrize("shape", [(0, 3), (3, 0), (2, 0, 5), (2, 5, 0)])
+def test_lu_with_info_empty(shape, dtype):
+    """Empty matrices (m=0 or n=0) return correctly shaped zero-info outputs."""
+    inp = torch.randn(shape, dtype=dtype, device=DEVICE)
+    ref_inp = utils.to_reference(inp)
+    ref_lu, ref_pivots, ref_info = torch._lu_with_info(ref_inp, pivot=True)
+    res_lu, res_pivots, res_info = flag_gems._lu_with_info(inp, pivot=True)
+    assert res_lu.shape == ref_lu.shape
+    assert res_pivots.shape == ref_pivots.shape
+    assert res_info.shape == ref_info.shape
     utils.gems_assert_equal(res_info, ref_info)
 
 

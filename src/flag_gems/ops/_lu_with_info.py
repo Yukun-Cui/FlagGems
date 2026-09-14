@@ -81,10 +81,19 @@ def _lu_with_info_impl(input, pivot=True, check_errors=True):
             f"only, got {input.dtype}"
         )
     m, n = input.shape[-2], input.shape[-1]
+    batch_shape = input.shape[:-2]
+    k = min(m, n)
     if m == 0 or n == 0:
-        raise NotImplementedError(
-            "FlagGems _lu_with_info currently does not support empty matrices"
+        # Degenerate matrices have no pivots to scan, so there is nothing for the
+        # factorization or the info kernel to do: LU keeps the input shape, pivots
+        # are empty along the k axis, and info is 0 (success) for every batch
+        # element. This matches ``torch._lu_with_info`` on empty inputs.
+        lu = input.clone()
+        pivots = torch.empty(
+            batch_shape + (k,), device=input.device, dtype=torch.int32
         )
+        info = torch.zeros(batch_shape, device=input.device, dtype=torch.int32)
+        return LuWithInfoResult(lu, pivots, info)
 
     # Core LU factorization is the Triton implementation shared with
     # ``linalg_lu_factor`` (panel-blocked partial-pivoting LU). It produces
@@ -92,8 +101,6 @@ def _lu_with_info_impl(input, pivot=True, check_errors=True):
     # tensor with a dedicated Triton kernel that scans the U diagonal.
     lu, pivots = _linalg_lu_factor_impl(input, pivot=pivot)
 
-    batch_shape = input.shape[:-2]
-    k = min(m, n)
     batch = lu.numel() // (m * n)
     info = torch.zeros(batch_shape, device=lu.device, dtype=torch.int32)
 
