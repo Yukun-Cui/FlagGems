@@ -89,9 +89,7 @@ def _lu_with_info_impl(input, pivot=True, check_errors=True):
         # are empty along the k axis, and info is 0 (success) for every batch
         # element. This matches ``torch._lu_with_info`` on empty inputs.
         lu = input.clone()
-        pivots = torch.empty(
-            batch_shape + (k,), device=input.device, dtype=torch.int32
-        )
+        pivots = torch.empty(batch_shape + (k,), device=input.device, dtype=torch.int32)
         info = torch.zeros(batch_shape, device=input.device, dtype=torch.int32)
         return LuWithInfoResult(lu, pivots, info)
 
