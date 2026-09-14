@@ -152,7 +152,7 @@ def log_softmax_backward_kernel(
         offsets = m_offset[:, None] * N * K + n_offset[None, :] * K + pid_k
         mask = m_offset[:, None] < M and n_offset[None, :] < N
         out_grad_ptrs = out_grad_ptr + offsets
-        out_grad = tl.load(out_grad_ptrs, mask=mask).to(tl.float32)
+        out_grad = tl.load(out_grad_ptrs, mask=mask, other=0.0).to(tl.float32)
         scale += out_grad
     scale = tl.sum(scale, 1)
 
