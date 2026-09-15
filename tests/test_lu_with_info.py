@@ -149,11 +149,17 @@ def test_lu_with_info_singular(shape, dtype):
     utils.gems_assert_equal(res_info, ref_info)
 
 
-def _make_singular_at(shape, pos, device, dtype):
-    """Build a matrix with zero pivot at position `pos` after partial pivoting.
+def _make_rank_deficient_at(shape, pos, device, dtype):
+    """Build a rank-deficient matrix whose deficiency originates at row `pos`.
 
-    For pos=0: zero out row 0 directly. For pos>0: make row `pos` a linear
-    combination of earlier rows, forcing that pivot to collapse.
+    ``pos == 0`` zeroes the first row, which yields an exactly-zero pivot at the
+    very first elimination step. For ``pos > 0`` the row is replaced by a linear
+    combination of the preceding rows, which makes the matrix mathematically
+    singular but -- because partial pivoting reorders rows and floating point
+    elimination rarely cancels exactly -- does not necessarily produce an
+    exactly-zero U pivot. The reference itself reports ``info == 0`` in that
+    case, so the test compares against the reference rather than asserting a
+    nonzero info.
     """
     a = torch.randn(shape, dtype=dtype, device=device)
     if pos == 0:
@@ -165,16 +171,22 @@ def _make_singular_at(shape, pos, device, dtype):
 
 @pytest.mark.lu_with_info
 @pytest.mark.parametrize("dtype", _TEST_DTYPES)
-@pytest.mark.parametrize("pos", [0, 31, 63])  # first, middle, last
+@pytest.mark.parametrize("pos", [0, 31, 63])  # first, intermediate, last row
 @pytest.mark.parametrize("shape", [(64, 64), (2, 64, 64)])
 def test_lu_with_info_singular_positions(shape, pos, dtype):
-    """Zero pivots at first, intermediate, and last positions; check LU finiteness."""
-    inp = _make_singular_at(shape, pos, DEVICE, dtype)
+    """Rank deficiency at the first/intermediate/last row must match the reference.
+
+    Also checks that the LU factors stay finite: a mishandled zero pivot shows up
+    as NaN/Inf in the stored factors even when ``info`` happens to agree.
+    """
+    inp = _make_rank_deficient_at(shape, pos, DEVICE, dtype)
     ref_inp = utils.to_reference(inp)
     ref_lu, ref_pivots, ref_info = torch._lu_with_info(ref_inp, pivot=True)
     res_lu, res_pivots, res_info = flag_gems._lu_with_info(inp, pivot=True)
     assert torch.isfinite(res_lu).all(), "LU contains non-finite values"
-    assert (res_info > 0).all(), "Expected nonzero info for singular input"
+    # info must track the reference exactly, whether or not the elimination
+    # produced an exactly-zero pivot for this construction.
+    utils.gems_assert_equal(res_info, ref_info)
     # Reconstruction check even for singular matrices (best-effort, validates numerics)
     prev_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
