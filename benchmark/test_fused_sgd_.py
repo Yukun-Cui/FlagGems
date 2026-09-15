@@ -15,6 +15,8 @@
 import pytest
 import torch
 
+import flag_gems
+
 from . import base, consts
 
 # The registered ATen variant exercised here is ``aten::_fused_sgd_`` (in-place).
@@ -105,12 +107,23 @@ def _torch_op_tensor_lr(params, grads, momentum_bufs, **kwargs):
     torch.ops.aten._fused_sgd_.tensor_lr(params, grads, momentum_bufs, **kwargs)
 
 
+def _gems_op(params, grads, momentum_bufs, **kwargs):
+    flag_gems._fused_sgd_(params, grads, momentum_bufs, **kwargs)
+
+
+def _gems_op_tensor_lr(params, grads, momentum_bufs, **kwargs):
+    flag_gems._fused_sgd__tensor_lr(params, grads, momentum_bufs, **kwargs)
+
+
 @pytest.mark.fused_sgd_
 def test_fused_sgd_():
     bench = FusedSgdBenchmark(
         input_fn=_input_fn,
         op_name="fused_sgd_",
         torch_op=_torch_op,
+        # Passed explicitly: without it the harness dispatches through torch for
+        # both timings, so the "speedup" would compare native against itself.
+        gems_op=_gems_op,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.shapes = list(SGD_SHAPES)
@@ -121,8 +134,9 @@ def test_fused_sgd_():
 def test_fused_sgd__tensor_lr():
     bench = FusedSgdBenchmark(
         input_fn=_input_fn_tensor_lr,
-        op_name="fused_sgd_",
+        op_name="fused_sgd__tensor_lr",
         torch_op=_torch_op_tensor_lr,
+        gems_op=_gems_op_tensor_lr,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.shapes = list(SGD_SHAPES)
