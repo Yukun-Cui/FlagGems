@@ -34,6 +34,7 @@ def _fused_adagrad_kernel(
     state_step,  # scalar tensor holding the optimizer step (read on-device)
     n: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
     lr: tl.constexpr,
     lr_decay: tl.constexpr,
     weight_decay: tl.constexpr,
@@ -50,33 +51,37 @@ def _fused_adagrad_kernel(
     mask = offsets < n
 
     # Early skip: if a non-finite gradient was found, leave the buffers untouched.
+    # ATen tests ``found_inf == 1`` rather than ``> 0``: any other value (including
+    # 2.0) still performs the update, so the comparison has to be exact.
     if has_found_inf:
         found_inf_val = tl.load(found_inf)
-        if found_inf_val > 0:
+        if found_inf_val == 1:
             return
 
     # Read the optimizer step on-device to avoid a host sync (`.item()`).
-    step = tl.load(state_step).to(tl.float32)
+    step = tl.load(state_step).to(ACC_DTYPE)
 
     # Load the parameter, gradient, and running sum of squared gradients.
     param_load = tl.load(param + offsets, mask=mask, other=0.0)
     grad_load = tl.load(grad + offsets, mask=mask, other=0.0)
     state_sum_load = tl.load(state_sum + offsets, mask=mask, other=0.0)
 
-    # Promote low-precision values to fp32 for the math (mirrors opmath_type in
-    # the reference C++ implementation).
-    param_f = param_load.to(tl.float32)
-    grad_f = grad_load.to(tl.float32)
-    state_sum_f = state_sum_load.to(tl.float32)
+    # Promote low-precision values to the accumulation type for the math (mirrors
+    # opmath_type in the reference C++ implementation). fp16/bf16/fp32 accumulate
+    # in fp32; fp64 keeps full double precision, which ATen also does -- computing
+    # a double parameter in fp32 would lose ~7 digits.
+    param_f = param_load.to(ACC_DTYPE)
+    grad_f = grad_load.to(ACC_DTYPE)
+    state_sum_f = state_sum_load.to(ACC_DTYPE)
 
-    # Gradient unscaling (for AMP); the scaled gradient is stored back to ``grad``
-    # unchanged (the original, unscaled value is preserved).
+    # Gradient unscaling (for AMP). ``grad`` is treated as read-only here: the
+    # native CUDA kernel only leaves an unscaled value behind for tail elements
+    # when numel is not a multiple of its vector width (4), so that write-back is
+    # a vectorization artifact rather than part of the operator contract and is
+    # deliberately not reproduced.
     if has_grad_scale:
         grad_scale_val = tl.load(grad_scale)
-        grad_to_store = grad_load
         grad_f = grad_f / grad_scale_val
-    else:
-        grad_to_store = grad_load
 
     # Handle maximize mode: negate the gradient for gradient ascent.
     if maximize:
@@ -98,8 +103,6 @@ def _fused_adagrad_kernel(
     # Store the updated values back, downcasting to the original element dtype.
     tl.store(param + offsets, param_f.to(param_load.dtype), mask=mask)
     tl.store(state_sum + offsets, state_sum_f.to(state_sum_load.dtype), mask=mask)
-    if has_grad_scale:
-        tl.store(grad + offsets, grad_to_store.to(grad_load.dtype), mask=mask)
 
 
 def _fused_adagrad_run(
@@ -129,25 +132,75 @@ def _fused_adagrad_run(
 
     ``state_steps`` is incremented by the caller; the step value is read on
     device inside the kernel to avoid a host synchronization.  When
-    ``found_inf`` is truthy the update is skipped entirely (AMP recovery).
+    ``found_inf == 1`` the update is skipped entirely (AMP recovery), matching
+    ATen's exact comparison -- other nonzero values still apply the update.
+    ``grads`` is read-only: only ``params`` and ``state_sums`` are mutated.
     """
     has_grad_scale = grad_scale is not None
     has_found_inf = found_inf is not None
     grad_scale_ptr = grad_scale if has_grad_scale else None
     found_inf_ptr = found_inf if has_found_inf else None
 
-    # _fused_adagrad supports float16 / bfloat16 / float32 parameters; the
-    # kernel accumulates in float32 and stores back to the original dtype.
-    # float64 and integer dtypes are rejected to match the ATen reference.
-    for _p in params:
-        assert _p.dtype in (torch.float16, torch.bfloat16, torch.float32), (
-            "_fused_adagrad only supports float16/bfloat16/float32 inputs, "
-            f"got {_p.dtype}"
-        )
+    # Validate the whole batch before touching any buffer. These values drive raw
+    # pointer arithmetic in the kernel, and a partially applied step is not
+    # recoverable, so every list has to be checked up front rather than lazily
+    # inside the launch loop.
+    n_params = len(params)
+    for name, seq in (
+        ("grads", grads),
+        ("state_sums", state_sums),
+        ("state_steps", state_steps),
+    ):
+        if len(seq) != n_params:
+            raise RuntimeError(
+                f"_fused_adagrad_: expected {name} to have the same length as "
+                f"params ({n_params}), got {len(seq)}"
+            )
 
-    # Optional early exit: skip the whole step when an inf/nan was observed.
-    if has_found_inf and found_inf.item() > 0:
-        return
+    # ATen accepts float16 / bfloat16 / float32 / float64 parameters; the kernel
+    # accumulates in float32 and stores back to the original dtype.
+    _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    for i, (param, grad, state_sum) in enumerate(zip(params, grads, state_sums)):
+        if param.dtype not in _SUPPORTED:
+            raise RuntimeError(
+                "_fused_adagrad_ only supports float16/bfloat16/float32/float64 "
+                f"inputs, got {param.dtype} at index {i}"
+            )
+        # The kernel indexes with a flat offset, so non-dense inputs would read
+        # the wrong elements. Checked before the per-tensor stride comparison so a
+        # strided param is reported as such instead of as a stride mismatch.
+        for name, tensor in (
+            ("param", param),
+            ("grad", grad),
+            ("state_sum", state_sum),
+        ):
+            if not tensor.is_contiguous():
+                raise RuntimeError(f"_fused_adagrad_: {name}[{i}] must be contiguous")
+        for name, other in (("grad", grad), ("state_sum", state_sum)):
+            if other.shape != param.shape:
+                raise RuntimeError(
+                    f"_fused_adagrad_: {name}[{i}] shape {tuple(other.shape)} does "
+                    f"not match param shape {tuple(param.shape)}"
+                )
+            if other.dtype != param.dtype:
+                raise RuntimeError(
+                    f"_fused_adagrad_: {name}[{i}] dtype {other.dtype} does not "
+                    f"match param dtype {param.dtype}"
+                )
+            if other.device != param.device:
+                raise RuntimeError(
+                    f"_fused_adagrad_: {name}[{i}] device {other.device} does not "
+                    f"match param device {param.device}"
+                )
+            if other.stride() != param.stride():
+                raise RuntimeError(
+                    f"_fused_adagrad_: {name}[{i}] stride {other.stride()} does "
+                    f"not match param stride {param.stride()}"
+                )
+
+    # ``found_inf`` is read on-device inside the kernel; deliberately no
+    # ``.item()`` here, which would synchronize on every AMP step and break
+    # CUDA graph capture.
 
     for i in range(len(params)):
         param = params[i]
@@ -156,6 +209,10 @@ def _fused_adagrad_run(
         state_step = state_steps[i]
 
         n = param.numel()
+        # Nothing to update for an empty parameter, and a zero-sized grid is not
+        # a valid launch.
+        if n == 0:
+            continue
 
         # Pick a block size that is a power of two, large enough for occupancy
         # but bounded to avoid register pressure.
@@ -165,6 +222,9 @@ def _fused_adagrad_run(
 
         grid = (triton.cdiv(n, BLOCK_SIZE),)
 
+        # fp64 params accumulate in fp64; everything else in fp32.
+        acc_dtype = tl.float64 if param.dtype == torch.float64 else tl.float32
+
         _fused_adagrad_kernel[grid](
             param,
             grad,
@@ -172,6 +232,7 @@ def _fused_adagrad_run(
             state_step,
             n,
             BLOCK_SIZE,
+            acc_dtype,
             lr,
             lr_decay,
             weight_decay,
@@ -200,9 +261,8 @@ def _fused_adagrad_(
 ):
     """In-place fused Adagrad step.
 
-    Mirrors ``aten::_fused_adagrad_``: the parameter, gradient (only when
-    ``grad_scale`` is set) and ``state_sum`` tensors are updated in place and
-    nothing is returned.
+    Mirrors ``aten::_fused_adagrad_``: the ``params`` and ``state_sums`` tensors
+    are updated in place and nothing is returned. ``grads`` is not modified.
     """
     logger.debug("GEMS FUSED_ADAGRAD_")
 
