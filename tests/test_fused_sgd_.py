@@ -253,23 +253,23 @@ def test_fused_sgd__grad_scale():
 
 
 @pytest.mark.fused_sgd_
-def test_fused_sgd__found_inf():
-    """When found_inf is set, the whole step is skipped (no mutation)."""
+@pytest.mark.parametrize("found_inf_val", [0.0, 1.0, 2.0])
+def test_fused_sgd__found_inf(found_inf_val):
+    """``found_inf == 1`` skips the step; any other value applies it.
+
+    ATen compares against 1 exactly rather than ``> 0``, so 2.0 must still
+    update. Testing only 1.0 passes under either comparison and cannot catch a
+    kernel that loosened the condition to ``> 0``.
+    """
     _skip_if_cpu_ref()
     device = flag_gems.device
     dtype = torch.float32
-    # A single representative size is enough for the found_inf skip path, which
-    # is independent of shape and dtype.
+    # A single representative size is enough: the skip path is independent of
+    # shape and dtype.
     shape = (128, 128)
     p, g, mb = _make_inputs(shape, dtype, device, momentum=0.9)
-    fi = torch.tensor([1.0], device=device)
-    res_p, res_g, res_mb = p.clone(), g.clone(), mb.clone()
-
-    _run_gems(
-        flag_gems._fused_sgd_,
-        [res_p],
-        [res_g],
-        [res_mb],
+    fi = torch.tensor([found_inf_val], device=device)
+    opts = dict(
         weight_decay=0.01,
         momentum=0.9,
         lr=0.1,
@@ -280,7 +280,63 @@ def test_fused_sgd__found_inf():
         found_inf=fi,
     )
 
-    # Nothing should have changed.
-    utils.gems_assert_close(res_p, p, dtype)
-    utils.gems_assert_close(res_g, g, dtype)
-    utils.gems_assert_close(res_mb, mb, dtype)
+    ref_p, ref_g, ref_mb = p.clone(), g.clone(), mb.clone()
+    _run_ref(torch._fused_sgd_, [ref_p], [ref_g], [ref_mb], **opts)
+
+    res_p, res_g, res_mb = p.clone(), g.clone(), mb.clone()
+    _run_gems(flag_gems._fused_sgd_, [res_p], [res_g], [res_mb], **opts)
+
+    utils.gems_assert_close(res_p, ref_p, dtype)
+    utils.gems_assert_close(res_g, ref_g, dtype)
+    utils.gems_assert_close(res_mb, ref_mb, dtype)
+
+    if found_inf_val == 1.0:
+        # Buffers must be untouched, not merely close to the reference.
+        assert torch.equal(res_p, p)
+        assert torch.equal(res_mb, mb)
+    else:
+        assert not torch.equal(res_p, p)
+
+
+@pytest.mark.fused_sgd_
+@pytest.mark.parametrize("lr_shape", [(), (1,)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fused_sgd__tensor_lr(lr_shape, dtype):
+    """``_fused_sgd_.tensor_lr`` matches the native overload.
+
+    fp64 is included deliberately: the float overload passes ``lr`` as a scalar,
+    which Triton narrows to fp32, so a double-precision param has to read it from
+    a tensor instead. Both paths must agree with ATen.
+    """
+    _skip_if_cpu_ref()
+    device = flag_gems.device
+    shape = (256, 128)
+    p, g, mb = _make_inputs(shape, dtype, device, momentum=0.9)
+    # ATen requires an fp32 lr tensor regardless of the param dtype (an fp64 lr
+    # raises "expected scalar type Float but found Double"), so the kernel must
+    # widen it rather than assume it matches the params.
+    lr = torch.full(lr_shape, 0.07, dtype=torch.float32, device=device)
+    opts = dict(
+        weight_decay=0.01,
+        momentum=0.9,
+        lr=lr,
+        dampening=0.0,
+        nesterov=True,
+        maximize=False,
+        is_first_step=False,
+    )
+
+    ref_p, ref_g, ref_mb = p.clone(), g.clone(), mb.clone()
+    _run_ref(
+        torch.ops.aten._fused_sgd_.tensor_lr,
+        [ref_p],
+        [ref_g],
+        [ref_mb],
+        **opts,
+    )
+
+    res_p, res_g, res_mb = p.clone(), g.clone(), mb.clone()
+    _run_gems(flag_gems._fused_sgd__tensor_lr, [res_p], [res_g], [res_mb], **opts)
+
+    utils.gems_assert_close(res_p, ref_p, dtype)
+    utils.gems_assert_close(res_mb, ref_mb, dtype)

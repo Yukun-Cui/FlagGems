@@ -154,6 +154,7 @@ _FULL_CONFIG = (
     ("_fused_rms_norm", _fused_rms_norm),
     ("_fused_rms_norm_backward", _fused_rms_norm_backward),
     ("_fused_sgd_", _fused_sgd_),
+    ("_fused_sgd_.tensor_lr", _fused_sgd__tensor_lr),
     ("_grouped_mm", group_mm),
     (
         "_has_compatible_shallow_copy_type",
