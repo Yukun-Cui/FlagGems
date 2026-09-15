@@ -159,12 +159,22 @@ def test_gather_sparse_backward_edge(shape, dim, dtype):
     ndim = len(shape)
     if dim < 0:
         dim += ndim
-    size_dim = shape[dim] if shape[dim] > 0 else 4
     index_shape = list(shape)
-    index_shape[dim] = 1 if shape[dim] == 0 else max(1, shape[dim] // 2)
-    if all(s == 0 for s in shape):
-        index_shape = [0 if s == 0 else s for s in shape]
-    # Build a valid index (empty when the gather dim is empty).
+    if shape[dim] == 0:
+        # An empty gather dimension has no valid index values at all, so the index
+        # must be empty along that dimension too. Setting it to 1 here would build
+        # a non-empty index (e.g. (4, 1, 3) -> nnz 12) whose values address an
+        # empty dimension, which is a different -- and invalid -- case rather than
+        # the nnz == 0 edge case this test is for.
+        index_shape[dim] = 0
+        size_dim = 1  # unused; no index values are generated
+    else:
+        size_dim = shape[dim]
+        index_shape[dim] = max(1, shape[dim] // 2)
+    # Any other zero-sized dimension also forces an empty index.
+    if any(s == 0 for s in index_shape):
+        index_shape = [0 if s == 0 else s for s in index_shape]
+    # Build a valid index (empty when any index dimension is empty).
     if index_shape[dim] == 0:
         index = torch.empty(
             tuple(index_shape), dtype=torch.long, device=flag_gems.device
@@ -209,3 +219,39 @@ def test_gather_sparse_backward_negative_dim(inp_shape, dim, dtype):
     res_out = flag_gems._gather_sparse_backward(inp, neg_dim, index, grad)
 
     _assert_sparse_equal(res_out, ref_out, dtype)
+
+
+@pytest.mark.gather_sparse_backward
+@pytest.mark.parametrize(
+    "self_shape,index_shape",
+    [
+        ((), ()),  # 0-dim self, 0-dim index
+        ((5,), ()),  # 1-dim self, 0-dim index
+        ((), (1,)),  # 0-dim self, 1-dim index
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_gather_sparse_backward_scalar(self_shape, index_shape, dtype):
+    """Scalar ``self`` / ``index`` take ATen's dedicated paths.
+
+    The equal-rank requirement does not apply when either operand is 0-dim: the
+    native op yields a single non-zero and takes the sparse dimensionality from
+    ``self``, so a 0-dim self produces a (0, 1) index tensor with sparse_dim 0.
+    """
+    inp = torch.randn(self_shape, dtype=dtype, device=flag_gems.device)
+    index = torch.zeros(index_shape, dtype=torch.long, device=flag_gems.device)
+    grad = torch.randn(index_shape, dtype=dtype, device=flag_gems.device)
+
+    ref_out = _gather_sparse_backward(
+        utils.to_reference(inp),
+        0,
+        utils.to_reference(index),
+        utils.to_reference(grad),
+    )
+    res_out = flag_gems._gather_sparse_backward(inp, 0, index, grad)
+
+    assert res_out.shape == ref_out.shape
+    assert res_out.sparse_dim() == ref_out.sparse_dim()
+    assert res_out._nnz() == ref_out._nnz()
+    assert res_out._indices().shape == ref_out._indices().shape
+    utils.gems_assert_close(res_out._values(), ref_out._values(), dtype)

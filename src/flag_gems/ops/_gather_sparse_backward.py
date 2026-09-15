@@ -155,14 +155,50 @@ def _gather_sparse_backward(self, dim, index, grad):
     logger.debug("GEMS _GATHER_SPARSE_BACKWARD")
 
     ndim = self.ndim
-    if ndim != index.ndim:
+
+    # ATen has dedicated scalar paths: when either ``self`` or ``index`` is 0-dim
+    # the equal-rank requirement does not apply. Verified against the native op:
+    #
+    #   0-dim self, 0-dim index -> nnz 1, sparse_dim 0, indices (0, 1)
+    #   1-dim self, 0-dim index -> nnz 1, sparse_dim 1, indices (1, 1)
+    #   0-dim self, 1-dim index -> nnz 1, sparse_dim 0, indices (0, 1)
+    #
+    # so a 0-dim operand yields a single non-zero and the sparse dimensionality
+    # follows ``self``, not ``index``.
+    is_scalar_case = ndim == 0 or index.ndim == 0
+    if not is_scalar_case and ndim != index.ndim:
         raise IndexError(
             f"self and index must have the same number of dimensions, "
             f"got self.ndim = {ndim} and index.ndim = {index.ndim}"
         )
 
-    # Normalize the gather dimension (matches aten's `maybe_wrap_dim`).
-    dim = dim if dim >= 0 else dim + ndim
+    # Normalize the gather dimension (matches aten's `maybe_wrap_dim`). A 0-dim
+    # self admits only dim 0/-1, which both normalize to 0.
+    if ndim == 0:
+        if dim not in (0, -1):
+            raise IndexError(
+                f"Dimension out of range (expected to be in range of [-1, 0], "
+                f"but got {dim})"
+            )
+        dim = 0
+    else:
+        dim = dim if dim >= 0 else dim + ndim
+        if not 0 <= dim < ndim:
+            raise IndexError(
+                f"Dimension out of range (expected to be in range of "
+                f"[{-ndim}, {ndim - 1}], but got {dim})"
+            )
+
+    if is_scalar_case:
+        # One non-zero at the all-zero coordinate; the sparse dimensionality comes
+        # from ``self``, so a 0-dim self gives a (0, 1) index tensor.
+        values = grad.reshape(-1)[:1] if grad.numel() else grad.reshape(-1)
+        sparse_indices = torch.zeros(
+            (ndim, values.numel()), dtype=torch.int64, device=index.device
+        )
+        return torch.sparse_coo_tensor(
+            sparse_indices, values, self.size(), device=self.device
+        )
 
     index = index.contiguous()
     grad = grad.contiguous()
