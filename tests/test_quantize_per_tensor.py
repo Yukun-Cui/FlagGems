@@ -94,6 +94,12 @@ def test_quantize_per_tensor_out(shape, in_dtype, scale, zero_point):
 
 
 @pytest.mark.quantize_per_tensor
+@pytest.mark.skipif(
+    utils.TO_CPU,
+    reason="half-way quotients are backend-specific: CPU aten rounds the fp32 "
+    "product, CUDA aten rounds the fp64 quotient, and the two disagree by 1. "
+    "This kernel targets CUDA, so the comparison is only meaningful there.",
+)
 @pytest.mark.parametrize("in_dtype", QUANT_DTYPES)
 def test_quantize_per_tensor_half_way_values(in_dtype):
     """Values whose quotient lands exactly on ``k + 0.5``.
@@ -103,13 +109,17 @@ def test_quantize_per_tensor_half_way_values(in_dtype):
     inputs almost never produce one. A non-zero ``zero_point`` is essential here,
     since adding it before rounding rather than after only changes the result at
     a tie.
+
+    Skipped under ``--ref=cpu``: at exactly these inputs the two aten backends
+    genuinely disagree (for x=0.85, scale=0.1 CPU gives 8 and CUDA gives 9), so no
+    single kernel can be bit-exact against both. Every other test in this file
+    passes under either reference, since random inputs essentially never tie.
     """
     scale = 0.14897697696685788
     ks = torch.arange(-400, 400, dtype=torch.float64) + 0.5
     res_inp = (ks * scale).to(torch.float32).cuda()
-    ref_inp = utils.to_reference(res_inp)
 
-    ref_out = torch.quantize_per_tensor(ref_inp, scale, 5, in_dtype)
+    ref_out = torch.quantize_per_tensor(res_inp, scale, 5, in_dtype)
     res_out = flag_gems.quantize_per_tensor(res_inp, scale, 5, in_dtype)
     utils.gems_assert_equal(res_out.int_repr(), ref_out.int_repr())
 
