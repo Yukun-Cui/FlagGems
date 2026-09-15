@@ -21,6 +21,7 @@ addcmul_out: test_addcmul
 addmm_out: test_addmm
 addmm_dtype_out: test_addmm
 addmv_out: test_addmv
+histogramdd_bin_edges_out: test_histogramdd_bin_edges
 arccosh_out: test_acosh
 arcsin_out: test_asin
 arcsinh_out: test_asinh

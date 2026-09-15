@@ -241,3 +241,111 @@ def test_histogramdd_bin_edges_out(shape, bins, dtype):
     flag_gems._histogramdd_bin_edges_out(inp, bins_list, out=res_out)
 
     _assert_edges_close(res_out, ref_out, dtype)
+
+
+@pytest.mark.histogramdd_bin_edges
+@pytest.mark.parametrize("nbins", [-3, -2, -1, 0, 1])
+def test_histogramdd_bin_edges_negative_bins(nbins):
+    """Parity for bins <= 0.
+
+    ATen builds the edges with ``linspace(steps=bins + 1)``, so bins == -1 (zero
+    edges) and bins == 0 (one edge) are legal, and only bins <= -2 raises. A
+    kernel that clamps the negative edge count to zero would silently accept -2
+    and -3.
+    """
+    dtype = torch.float32
+    inp = torch.randn(16, 1, dtype=dtype, device=flag_gems.device)
+    ref_inp = _to_cpu_ref(inp)
+
+    ref_exc = None
+    try:
+        ref = torch.ops.aten._histogramdd_bin_edges(ref_inp, [nbins])
+    except RuntimeError as e:
+        ref_exc = e
+
+    if ref_exc is not None:
+        with pytest.raises(RuntimeError, match="number of steps must be non-negative"):
+            flag_gems._histogramdd_bin_edges(inp, [nbins])
+    else:
+        res = flag_gems._histogramdd_bin_edges(inp, [nbins])
+        assert len(res) == len(ref)
+        assert res[0].numel() == ref[0].numel() == nbins + 1
+        _assert_edges_close(res, ref, dtype)
+
+
+@pytest.mark.histogramdd_bin_edges
+@pytest.mark.parametrize(
+    "bad", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"]
+)
+@pytest.mark.parametrize("endpoint", [0, 1], ids=["left", "right"])
+def test_histogramdd_bin_edges_nonfinite_explicit_range(bad, endpoint):
+    """An explicit non-finite range must raise, not produce non-finite edges."""
+    inp = torch.randn(16, 2, dtype=torch.float32, device=flag_gems.device)
+    rng = [0.0, 1.0, 0.0, 1.0]
+    rng[endpoint] = bad
+
+    with pytest.raises(RuntimeError, match="is not finite"):
+        flag_gems._histogramdd_bin_edges(inp, [4, 4], range=rng)
+
+    # Same input is rejected by ATen.
+    with pytest.raises(RuntimeError, match="is not finite"):
+        torch.ops.aten._histogramdd_bin_edges(_to_cpu_ref(inp), [4, 4], range=rng)
+
+
+@pytest.mark.histogramdd_bin_edges
+@pytest.mark.parametrize("shape", [(3, 0), (0, 0), (2, 5, 0)])
+def test_histogramdd_bin_edges_empty_innermost(shape):
+    """An empty innermost dimension yields an empty edge list, as in ATen.
+
+    Also guards the reshape(-1, 0) path, which cannot infer a leading extent.
+    """
+    inp = torch.randn(shape, dtype=torch.float32, device=flag_gems.device)
+    ref = torch.ops.aten._histogramdd_bin_edges(_to_cpu_ref(inp), [])
+    res = flag_gems._histogramdd_bin_edges(inp, [])
+    assert len(res) == len(ref) == 0
+
+
+@pytest.mark.histogramdd_bin_edges_out
+def test_histogramdd_bin_edges_out_contract():
+    """``out=`` parity: list length, dtype, reuse, resize and non-contiguity."""
+    dtype = torch.float32
+    dev = flag_gems.device
+    inp = torch.randn(16, 2, dtype=dtype, device=dev)
+    bins = [3, 3]
+
+    # Wrong list length is rejected (ATen raises for 1 and 3 given 2 dimensions).
+    for n in (1, 3):
+        outs = [torch.empty(0, dtype=dtype, device=dev) for _ in range(n)]
+        with pytest.raises(RuntimeError):
+            flag_gems._histogramdd_bin_edges_out(inp, bins, out=outs)
+
+    # A mismatched out dtype must raise rather than being silently cast by copy_.
+    bad = [torch.empty(0, dtype=torch.float64, device=dev) for _ in range(2)]
+    with pytest.raises(RuntimeError, match="dtype"):
+        flag_gems._histogramdd_bin_edges_out(inp, bins, out=bad)
+    with pytest.raises(RuntimeError, match="dtype"):
+        torch.ops.aten._histogramdd_bin_edges.out(
+            _to_cpu_ref(inp), bins, out=[t.cpu() for t in bad]
+        )
+
+    # Wrongly sized outputs are resized in place, reusing the same objects.
+    outs = [
+        torch.empty(99, dtype=dtype, device=dev),
+        torch.empty(1, dtype=dtype, device=dev),
+    ]
+    ids = [id(o) for o in outs]
+    flag_gems._histogramdd_bin_edges_out(inp, bins, out=outs)
+    assert [o.numel() for o in outs] == [4, 4]
+    assert [id(o) for o in outs] == ids
+
+    ref_out = [torch.empty(0, dtype=dtype) for _ in range(2)]
+    torch.ops.aten._histogramdd_bin_edges.out(_to_cpu_ref(inp), bins, out=ref_out)
+    _assert_edges_close(outs, ref_out, dtype)
+
+    # A non-contiguous output of the right size is accepted, as in ATen.
+    base = torch.empty(8, dtype=dtype, device=dev)
+    nc = base[::2]
+    assert not nc.is_contiguous() and nc.numel() == 4
+    outs = [nc, torch.empty(0, dtype=dtype, device=dev)]
+    flag_gems._histogramdd_bin_edges_out(inp, bins, out=outs)
+    _assert_edges_close(outs, ref_out, dtype)

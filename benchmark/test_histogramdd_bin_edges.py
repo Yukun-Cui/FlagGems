@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from flag_gems.ops._histogramdd_bin_edges import _histogramdd_bin_edges as gems_op
+import flag_gems
 
 from . import base
 
@@ -37,7 +37,16 @@ HIST_SHAPES = [
 
 
 class _FixedShapesBenchmark(base.GenericBenchmark2DOnly):
-    """Generic 2D benchmark that pins the shape list to ``HIST_SHAPES``."""
+    """Generic 2D benchmark that pins the shape list to ``HIST_SHAPES``.
+
+    ``speedup`` is deliberately dropped from the metrics: the baseline runs the
+    native CPU kernel (aten has no CUDA implementation of this operator), so
+    ``latency_base`` and ``latency`` are measured on different devices and their
+    ratio is not an operator-parity speedup. The two latencies are still reported
+    individually, which is the honest form of this comparison.
+    """
+
+    DEFAULT_METRICS = ["latency_base", "latency"]
 
     def init_user_config(self):
         # Bypass the yaml-based shape loading; dtypes/metrics still use Config.
@@ -49,18 +58,49 @@ class _FixedShapesBenchmark(base.GenericBenchmark2DOnly):
         self.shapes = [tuple(s) for s in HIST_SHAPES]
 
 
+# The harness hands both the baseline and the gems op the same arguments, but the
+# native kernel is CPU-only. Keeping a CPU copy of each generated input here lets
+# the baseline run without an H2D/D2H copy inside the timed region: timing those
+# copies would charge the native op for transfers the gems op never performs.
+_CPU_INPUTS = {}
+_CPU_OUTPUTS = {}
+
+
 def _input_fn(shape, dtype, device):
     inp = torch.randn(shape, dtype=dtype, device=device)
+    _CPU_INPUTS[_cpu_key(inp)] = inp.to("cpu")
     yield inp, {"bins": list(HIST_BINS)}
 
 
+def _cpu_key(t):
+    return (t.data_ptr(), tuple(t.shape), t.dtype)
+
+
+def _cpu_view(inp):
+    """Return the pre-staged CPU copy of ``inp`` (falling back to a copy).
+
+    Compared against None explicitly: a multi-element tensor is not usable in a
+    boolean expression.
+    """
+    staged = _CPU_INPUTS.get(_cpu_key(inp))
+    return inp.to("cpu") if staged is None else staged
+
+
+gems_op = flag_gems._histogramdd_bin_edges
+
+
 def _torch_op(inp, *, bins, range=None, weight=None, density=False):
-    # Fall back to the CPU implementation since aten has no CUDA kernel.
-    ref_inp = inp.to("cpu")
-    out = torch._histogramdd_bin_edges(
-        ref_inp, bins, range=range, weight=weight, density=density
+    """Native CPU baseline.
+
+    aten has no CUDA kernel for this operator, so there is no same-device
+    reference: ``latency_base`` below is a CPU measurement and ``latency`` a CUDA
+    one. That is why ``speedup`` is not reported (see ``_FixedShapesBenchmark``);
+    the two numbers are informative individually but their ratio is not operator
+    parity.
+    """
+    return torch._histogramdd_bin_edges(
+        _cpu_view(inp), bins, range=range, weight=weight, density=density
     )
-    return [t.to(inp.device) for t in out]
 
 
 @pytest.mark.histogramdd_bin_edges
@@ -78,27 +118,35 @@ def test_histogramdd_bin_edges():
 @pytest.mark.histogramdd_bin_edges_out
 def test_histogramdd_bin_edges_out():
     def _torch_out_op(inp, *, bins, out=None, range=None, weight=None, density=False):
-        ref_inp = inp.to("cpu")
-        ref_out = [t.to("cpu") for t in out]
+        """Native CPU baseline for the ``out`` overload.
+
+        Writes into pre-staged CPU outputs so the timed region is the native
+        kernel only, with no device transfers the gems path does not perform.
+        See ``_torch_op`` on why no speedup is reported.
+        """
+        ref_out = _CPU_OUTPUTS[id(out)]
         torch.ops.aten._histogramdd_bin_edges.out(
-            ref_inp, bins, range=range, weight=weight, density=density, out=ref_out
+            _cpu_view(inp),
+            bins,
+            range=range,
+            weight=weight,
+            density=density,
+            out=ref_out,
         )
-        for gpu, cpu in zip(out, ref_out):
-            if gpu.numel() != cpu.numel():
-                gpu.resize_(cpu.numel())
-            gpu.copy_(cpu.to(inp.device))
 
     def _gems_out_op(inp, *, bins, out=None, range=None, weight=None, density=False):
-        from flag_gems.ops._histogramdd_bin_edges import _histogramdd_bin_edges_out
-
-        return _histogramdd_bin_edges_out(
+        return flag_gems._histogramdd_bin_edges_out(
             inp, bins, range=range, weight=weight, density=density, out=out
         )
 
     def _out_input_fn(shape, dtype, device):
         n_dims = len(HIST_BINS)
         inp = torch.randn(shape, dtype=dtype, device=device)
+        _CPU_INPUTS[_cpu_key(inp)] = inp.to("cpu")
         out = [torch.empty(0, dtype=dtype, device=device) for _ in range(n_dims)]
+        _CPU_OUTPUTS[id(out)] = [
+            torch.empty(0, dtype=dtype, device="cpu") for _ in range(n_dims)
+        ]
         yield inp, {"bins": list(HIST_BINS), "out": out}
 
     bench = _FixedShapesBenchmark(
