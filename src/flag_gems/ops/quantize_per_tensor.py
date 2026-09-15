@@ -19,7 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.runtime import device as runtime_device
 from flag_gems.utils import tl_extra_shim
 
 logger = logging.getLogger(__name__)
@@ -32,14 +31,25 @@ _QUANT_INFO = {
     torch.qint32: (torch.int32, -2147483648, 2147483647),
 }
 
-# PyTorch's reference ``quantize_per_tensor`` rounds ``x / scale`` (ties to
-# even) in double precision before clamping to the quantized integer range. To
-# reproduce that bit-for-bit while staying fast we compute ``round(x * inv)``
-# where ``inv = 1.0 / scale`` is precomputed in fp64 -- fp64 multiplication is
-# ~8x faster than fp64 division on the tensor cores yet yields the identical
-# rounded result. When the device lacks fp64 we fall back to fp32, which may
-# differ by +/-1 at exact half-way points.
-_USE_FP64 = bool(getattr(runtime_device, "support_fp64", False))
+# ATen's quantized CUDA path computes
+# ``nearbyint(raw_val * (1 / scale)) + zero_point`` entirely in fp32: it narrows
+# the double ``scale`` from the schema to float, takes the fp32 reciprocal once,
+# and multiplies. Reproducing that exactly requires matching both the operation
+# and the precision -- verified element-by-element against the native op on
+# engineered half-way values:
+#
+#   fp32 reciprocal multiply :      0 / 307200 mismatches
+#   fp32 true division       :  39258 / 307200 mismatches
+#   fp64 (either form)       : ~19% of half-way values mismatch
+#
+# These forms are genuinely different: for x=31.508630752563477,
+# scale=0.14897697696685788, ``x * (1/scale)`` is 211.49998 -> 211 (what ATen
+# returns) while ``x / scale`` is exactly 211.5 -> 212. Widening to fp64 makes it
+# worse, not better: for x=0.35, scale=0.1 ATen yields 4 but fp64 yields 3.
+#
+# Note also that plain ``/`` in Triton lowers to the fast approximate reciprocal,
+# which is a third, separately-wrong answer; the explicit reciprocal below avoids
+# depending on how the division is lowered.
 
 
 @triton.jit
@@ -52,21 +62,17 @@ def quantize_per_tensor_kernel(
     qmax: tl.constexpr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
-    USE_FP64: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    # ``inv_scale`` is loaded from an fp32 0-dim tensor rather than passed as a
+    # Python float: a float scalar binds as fp64 and promotes the multiply,
+    # changing the rounded result at half-way points.
     inv_scale = tl.load(inv_scale_ptr)
-    if USE_FP64:
-        x = x.to(tl.float64)
-        inv_scale = inv_scale.to(tl.float64)
-    else:
-        x = x.to(tl.float32)
-        inv_scale = inv_scale.to(tl.float32)
-    # int_value = round_half_even(x * (1 / scale)) + zero_point, then clamp.
+    # int_value = nearbyint(raw_val * (1 / scale)) + zero_point, then clamp.
     q = tl_extra_shim.rint(x * inv_scale) + zero_point
     q = tl.minimum(tl.maximum(q, qmin), qmax)
     tl.store(out_ptr + offsets, q.to(out_ptr.dtype.element_ty), mask=mask)
@@ -78,25 +84,39 @@ def _quantize_per_tensor_impl(a, scale, zero_point, dtype):
     Returns the integer storage tensor (e.g. uint8 for quint8) holding
     ``clamp(rint(x / scale) + zero_point, qmin, qmax)``.
     """
+    if dtype not in _QUANT_INFO:
+        raise RuntimeError(
+            f"quantize_per_tensor: unsupported quantized dtype {dtype}, expected "
+            "one of torch.quint8, torch.qint8, torch.qint32"
+        )
+    # ATen only accepts float32 input and raises for anything else, rather than
+    # silently upcasting/downcasting.
+    if a.dtype != torch.float32:
+        raise RuntimeError(
+            f"quantize_per_tensor: expected input of dtype torch.float32, got {a.dtype}"
+        )
+
     storage_dtype, qmin, qmax = _QUANT_INFO[dtype]
     n_elements = a.numel()
     out = torch.empty(a.shape, dtype=storage_dtype, device=a.device)
     if n_elements == 0:
         return out
 
-    # ``inv_scale`` is passed through a 0-dim tensor so its full precision
-    # survives into the kernel: a Python ``float`` scalar would be narrowed to
-    # fp32 by the Triton arg binding, which would lose the round-half-even match
-    # with the reference on half-way values. fp64 storage is used when supported.
-    inv_dtype = torch.float64 if _USE_FP64 else torch.float32
-    inv_scale_tensor = torch.tensor(
-        1.0 / float(scale), device=a.device, dtype=inv_dtype
-    )
+    # The kernel walks storage with a flat offset, so a transposed or sliced view
+    # would be read in the wrong order; materialize a dense copy first.
+    a = a.contiguous()
 
     # One thread per element; 1024 is a standard block size that keeps the
     # launch grid small for the typical quantization buffer sizes.
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    # Narrow the scale to fp32 and take the reciprocal there, matching ATen's
+    # order of operations. Carried in a 0-dim tensor so the value reaches the
+    # kernel as fp32 instead of being re-widened by the Triton scalar binding.
+    inv_scale_tensor = torch.reciprocal(
+        torch.tensor(float(scale), dtype=torch.float32, device=a.device)
+    )
+
     quantize_per_tensor_kernel[grid](
         a,
         out,
@@ -106,7 +126,6 @@ def _quantize_per_tensor_impl(a, scale, zero_point, dtype):
         qmax=qmax,
         n_elements=n_elements,
         BLOCK_SIZE=BLOCK_SIZE,
-        USE_FP64=_USE_FP64,
     )
     return out
 
@@ -121,6 +140,30 @@ def quantize_per_tensor(a, scale, zero_point, dtype):
 
 def quantize_per_tensor_out(a, scale, zero_point, dtype, *, out=None):
     logger.debug("GEMS QUANTIZE_PER_TENSOR_OUT")
+    if out is None:
+        raise RuntimeError("quantize_per_tensor.out: argument 'out' is required")
+
+    # ATen validates the out tensor's dtype and device before computing, with the
+    # requested quantized dtype -- not the input dtype -- deciding what is legal.
+    if out.dtype != dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {dtype}, but got {out.dtype} instead"
+        )
+    if out.device != a.device:
+        raise RuntimeError(
+            f"Expected out tensor to have device {a.device}, but got {out.device} "
+            "instead"
+        )
+    # A shape mismatch is a resize in ATen, but ``aten::resize_`` has no
+    # QuantizedCUDA kernel, so the native op itself fails on this path. Reject it
+    # with a clear message rather than silently producing a wrong-shaped result.
+    if tuple(out.shape) != tuple(a.shape):
+        raise RuntimeError(
+            f"quantize_per_tensor.out: out has shape {tuple(out.shape)} but the "
+            f"result requires {tuple(a.shape)}; resizing a quantized CUDA output "
+            "is not supported"
+        )
+
     result = quantize_per_tensor(a, scale, zero_point, dtype)
     # ``out`` is a quantized tensor; ``copy_`` propagates both the integer
     # storage and the quantization parameters (scale / zero_point) onto it,

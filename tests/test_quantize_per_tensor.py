@@ -24,6 +24,10 @@ from . import accuracy_utils as utils
 # so there is no ``FLOAT_DTYPES`` parametrization here. The output is a
 # quantized tensor whose ``int_repr`` matches the reference exactly (round to
 # nearest, ties to even), hence ``gems_assert_equal`` on the int representation.
+#
+# The computation is fp32 end to end -- matching ATen, which narrows the double
+# scale to float and multiplies by the fp32 reciprocal -- so the result does not
+# depend on whether the device supports fp64.
 QUANT_DTYPES = [torch.quint8, torch.qint8, torch.qint32]
 QUANT_SHAPES = (
     [(2, 19, 7)]
@@ -50,15 +54,6 @@ def _make_input(shape, device="cuda"):
 @pytest.mark.parametrize("scale", SCALES)
 @pytest.mark.parametrize("zero_point", ZERO_POINTS)
 def test_quantize_per_tensor(shape, in_dtype, scale, zero_point):
-    # The kernel computes the quantized integer in fp64 when the device supports
-    # it (matching the CPU fp64 reference exactly) and falls back to fp32
-    # otherwise, which can differ by +/-1 at half-way points. Under --ref=cpu
-    # the reference runs on CPU (always fp64), so on a non-fp64 GPU the exact
-    # int_repr comparison would be device-dependent -> skip there.
-    if utils.TO_CPU and not utils.fp64_is_supported:
-        pytest.skip(
-            "quantize_per_tensor int_repr is fp64-dependent; non-fp64 GPU vs CPU ref mismatch"
-        )
     res_inp = _make_input(shape)
     ref_inp = utils.to_reference(res_inp)
 
@@ -77,11 +72,6 @@ def test_quantize_per_tensor(shape, in_dtype, scale, zero_point):
 @pytest.mark.parametrize("scale", SCALES)
 @pytest.mark.parametrize("zero_point", ZERO_POINTS)
 def test_quantize_per_tensor_out(shape, in_dtype, scale, zero_point):
-    # See test_quantize_per_tensor: exact int_repr equality is fp64-dependent.
-    if utils.TO_CPU and not utils.fp64_is_supported:
-        pytest.skip(
-            "quantize_per_tensor int_repr is fp64-dependent; non-fp64 GPU vs CPU ref mismatch"
-        )
     res_inp = _make_input(shape)
     ref_inp = utils.to_reference(res_inp)
 
@@ -101,3 +91,84 @@ def test_quantize_per_tensor_out(shape, in_dtype, scale, zero_point):
     utils.gems_assert_equal(res_r.int_repr(), ref_r.int_repr())
     assert res_r.q_scale() == ref_r.q_scale()
     assert res_r.q_zero_point() == ref_r.q_zero_point()
+
+
+@pytest.mark.quantize_per_tensor
+@pytest.mark.parametrize("in_dtype", QUANT_DTYPES)
+def test_quantize_per_tensor_half_way_values(in_dtype):
+    """Values whose quotient lands exactly on ``k + 0.5``.
+
+    This is the only input class that distinguishes ATen's fp32 reciprocal
+    multiply from a true division or an fp64 computation, so uniformly random
+    inputs do not exercise it. Ties round to even.
+    """
+    scale = 0.14897697696685788
+    ks = torch.arange(-400, 400, dtype=torch.float64) + 0.5
+    res_inp = (ks * scale).to(torch.float32).cuda()
+    ref_inp = utils.to_reference(res_inp)
+
+    ref_out = torch.quantize_per_tensor(ref_inp, scale, 5, in_dtype)
+    res_out = flag_gems.quantize_per_tensor(res_inp, scale, 5, in_dtype)
+    utils.gems_assert_equal(res_out.int_repr(), ref_out.int_repr())
+
+
+@pytest.mark.quantize_per_tensor
+@pytest.mark.parametrize("in_dtype", QUANT_DTYPES)
+@pytest.mark.parametrize("layout", ["transpose", "slice", "narrow"])
+def test_quantize_per_tensor_non_contiguous(in_dtype, layout):
+    base = _make_input((64, 64))
+    view = {
+        "transpose": lambda t: t.t(),
+        "slice": lambda t: t[:, ::2],
+        "narrow": lambda t: t[8:24, 4:20],
+    }[layout](base)
+    assert not view.is_contiguous()
+    ref_view = utils.to_reference(view)
+
+    ref_out = torch.quantize_per_tensor(ref_view, 0.05, 7, in_dtype)
+    res_out = flag_gems.quantize_per_tensor(view, 0.05, 7, in_dtype)
+    utils.gems_assert_equal(res_out.int_repr(), ref_out.int_repr())
+    assert tuple(res_out.shape) == tuple(view.shape)
+
+
+@pytest.mark.quantize_per_tensor
+@pytest.mark.parametrize("bad_dtype", [torch.float64, torch.float16, torch.bfloat16])
+def test_quantize_per_tensor_rejects_non_float32(bad_dtype):
+    # ATen raises "Quantize only works on Float Tensor" rather than upcasting.
+    inp = torch.randn(32, dtype=bad_dtype, device="cuda")
+    with pytest.raises(RuntimeError, match="torch.float32"):
+        flag_gems.quantize_per_tensor(inp, 0.1, 0, torch.quint8)
+
+
+@pytest.mark.quantize_per_tensor
+def test_quantize_per_tensor_empty():
+    inp = torch.empty(0, dtype=torch.float32, device="cuda")
+    ref_out = torch.quantize_per_tensor(utils.to_reference(inp), 0.1, 0, torch.quint8)
+    res_out = flag_gems.quantize_per_tensor(inp, 0.1, 0, torch.quint8)
+    assert res_out.numel() == 0
+    assert res_out.dtype == ref_out.dtype
+    assert res_out.q_scale() == ref_out.q_scale()
+
+
+@pytest.mark.quantize_per_tensor_out
+def test_quantize_per_tensor_out_dtype_mismatch():
+    inp = _make_input((8, 8))
+    # Requesting quint8 while handing in a qint8 buffer: ATen validates the out
+    # dtype against the *requested* quantized dtype and rejects the mismatch.
+    out = torch._empty_affine_quantized(
+        (8, 8), scale=0.1, zero_point=0, dtype=torch.qint8, device="cuda"
+    )
+    with pytest.raises(RuntimeError, match="dtype"):
+        flag_gems.quantize_per_tensor_out(inp, 0.1, 0, torch.quint8, out=out)
+
+
+@pytest.mark.quantize_per_tensor_out
+def test_quantize_per_tensor_out_shape_mismatch():
+    inp = _make_input((8, 8))
+    out = torch._empty_affine_quantized(
+        (2, 2), scale=0.1, zero_point=0, dtype=torch.quint8, device="cuda"
+    )
+    # A shape mismatch is a resize in ATen, but ``aten::resize_`` has no
+    # QuantizedCUDA kernel, so the native op fails here too.
+    with pytest.raises(RuntimeError):
+        flag_gems.quantize_per_tensor_out(inp, 0.1, 0, torch.quint8, out=out)
