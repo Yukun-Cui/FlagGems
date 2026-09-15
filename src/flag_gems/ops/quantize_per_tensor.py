@@ -31,32 +31,40 @@ _QUANT_INFO = {
     torch.qint32: (torch.int32, -2147483648, 2147483647),
 }
 
-# ATen's quantized CUDA path computes
-# ``nearbyint(raw_val * (1 / scale)) + zero_point`` entirely in fp32: it narrows
-# the double ``scale`` from the schema to float, takes the fp32 reciprocal once,
-# and multiplies. Reproducing that exactly requires matching both the operation
-# and the precision -- verified element-by-element against the native op on
-# engineered half-way values:
+# ATen's quantized CUDA path computes, per element,
 #
-#   fp32 reciprocal multiply :      0 / 307200 mismatches
-#   fp32 true division       :  39258 / 307200 mismatches
-#   fp64 (either form)       : ~19% of half-way values mismatch
+#   int_value = static_cast<int64_t>(zero_point + nearbyint(raw_val / scale))
 #
-# These forms are genuinely different: for x=31.508630752563477,
-# scale=0.14897697696685788, ``x * (1/scale)`` is 211.49998 -> 211 (what ATen
-# returns) while ``x / scale`` is exactly 211.5 -> 212. Widening to fp64 makes it
-# worse, not better: for x=0.35, scale=0.1 ATen yields 4 but fp64 yields 3.
+# Two details of that expression matter for bit-exactness, and both were wrong in
+# an earlier revision of this file:
 #
-# Note also that plain ``/`` in Triton lowers to the fast approximate reciprocal,
-# which is a third, separately-wrong answer; the explicit reciprocal below avoids
-# depending on how the division is lowered.
+# 1. The division is a true fp64 division. ``scale`` arrives from the schema as a
+#    double and is *not* narrowed to float on this backend, so the quotient is
+#    computed in double precision. Reproducing it with an fp32 reciprocal
+#    multiply agrees with the CPU reference but not with CUDA: for x=0.85,
+#    scale=0.1 the fp32 product is exactly 8.5 -> 8, while the fp64 quotient is
+#    8.500000238418579 -> 9, which is what quantize_per_tensor returns on CUDA.
+#    Only 3 elements in 7.8M hit this, so it is easy to miss with random inputs.
+#
+# 2. ``zero_point`` is added *after* rounding, not before. Adding it first lets an
+#    integer offset move a value onto or off a tie: for x=0.75, scale=0.1,
+#    zero_point=5 the quotient is exactly 7.5, and nearbyint(7.5) + 5 = 13 (ATen's
+#    answer) whereas nearbyint(7.5 + 5) = 12.
+#
+# ``nearbyint`` here is round-half-to-even in the default rounding mode, so 7.5
+# rounds up to 8 but 12.5 rounds down to 12; the ordering in (2) is what makes
+# that distinction observable.
+#
+# Note also that plain ``/`` on fp32 in Triton lowers to the fast approximate
+# reciprocal, a third and separately-wrong answer. Operating in fp64 avoids that
+# as a side effect, since there is no fast-math fp64 reciprocal to fall into.
 
 
 @triton.jit
 def quantize_per_tensor_kernel(
     x_ptr,
     out_ptr,
-    inv_scale_ptr,
+    scale_ptr,
     zero_point,
     qmin: tl.constexpr,
     qmax: tl.constexpr,
@@ -67,13 +75,14 @@ def quantize_per_tensor_kernel(
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    # ``inv_scale`` is loaded from an fp32 0-dim tensor rather than passed as a
-    # Python float: a float scalar binds as fp64 and promotes the multiply,
-    # changing the rounded result at half-way points.
-    inv_scale = tl.load(inv_scale_ptr)
-    # int_value = nearbyint(raw_val * (1 / scale)) + zero_point, then clamp.
-    q = tl_extra_shim.rint(x * inv_scale) + zero_point
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float64)
+    # ``scale`` is loaded from a 0-dim fp64 tensor rather than passed as a Python
+    # float: Triton narrows a float kernel argument to fp32, which silently turns
+    # the division below back into a single-precision one.
+    scale = tl.load(scale_ptr)
+    # zero_point + nearbyint(raw_val / scale), then clamp. Rounding happens
+    # before the zero_point add -- see (2) above.
+    q = tl_extra_shim.rint(x / scale) + zero_point
     q = tl.minimum(tl.maximum(q, qmin), qmax)
     tl.store(out_ptr + offsets, q.to(out_ptr.dtype.element_ty), mask=mask)
 
@@ -110,17 +119,14 @@ def _quantize_per_tensor_impl(a, scale, zero_point, dtype):
     # launch grid small for the typical quantization buffer sizes.
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    # Narrow the scale to fp32 and take the reciprocal there, matching ATen's
-    # order of operations. Carried in a 0-dim tensor so the value reaches the
-    # kernel as fp32 instead of being re-widened by the Triton scalar binding.
-    inv_scale_tensor = torch.reciprocal(
-        torch.tensor(float(scale), dtype=torch.float32, device=a.device)
-    )
+    # Carried in a 0-dim fp64 tensor so the exact double reaches the kernel; see
+    # the note in the kernel about Triton narrowing float scalar arguments.
+    scale_tensor = torch.tensor(float(scale), dtype=torch.float64, device=a.device)
 
     quantize_per_tensor_kernel[grid](
         a,
         out,
-        inv_scale_tensor,
+        scale_tensor,
         int(zero_point),
         qmin=qmin,
         qmax=qmax,

@@ -98,9 +98,11 @@ def test_quantize_per_tensor_out(shape, in_dtype, scale, zero_point):
 def test_quantize_per_tensor_half_way_values(in_dtype):
     """Values whose quotient lands exactly on ``k + 0.5``.
 
-    This is the only input class that distinguishes ATen's fp32 reciprocal
-    multiply from a true division or an fp64 computation, so uniformly random
-    inputs do not exercise it. Ties round to even.
+    Half-way quotients are the only input class that pins down the precision of
+    the division and the position of the ``zero_point`` add; uniformly random
+    inputs almost never produce one. A non-zero ``zero_point`` is essential here,
+    since adding it before rounding rather than after only changes the result at
+    a tie.
     """
     scale = 0.14897697696685788
     ks = torch.arange(-400, 400, dtype=torch.float64) + 0.5
