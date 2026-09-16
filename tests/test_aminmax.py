@@ -45,12 +45,14 @@ def test_aminmax(shape, dim, keepdim, dtype):
         ref_max = torch.amax(ref_inp, dim=dim, keepdim=keepdim)
     else:
         ref_min, ref_max = torch.aminmax(ref_inp, dim=dim, keepdim=keepdim)
-    with flag_gems.use_gems():
-        if isinstance(dim, list):
-            res_min = torch.amin(inp, dim=dim, keepdim=keepdim)
-            res_max = torch.amax(inp, dim=dim, keepdim=keepdim)
-        else:
-            res_min, res_max = torch.aminmax(inp, dim=dim, keepdim=keepdim)
+    # Call the FlagGems entry points directly rather than dispatching through
+    # use_gems(): the framework handles dispatch, and check-kernelgen-tests
+    # forbids use_gems() in tests for KernelGen operators.
+    if isinstance(dim, list):
+        res_min = flag_gems.amin(inp, dim=dim, keepdim=keepdim)
+        res_max = flag_gems.amax(inp, dim=dim, keepdim=keepdim)
+    else:
+        res_min, res_max = flag_gems.aminmax(inp, dim=dim, keepdim=keepdim)
 
     utils.gems_assert_equal(res_min, ref_min)
     utils.gems_assert_equal(res_max, ref_max)
@@ -64,8 +66,7 @@ def test_accuracy_aminmax_no_dim(shape, dtype):
     ref_inp = utils.to_reference(inp)
 
     ref_min, ref_max = torch.aminmax(ref_inp)
-    with flag_gems.use_gems():
-        res_min, res_max = torch.aminmax(inp)
+    res_min, res_max = flag_gems.aminmax(inp)
 
     utils.gems_assert_equal(res_min, ref_min)
     utils.gems_assert_equal(res_max, ref_max)
