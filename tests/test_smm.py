@@ -125,8 +125,9 @@ def test_smm_uncoalesced_duplicate_indices():
     indices = torch.tensor(
         [[0, 0, 1, 1, 1, 3], [2, 2, 0, 3, 0, 1]], device=flag_gems.device
     )
-    values = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, -1.5], dtype=dtype,
-                          device=flag_gems.device)
+    values = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0, 5.0, -1.5], dtype=dtype, device=flag_gems.device
+    )
     sparse = torch.sparse_coo_tensor(indices, values, size=(4, 6))
     assert not sparse.is_coalesced()
     mat = torch.randn(6, 3, dtype=dtype, device=flag_gems.device)

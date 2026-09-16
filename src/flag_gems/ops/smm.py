@@ -200,7 +200,9 @@ def smm(self, mat):
             f"sspaddmm: Argument #2: matrices expected, got {self.ndim}D tensor"
         )
     if mat.is_sparse:
-        raise RuntimeError("Cannot access data pointer of Tensor that doesn't have storage")
+        raise RuntimeError(
+            "Cannot access data pointer of Tensor that doesn't have storage"
+        )
     if mat.ndim != 2:
         raise RuntimeError(
             f"sspaddmm: Argument #3: matrices expected, got {mat.ndim}D tensor"
