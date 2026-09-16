@@ -23,7 +23,14 @@ from . import base, consts
 
 # quantized_max_pool3d operates on per-tensor quint8 tensors. PyTorch ships no
 # native QuantizedCUDA kernel for it, so the baseline runs on the CPU
-# (QuantizedCPU) while the FlagGems kernel runs on the GPU.
+# (QuantizedCPU) while the FlagGems kernel runs on the GPU. The reported speedup
+# is therefore GPU-vs-CPU rather than GPU-vs-GPU. Host/device transfers are
+# hoisted into the input function so they are not attributed to the baseline.
+#
+# Because the baseline is CPU-only, prefer ``--mode wrapper`` (wall-clock) for
+# these numbers. The default ``kernel`` mode times with CUDA events, which
+# cannot observe work that never reaches the GPU and reports a meaningless
+# near-constant baseline latency.
 QDTYPE = torch.quint8
 SCALE = 0.1
 ZERO_POINT = 128
@@ -54,6 +61,10 @@ def quantized_max_pool3d_input_fn(shape, dtype, device):
         )
     else:
         qx = _make_qinput(shape, device)
+    # The CPU baseline needs a CPU copy of the input. Take it once here, outside
+    # the timed region, so the reported baseline latency is the CPU kernel alone
+    # and not a device-to-host transfer (which dominates the smaller shapes).
+    qx._cpu_twin = qx.to("cpu") if qx.device.type != "cpu" else qx
     yield qx, {
         "kernel_size": 3,
         "stride": 2,
@@ -81,13 +92,22 @@ def quantized_max_pool3d_input_fn(shape, dtype, device):
         }
 
 
+def _cpu_input(qx):
+    """Return the CPU copy of ``qx`` prepared by the input function."""
+    twin = getattr(qx, "_cpu_twin", None)
+    if twin is None:
+        twin = qx.to("cpu") if qx.device.type != "cpu" else qx
+    return twin
+
+
 def _torch_op(qx, **kwargs):
     """Baseline running PyTorch's quantized_max_pool3d on the CPU.
 
-    PyTorch has no native QuantizedCUDA kernel, so the reference runs on
-    QuantizedCPU. We move the quantized tensor to the CPU first.
+    PyTorch ships no native QuantizedCUDA kernel, so the reference necessarily
+    runs on QuantizedCPU. The host copy of the input is made once by the input
+    function, so only the pooling itself falls inside the timed region.
     """
-    return torch.quantized_max_pool3d(qx.to("cpu"), **kwargs)
+    return torch.quantized_max_pool3d(_cpu_input(qx), **kwargs)
 
 
 class QuantizedMaxPool3dBenchmark(base.GenericBenchmark):
@@ -115,9 +135,18 @@ def test_quantized_max_pool3d_out():
             qx, params = forward_args
             # Pre-allocate a matching out tensor so the baseline (.out) kernel
             # and the gems kernel share the same output geometry.
-            ref_shape = torch.quantized_max_pool3d(qx.to("cpu"), **params).shape
+            ref_shape = torch.quantized_max_pool3d(_cpu_input(qx), **params).shape
             out_q = torch.quantize_per_tensor(
                 torch.zeros(ref_shape, dtype=torch.float32, device=device),
+                SCALE,
+                ZERO_POINT,
+                QDTYPE,
+            )
+            # The CPU baseline writes into a host out tensor. Allocate it once
+            # here so neither the allocation nor a host/device copy is timed;
+            # both operators then measure just their own pooling work.
+            out_q._cpu_twin = torch.quantize_per_tensor(
+                torch.zeros(ref_shape, dtype=torch.float32, device="cpu"),
                 SCALE,
                 ZERO_POINT,
                 QDTYPE,
@@ -127,15 +156,9 @@ def test_quantized_max_pool3d_out():
             yield qx, out_q, params
 
     def torch_out_op(qx, out, **kwargs):
-        out_cpu = torch.quantize_per_tensor(
-            torch.zeros(out.shape, dtype=torch.float32, device="cpu"),
-            out.q_scale(),
-            out.q_zero_point(),
-            QDTYPE,
+        return torch.ops.aten.quantized_max_pool3d.out(
+            _cpu_input(qx), out=_cpu_input(out), **kwargs
         )
-        torch.ops.aten.quantized_max_pool3d.out(qx.to("cpu"), out=out_cpu, **kwargs)
-        out.copy_(out_cpu)
-        return out
 
     def gems_out_op(qx, out, **kwargs):
         return flag_gems.quantized_max_pool3d_out(qx, out=out, **kwargs)

@@ -25,6 +25,44 @@ from flag_gems.utils.limits import get_dtype_min
 
 logger = logging.getLogger(__name__)
 
+# Quantized integer dtypes natively accepted by ``aten::quantized_max_pool3d``
+# (its kernel is wrapped in ``AT_DISPATCH_QINT_TYPES``), mapped to the dtype of
+# their ``int_repr()``. Pooling runs directly on the integer representation, so
+# the kernel only needs the width/signedness of these.
+_QINT_DTYPES = {
+    torch.quint8: torch.uint8,
+    torch.qint8: torch.int8,
+    torch.qint32: torch.int32,
+}
+
+# ATen reports the *C++* spelling of a dtype in the ``out=`` dtype error, e.g.
+# "Expected out tensor to have dtype c10::quint8, but got c10::qint8 instead".
+# Reproduce the spellings so the message matches the native operator verbatim.
+_ATEN_DTYPE_NAMES = {
+    torch.quint8: "c10::quint8",
+    torch.qint8: "c10::qint8",
+    torch.qint32: "c10::qint32",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.float16: "c10::Half",
+    torch.bfloat16: "c10::BFloat16",
+    torch.bool: "bool",
+    torch.uint8: "unsigned char",
+    torch.int8: "signed char",
+    torch.int16: "short int",
+    torch.int32: "int",
+    torch.int64: "long int",
+    torch.uint16: "short unsigned int",
+    torch.uint32: "unsigned int",
+    torch.uint64: "long unsigned int",
+    torch.complex64: "c10::complex<float>",
+    torch.complex128: "c10::complex<double>",
+}
+
+
+def _aten_dtype_name(dtype: torch.dtype) -> str:
+    return _ATEN_DTYPE_NAMES.get(dtype, str(dtype))
+
 
 def pool3d_output_size(
     in_size: int,
@@ -34,12 +72,24 @@ def pool3d_output_size(
     dilation: int,
     ceil_mode: bool = False,
 ) -> int:
-    """Compute one spatial dimension of the 3-D max-pool output."""
+    """Compute one spatial dimension of the 3-D max-pool output.
+
+    Mirrors ``at::native::pooling_output_shape``, including the two checks it
+    performs before computing the size and the ``ceil_mode`` correction that
+    keeps the last pooling window starting inside the image.
+    """
+    if stride == 0:
+        raise RuntimeError("stride should not be zero")
+    if padding < 0:
+        raise RuntimeError(f"pad must be non-negative, but got pad: {padding}")
+
     effective_kernel_size = (kernel_size - 1) * dilation + 1
     numerator = in_size + 2 * padding - effective_kernel_size
     if ceil_mode:
+        # Python's floor division matches ATen's ``div_rtn`` for negatives too.
         output_size = (numerator + stride - 1) // stride + 1
-        # PyTorch-compatible adjustment for ceil_mode
+        # PyTorch-compatible adjustment for ceil_mode: ensure that the last
+        # pooling window starts inside the image.
         if (output_size - 1) * stride >= in_size + padding:
             output_size -= 1
     else:
@@ -47,39 +97,100 @@ def pool3d_output_size(
     return output_size
 
 
-def _parse_pool3d_params(kernel_size, stride, padding, dilation):
-    """Parse and validate 3-D pooling parameters.
+def _check_maxpool3d_params(kernel_size, stride, padding, dilation):
+    """Mirror ATen's ``check_maxpool3d_params`` argument-shape validation.
 
-    Each parameter can be an int (applied to all 3 spatial dims) or a
-    3-element tuple/list (D, H, W).
+    Returns the parameters expanded to 3-tuples. ``stride`` may be an empty
+    sequence, in which case ``None`` is returned for it so that the caller can
+    substitute ``kernel_size`` (what ATen does right after this check).
     """
 
-    def _parse_param(param, name, default=None):
-        if param is None:
-            return default
+    def _expand(param, name, message):
         if isinstance(param, int):
+            # A bare int reaches the ATen schema as ``int[3]``, i.e. broadcast.
             return param, param, param
-        if isinstance(param, (list, tuple)) and len(param) == 3:
-            return tuple(param)
-        raise ValueError(f"Invalid {name}: {param}")
+        if isinstance(param, (list, tuple)):
+            if len(param) != 3:
+                raise RuntimeError(f"{message}{len(param)}")
+            return tuple(int(p) for p in param)
+        raise RuntimeError(f"Invalid {name}: {param}")
 
-    kd, kh, kw = _parse_param(kernel_size, "kernel_size")
-    sd, sh, sw = _parse_param(stride, "stride", default=(kd, kh, kw))
-    pd, ph, pw = _parse_param(padding, "padding", default=(0, 0, 0))
-    dd, dh, dw = _parse_param(dilation, "dilation", default=(1, 1, 1))
+    kernel = _expand(kernel_size, "kernel_size", "Expected 3d kernel size, got ")
 
+    if isinstance(stride, (list, tuple)) and len(stride) == 0:
+        strides = None
+    else:
+        # Note the missing space after "got": ATen's message reads
+        # "Expected no strides or 3d strides, got2".
+        strides = _expand(stride, "stride", "Expected no strides or 3d strides, got")
+
+    pads = _expand(padding, "padding", "Expected 3d padding, got ")
+    # ATen's text says "1d or 3d" but the check only accepts 3 elements.
+    dilations = _expand(dilation, "dilation", "Expected 1d or 3d dilation, got ")
+
+    if any(d < 1 for d in dilations):
+        raise RuntimeError("Expected dilation >= 1")
+
+    return kernel, strides, pads, dilations
+
+
+def _parse_pool3d_params(kernel_size, stride, padding, dilation):
+    """Parse and validate 3-D pooling parameters the way ATen does.
+
+    Each parameter can be an int (applied to all 3 spatial dims) or a
+    3-element tuple/list (D, H, W). An empty ``stride`` sequence -- the schema
+    default of ``aten::quantized_max_pool3d`` -- falls back to ``kernel_size``.
+    """
+    kernel, strides, pads, dilations = _check_maxpool3d_params(
+        kernel_size, stride, padding, dilation
+    )
+    if strides is None:
+        strides = kernel
+
+    kd, kh, kw = kernel
+    sd, sh, sw = strides
+    pd, ph, pw = pads
+    dd, dh, dw = dilations
+
+    # ATen validates kernel/stride positivity inside ``q_maxpool_3d``, in this
+    # order, before it looks at the input tensor at all.
+    if kd <= 0 or kh <= 0 or kw <= 0:
+        raise RuntimeError("kernel_size should be greater than zero.")
     if sd <= 0 or sh <= 0 or sw <= 0:
-        raise ValueError(f"stride must be positive, but got stride=({sd}, {sh}, {sw})")
-    if pd < 0 or ph < 0 or pw < 0:
-        raise ValueError(
-            f"padding must be non-negative, but got padding=({pd}, {ph}, {pw})"
-        )
-    if dd <= 0 or dh <= 0 or dw <= 0:
-        raise ValueError(
-            f"dilation must be positive, but got dilation=({dd}, {dh}, {dw})"
-        )
+        raise RuntimeError("strides should be greater than zero.")
 
     return kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw
+
+
+def _quantized_max_pool3d_output_shape(input, params, ceil_mode):
+    """Validate the input against ``params`` and return the output shape.
+
+    Reproduces the remaining checks of ATen's ``q_maxpool_3d``, in order:
+    rank, non-zero dimensions, padding vs. half the kernel, and finally a
+    positive output size.
+    """
+    kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw = params
+
+    if input.dim() != 5:
+        raise RuntimeError("Expecting the input tensor of rank 5.")
+
+    in_n, in_c, in_d, in_h, in_w = input.shape
+    if in_c <= 0 or in_d <= 0 or in_h <= 0 or in_w <= 0:
+        raise RuntimeError("input dimensions must be non-zero.")
+    if kd // 2 < pd or kh // 2 < ph or kw // 2 < pw:
+        raise RuntimeError("padding should be smaller than half of kernel_size.")
+
+    out_d = pool3d_output_size(in_d, kd, sd, pd, dd, ceil_mode)
+    out_h = pool3d_output_size(in_h, kh, sh, ph, dh, ceil_mode)
+    out_w = pool3d_output_size(in_w, kw, sw, pw, dw, ceil_mode)
+    if out_d <= 0 or out_h <= 0 or out_w <= 0:
+        raise RuntimeError(
+            f"Given input size: ({in_c}t{in_d}x{in_h}x{in_w}). "
+            f"Calculated output size: ({in_c}t{out_d}x{out_h}x{out_w}). "
+            "Output size is too small."
+        )
+
+    return in_n, in_c, out_d, out_h, out_w
 
 
 @libentry()
@@ -107,6 +218,12 @@ def quantized_max_pool3d_forward_kernel(
     in_stride_d,
     in_stride_h,
     in_stride_w,
+    # Output tensor strides
+    out_stride_n,
+    out_stride_c,
+    out_stride_d,
+    out_stride_h,
+    out_stride_w,
     # Input/Output shapes
     in_c,
     in_d,
@@ -134,11 +251,18 @@ def quantized_max_pool3d_forward_kernel(
 ):
     """Forward kernel for quantized 3-D max pooling.
 
-    The kernel operates directly on the ``uint8`` integer representation
-    (``int_repr``) of a quantized ``quint8`` tensor. Because the quantization
-    mapping ``real = (uint8 - zero_point) * scale`` is monotonically
-    increasing in ``uint8`` for a positive ``scale``, taking the max over the
+    The kernel operates directly on the integer representation
+    (``int_repr``) of a per-tensor quantized tensor -- ``uint8`` for
+    ``quint8``, ``int8`` for ``qint8``, ``int32`` for ``qint32``. Because the
+    quantization mapping ``real = (q - zero_point) * scale`` is monotonically
+    increasing in ``q`` for a positive ``scale``, taking the max over the
     quantized integers is equivalent to taking the max over the real values.
+    The identity of the max is what is stored, so no requantization is needed
+    and the result is exact for every one of the three dtypes.
+
+    Both the input and the output are addressed through explicit strides, so
+    non-contiguous inputs need no repacking and a ``channels_last_3d`` output
+    can be written in place.
 
     Grid: (N * C, num_d_blocks * num_h_blocks * num_w_blocks)
     where num_h_blocks = cdiv(out_h, BLOCK_H),
@@ -190,65 +314,66 @@ def quantized_max_pool3d_forward_kernel(
                 )
                 max_val_acc = tl.maximum(max_val_acc, current_val)
 
-    out_spatial = out_h * out_w
-    out_base_offset = pid_nc * out_d * out_spatial + d_out * out_spatial
-    out_base_ptr = output_ptr + out_base_offset
-    out_h_offsets = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
-    out_w_offsets = w_block_idx * BLOCK_W + tl.arange(0, BLOCK_W)
+    out_base_ptr = (
+        output_ptr + n_idx * out_stride_n + c_idx * out_stride_c + d_out * out_stride_d
+    )
     output_block_ptr = (
-        out_base_ptr + out_h_offsets[:, None] * out_w + out_w_offsets[None, :]
+        out_base_ptr
+        + h_out_offsets[:, None] * out_stride_h
+        + w_out_offsets[None, :] * out_stride_w
     )
 
-    out_mask = (out_h_offsets[:, None] < out_h) & (out_w_offsets[None, :] < out_w)
+    out_mask = (h_out_offsets[:, None] < out_h) & (w_out_offsets[None, :] < out_w)
     tl.store(output_block_ptr, max_val_acc, mask=out_mask)
 
 
-def quantized_max_pool3d(
-    input: torch.Tensor,
-    kernel_size,
-    stride=[],
-    padding=0,
-    dilation=1,
-    ceil_mode=False,
-):
-    """Apply 3-D max pooling to a per-tensor quantized ``quint8`` tensor.
-
-    The pooling is performed directly over the quantized integer
-    representation, which (for a positive scale) yields the same result as
-    pooling over the dequantized values while keeping the input's
-    ``scale``/``zero_point`` on the output.
-    """
-    logger.debug("GEMS QUANTIZED_MAX_POOL3D")
-
+def _check_quantized_input(input):
+    """Reject inputs that ATen's ``quantized_max_pool3d`` cannot accept."""
     if not input.is_quantized:
         raise RuntimeError(
-            "quantized_max_pool3d expects a quantized tensor (e.g. torch.quint8)"
+            "quantized_max_pool3d expects a quantized tensor "
+            "(torch.quint8, torch.qint8 or torch.qint32)"
+        )
+    if input.qscheme() != torch.per_tensor_affine:
+        # ATen fails inside the quantizer when reading q_scale().
+        raise RuntimeError(
+            "Expected quantizer->qscheme() == kPerTensorAffine to be true, "
+            "but got false."
+        )
+    if input.dtype not in _QINT_DTYPES:
+        raise RuntimeError(
+            f"quantized_max_pool3d not implemented for '{input.dtype}'; "
+            "expected one of torch.quint8, torch.qint8, torch.qint32"
         )
 
-    # Pull the uint8 integer representation onto the compute device.
-    int_repr = input.int_repr()
-    if int_repr.device != input.device:
-        int_repr = int_repr.to(input.device)
-    int_repr = int_repr.contiguous()
-    scale = float(input.q_scale())
-    zero_point = int(input.q_zero_point())
 
-    params = _parse_pool3d_params(kernel_size, stride, padding, dilation)
-    kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw = params
+def _int_view(qtensor):
+    """Alias a quantized tensor's storage as a writable integer tensor.
 
-    in_n, in_c, in_d, in_h, in_w = int_repr.shape
-    out_d = pool3d_output_size(in_d, kd, sd, pd, dd, ceil_mode)
-    out_h = pool3d_output_size(in_h, kh, sh, ph, dh, ceil_mode)
-    out_w = pool3d_output_size(in_w, kw, sw, pw, dw, ceil_mode)
-
-    out_int = torch.empty(
-        (in_n, in_c, out_d, out_h, out_w),
-        device=int_repr.device,
-        dtype=int_repr.dtype,
+    ``int_repr()`` returns a *copy*, so it cannot be used as a kernel
+    destination. Aliasing the storage with the tensor's own sizes and strides
+    gives a view the kernel can store into, whatever layout it has.
+    """
+    return torch.empty(
+        0, dtype=_QINT_DTYPES[qtensor.dtype], device=qtensor.device
+    ).set_(
+        qtensor.untyped_storage(),
+        qtensor.storage_offset(),
+        tuple(qtensor.shape),
+        qtensor.stride(),
     )
 
-    if out_int.numel() == 0:
-        return torch._make_per_tensor_quantized_tensor(out_int, scale, zero_point)
+
+def _launch_quantized_max_pool3d(input, params, out_shape, out_int):
+    """Run the pooling kernel over ``input``'s integer representation."""
+    kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw = params
+    in_n, in_c, in_d, in_h, in_w = input.shape
+    _, _, out_d, out_h, out_w = out_shape
+
+    # The kernel is fully strided on both sides, so a non-contiguous input needs
+    # no repacking. Alias the storage rather than calling ``int_repr()``, which
+    # would materialise a compacted copy of a strided input.
+    int_repr = _int_view(input)
 
     grid = lambda meta: (
         in_n * in_c,
@@ -260,11 +385,8 @@ def quantized_max_pool3d(
     quantized_max_pool3d_forward_kernel[grid](
         int_repr,
         out_int,
-        int_repr.stride(0),
-        int_repr.stride(1),
-        int_repr.stride(2),
-        int_repr.stride(3),
-        int_repr.stride(4),
+        *int_repr.stride(),
+        *out_int.stride(),
         in_c,
         in_d,
         in_h,
@@ -285,14 +407,95 @@ def quantized_max_pool3d(
         dh,
         dw,
     )
+    return out_int
 
-    return torch._make_per_tensor_quantized_tensor(out_int, scale, zero_point)
+
+def quantized_max_pool3d(
+    input: torch.Tensor,
+    kernel_size,
+    stride=(),
+    padding=0,
+    dilation=1,
+    ceil_mode=False,
+):
+    """Apply 3-D max pooling to a per-tensor quantized tensor.
+
+    Accepts the three dtypes the native operator dispatches over --
+    ``torch.quint8``, ``torch.qint8`` and ``torch.qint32``. Pooling is
+    performed directly over the quantized integer representation, which (for a
+    positive scale) yields the same result as pooling over the dequantized
+    values while keeping the input's ``scale``/``zero_point`` on the output.
+
+    An omitted or empty ``stride`` falls back to ``kernel_size``, matching the
+    ``int[3] stride=[]`` schema default of ``aten::quantized_max_pool3d``.
+    """
+    logger.debug("GEMS QUANTIZED_MAX_POOL3D")
+
+    params = _parse_pool3d_params(kernel_size, stride, padding, dilation)
+    _check_quantized_input(input)
+    out_shape = _quantized_max_pool3d_output_shape(input, params, ceil_mode)
+
+    scale = float(input.q_scale())
+    zero_point = int(input.q_zero_point())
+
+    # ATen has a dedicated channels-last path that keeps a channels_last_3d
+    # input in that layout; every other layout yields an NCDHW-contiguous
+    # result.
+    memory_format = (
+        torch.channels_last_3d
+        if input.is_contiguous(memory_format=torch.channels_last_3d)
+        and not input.is_contiguous()
+        else torch.contiguous_format
+    )
+    # Allocate the quantized result directly: ``_empty_affine_quantized``
+    # honours ``memory_format``, whereas wrapping a strided integer tensor with
+    # ``_make_per_tensor_quantized_tensor`` silently normalises its strides on
+    # CUDA and would drop the channels-last layout.
+    out = torch._empty_affine_quantized(
+        out_shape,
+        scale=scale,
+        zero_point=zero_point,
+        dtype=input.dtype,
+        device=input.device,
+        memory_format=memory_format,
+    )
+
+    if out.numel() != 0:
+        _launch_quantized_max_pool3d(input, params, out_shape, _int_view(out))
+
+    return out
+
+
+def _resize_quantized_out(out, shape):
+    """Resize a quantized ``out`` tensor to ``shape``, ATen-style.
+
+    ``aten::resize_`` and ``aten::set_.source_Tensor`` are both unimplemented
+    for the QuantizedCUDA backend, so the metadata is rewritten through
+    ``set_(storage, offset, size, stride)``, which is registered. This
+    reproduces what ``at::native::resize_output`` does for a strided tensor:
+    the storage offset is preserved, the storage only ever grows, and the
+    resized tensor is given contiguous strides.
+    """
+    strides = []
+    acc = 1
+    for size in reversed(shape):
+        strides.append(acc)
+        acc *= size
+    strides = tuple(reversed(strides))
+
+    storage = out.untyped_storage()
+    offset = out.storage_offset()
+    needed = (offset + acc) * out.element_size()
+    if acc != 0 and storage.size() < needed:
+        storage.resize_(needed)
+    out.set_(storage, offset, tuple(shape), strides)
+    return out
 
 
 def quantized_max_pool3d_out(
     input: torch.Tensor,
     kernel_size,
-    stride=[],
+    stride=(),
     padding=0,
     dilation=1,
     ceil_mode=False,
@@ -301,15 +504,34 @@ def quantized_max_pool3d_out(
 ):
     """``out`` variant of :func:`quantized_max_pool3d`.
 
-    Writes the pooled result into the pre-allocated quantized ``out`` tensor
-    and returns it. The ``out`` tensor is expected to carry the same
-    quantization parameters (``scale``/``zero_point``) as ``input``.
-
-    Quantized tensors have no ``resize_`` kernel on the QuantizedCUDA backend,
-    so the output is materialized first and then copied into ``out`` through a
-    ``uint8`` view that shares ``out``'s storage.
+    Follows the full contract of the autogenerated ``quantized_max_pool3d.out``
+    kernel: the pooling parameters are validated first, then ``out``'s dtype
+    and device, then ``out`` is resized to the computed shape (preserving its
+    storage offset and keeping its existing strides when no resize is needed),
+    and finally the pooled values *and* the input's quantization parameters are
+    written into it.
     """
     logger.debug("GEMS QUANTIZED_MAX_POOL3D_OUT")
+
+    params = _parse_pool3d_params(kernel_size, stride, padding, dilation)
+    _check_quantized_input(input)
+    out_shape = _quantized_max_pool3d_output_shape(input, params, ceil_mode)
+
+    # ATen's generated ``resize_out`` checks dtype before device.
+    if out.dtype != input.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {_aten_dtype_name(input.dtype)}, "
+            f"but got {_aten_dtype_name(out.dtype)} instead"
+        )
+    if out.device != input.device:
+        raise RuntimeError(
+            f"Expected out tensor to have device {input.device}, "
+            f"but got {out.device} instead"
+        )
+
+    if tuple(out.shape) != tuple(out_shape):
+        _resize_quantized_out(out, out_shape)
+
     result = quantized_max_pool3d(
         input,
         kernel_size=kernel_size,
@@ -318,16 +540,8 @@ def quantized_max_pool3d_out(
         dilation=dilation,
         ceil_mode=ceil_mode,
     )
-    # Copy the uint8 storage of `result` into `out`'s underlying storage so
-    # that ``out`` is mutated in place (as the ``Tensor(a!) out`` aliasing
-    # contract requires) without invoking any quantized-tensor ops.
-    result_int = result.int_repr()
-    storage = out.untyped_storage()
-    needed = result_int.nbytes
-    if storage.size() < needed:
-        storage.resize_(needed)
-    out_int = torch.empty((0,), dtype=torch.uint8, device=result_int.device).set_(
-        storage, 0, result_int.shape, result_int.stride()
-    )
-    out_int.copy_(result_int)
+    # ``copy_`` on a quantized tensor writes the values through ``out``'s own
+    # strides and adopts the source's scale/zero_point, which is exactly what
+    # ATen leaves behind on ``out``.
+    out.copy_(result)
     return out
