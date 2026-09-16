@@ -24,6 +24,20 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
+# ATen's error messages use the C++ scalar-type spelling, e.g. "Float"/"Double".
+_SCALAR_NAMES = {
+    torch.float16: "Half",
+    torch.bfloat16: "BFloat16",
+    torch.float32: "Float",
+    torch.float64: "Double",
+    torch.complex64: "ComplexFloat",
+    torch.complex128: "ComplexDouble",
+}
+
+
+def _scalar_name(dtype):
+    return _SCALAR_NAMES.get(dtype, str(dtype).replace("torch.", ""))
+
 
 @libentry()
 @triton.jit
@@ -42,6 +56,7 @@ def replication_pad1d_backward_kernel(
     grad_in_stride_n,
     grad_in_stride_c,
     grad_in_stride_w,
+    ACC_DTYPE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -71,12 +86,18 @@ def replication_pad1d_backward_kernel(
     base_out = n.to(tl.int64) * grad_out_stride_n + c.to(tl.int64) * grad_out_stride_c
     base_in = n.to(tl.int64) * grad_in_stride_n + c.to(tl.int64) * grad_in_stride_c
 
-    # Handle left edge (w_in=0): accumulate grad_out[0:pad_left+1]
+    # Handle left edge (w_in=0): accumulate grad_out[0:pad_left+1].
+    #
+    # With a negative pad_left the input column 0 is cropped away rather than
+    # replicated, so it receives no gradient at all and the loop must not run:
+    # ``range(pad_left + 1, ...)`` would otherwise start below zero. Clamping the
+    # lower bound to 0 makes the range empty for pad_left < 0.
     if W_in >= 1:
-        left_acc = 0.0
-        for i in range(min(pad_left + 1, W_out)):
+        left_acc = tl.zeros((), dtype=ACC_DTYPE)
+        left_stop = min(max(pad_left + 1, 0), W_out)
+        for i in range(0, left_stop):
             ptr = grad_out_ptr + base_out + i * grad_out_stride_w
-            left_acc += tl.load(ptr)
+            left_acc += tl.load(ptr).to(ACC_DTYPE)
         ptr_in = grad_in_ptr + base_in
         tl.store(ptr_in, left_acc.to(grad_out_ptr.dtype.element_ty))
 
@@ -86,7 +107,12 @@ def replication_pad1d_backward_kernel(
         mask = w_in < W_in - 1
 
         w_out = pad_left + w_in
-        out_mask = mask & (w_out < W_out)
+        # Both bounds are needed. A negative pad_left makes w_out negative for the
+        # leading columns, and the previous mask only checked the upper bound, so
+        # those lanes read grad_output at a negative offset -- out of bounds before
+        # the start of the tensor. Columns cropped away by negative padding receive
+        # no gradient, hence the `other=0.0` store.
+        out_mask = mask & (w_out >= 0) & (w_out < W_out)
 
         out_offset = w_out.to(tl.int64) * grad_out_stride_w
         out_ptr = grad_out_ptr + base_out + out_offset
@@ -96,21 +122,25 @@ def replication_pad1d_backward_kernel(
         in_ptr = grad_in_ptr + base_in + in_offset
         tl.store(in_ptr, val.to(grad_out_ptr.dtype.element_ty), mask=mask)
 
-    # Handle right edge (w_in=W_in-1): accumulate grad_out[pad_left+W_in-1:W_out]
+    # Handle right edge (w_in=W_in-1): accumulate grad_out[pad_left+W_in-1:W_out].
+    #
+    # The start index is clamped to 0 for the same reason as the left edge: with a
+    # large negative pad_left it can fall below the start of grad_output. The range
+    # is empty when the last input column is cropped away (start >= W_out).
     if W_in >= 2:
-        right_acc = 0.0
-        right_start = pad_left + W_in - 1
+        right_acc = tl.zeros((), dtype=ACC_DTYPE)
+        right_start = max(pad_left + W_in - 1, 0)
         for i in range(right_start, W_out):
             ptr = grad_out_ptr + base_out + i * grad_out_stride_w
-            right_acc += tl.load(ptr)
+            right_acc += tl.load(ptr).to(ACC_DTYPE)
         ptr_in = grad_in_ptr + base_in + (W_in - 1) * grad_in_stride_w
         tl.store(ptr_in, right_acc.to(grad_out_ptr.dtype.element_ty))
     elif W_in == 1:
         # Special case: only one element, accumulate all output
-        acc = 0.0
+        acc = tl.zeros((), dtype=ACC_DTYPE)
         for i in range(W_out):
             ptr = grad_out_ptr + base_out + i * grad_out_stride_w
-            acc += tl.load(ptr)
+            acc += tl.load(ptr).to(ACC_DTYPE)
         ptr_in = grad_in_ptr + base_in
         tl.store(ptr_in, acc.to(grad_out_ptr.dtype.element_ty))
 
@@ -167,6 +197,17 @@ def _launch_replication_pad1d_backward_kernel(
     grid = (B * C,)
     BLOCK_SIZE = 256
 
+    # Edge gradients are sums over the replicated span, so accumulate in fp32 for
+    # low-precision dtypes rather than adding in fp16/bf16 element by element.
+    if self_tensor.dtype in (torch.float16, torch.bfloat16):
+        acc_dtype = tl.float32
+    elif self_tensor.dtype == torch.float64:
+        acc_dtype = tl.float64
+    elif self_tensor.dtype == torch.complex64:
+        acc_dtype = tl.complex64 if hasattr(tl, "complex64") else tl.float32
+    else:
+        acc_dtype = tl.float32
+
     with torch_device_fn.device(grad_output.device):
         replication_pad1d_backward_kernel[grid](
             grad_output,
@@ -183,6 +224,7 @@ def _launch_replication_pad1d_backward_kernel(
             grad_in_s_n if dim == 3 else grad_in_s_n,
             grad_in_s_c,
             grad_in_s_w,
+            ACC_DTYPE=acc_dtype,
             BLOCK_SIZE=BLOCK_SIZE,
         )
     return grad_input
@@ -197,24 +239,57 @@ def replication_pad1d_backward(
     left, right = int(padding[0]), int(padding[1])
 
     dim = self_tensor.dim()
-    if dim == 3:
-        N, C, W_in = self_tensor.shape
-        grad_input = torch.empty(
-            (N, C, W_in),
-            device=grad_output.device,
-            dtype=grad_output.dtype,
-        )
-    elif dim == 2:
-        C, W_in = self_tensor.shape
-        grad_input = torch.empty(
-            (C, W_in),
-            device=grad_output.device,
-            dtype=grad_output.dtype,
-        )
-    else:
+    if dim not in (2, 3):
         raise ValueError(
             "replication_pad1d_backward expects 2D (C, W) or 3D (N, C, W) input"
         )
+
+    # ATen rejects a gradient whose dtype differs from the input rather than
+    # promoting it, with this wording.
+    if grad_output.dtype != self_tensor.dtype:
+        raise RuntimeError(
+            f"expected scalar type {_scalar_name(self_tensor.dtype)} but found "
+            f"{_scalar_name(grad_output.dtype)}"
+        )
+    if grad_output.device != self_tensor.device:
+        raise RuntimeError(
+            f"expected grad_output to be on device {self_tensor.device} but found "
+            f"{grad_output.device}"
+        )
+
+    # The output takes the *input's* options, not the gradient's: ATen returns
+    # ``at::empty_like(self)``. Following grad_output would silently hand back a
+    # differently-typed gradient for a mismatched input.
+    grad_input = torch.empty(
+        self_tensor.shape,
+        device=self_tensor.device,
+        dtype=self_tensor.dtype,
+    )
+
+    if self_tensor.is_complex():
+        # Triton has no complex scalar type, and this operator never mixes the real
+        # and imaginary parts: it only gathers and sums gradients along W. So run the
+        # real kernel on a view where the two components are separate channels.
+        #
+        # view_as_real appends a size-2 axis, giving (..., W, 2); moving it before W
+        # yields (..., 2, W), which is exactly "twice as many channels, same W". The
+        # movedim makes the result non-contiguous, hence the explicit strides the
+        # kernel already takes.
+        # Run the real kernel once per component. Slicing the last axis of the
+        # view_as_real result keeps the original W layout (only the element stride
+        # changes, which the kernel already takes as a parameter), whereas
+        # reshaping a movedim'd view silently reorders the data.
+        go_real = torch.view_as_real(grad_output)
+        self_real = torch.view_as_real(self_tensor)
+        gi_real = torch.view_as_real(grad_input)
+        for comp in (0, 1):
+            _launch_replication_pad1d_backward_kernel(
+                go_real[..., comp],
+                self_real[..., comp],
+                (left, right),
+                gi_real[..., comp],
+            )
+        return grad_input
 
     return _launch_replication_pad1d_backward_kernel(
         grad_output, self_tensor, (left, right), grad_input
