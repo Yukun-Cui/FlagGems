@@ -36,6 +36,7 @@ def _aminmax_kernel_1(
     max_out,
     M,
     BLOCK_SIZE: tl.constexpr,
+    IS_FLOAT: tl.constexpr,
 ):
     pid = ext.program_id(0)
 
@@ -47,8 +48,20 @@ def _aminmax_kernel_1(
     min_val = tl.load(inp_ptrs, mask=mask, other=min_fill)
     max_val = tl.load(inp_ptrs, mask=mask, other=max_fill)
 
-    min_val = tl.min(min_val)
-    max_val = tl.max(max_val)
+    if IS_FLOAT:
+        # torch._aminmax returns NaN for *both* outputs when any input is NaN,
+        # but tl.min/tl.max drop NaNs instead of propagating them. Detect a NaN
+        # in this tile (x != x is only true for NaN) and force both results to
+        # NaN, which also keeps the second stage's inputs NaN-tainted.
+        has_nan = tl.sum((min_val != min_val).to(tl.int32)) > 0
+        min_red = tl.min(min_val)
+        max_red = tl.max(max_val)
+        nan = float("nan")
+        min_val = tl.where(has_nan, nan, min_red)
+        max_val = tl.where(has_nan, nan, max_red)
+    else:
+        min_val = tl.min(min_val)
+        max_val = tl.max(max_val)
 
     min_ptr = min_out + pid
     max_ptr = max_out + pid
@@ -59,7 +72,13 @@ def _aminmax_kernel_1(
 @libentry()
 @triton.jit
 def _aminmax_kernel_2(
-    min_inp, max_inp, min_out, max_out, mid_size, BLOCK_MID: tl.constexpr
+    min_inp,
+    max_inp,
+    min_out,
+    max_out,
+    mid_size,
+    BLOCK_MID: tl.constexpr,
+    IS_FLOAT: tl.constexpr,
 ):
     offset = tl.arange(0, BLOCK_MID)
     min_ptrs = min_inp + offset
@@ -70,26 +89,74 @@ def _aminmax_kernel_2(
     min_val = tl.load(min_ptrs, mask=mask, other=min_fill)
     max_val = tl.load(max_ptrs, mask=mask, other=max_fill)
 
-    min_val = tl.min(min_val)
-    max_val = tl.max(max_val)
+    if IS_FLOAT:
+        # Second stage needs the same guard: stage one writes NaN into both
+        # partial buffers when it sees one, and tl.min/tl.max would drop it here.
+        # Either buffer carrying a NaN taints both outputs.
+        has_nan = (
+            tl.sum((min_val != min_val).to(tl.int32))
+            + tl.sum((max_val != max_val).to(tl.int32))
+        ) > 0
+        min_red = tl.min(min_val)
+        max_red = tl.max(max_val)
+        nan = float("nan")
+        min_val = tl.where(has_nan, nan, min_red)
+        max_val = tl.where(has_nan, nan, max_red)
+    else:
+        min_val = tl.min(min_val)
+        max_val = tl.max(max_val)
 
     tl.store(min_out, min_val)
     tl.store(max_out, max_val)
 
 
-def _aminmax(inp):
-    logger.debug("GEMS _AMINMAX")
+def _aminmax_run(inp, out0=None, out1=None):
+    """Shared driver for the base and ``.out`` variants."""
+    if inp.numel() == 0:
+        # ATen refuses to reduce an empty input rather than returning +-inf.
+        raise RuntimeError(
+            "aminmax(): cannot compute aminmax over an empty dimension as the "
+            "operation has no identity."
+        )
+
+    # The kernels index with a flat offset, so a sliced, transposed or expanded
+    # view would be read in the wrong element order (or past its end for an
+    # expanded view, whose stride is 0). Materialize a dense copy first.
+    inp = inp.contiguous()
 
     M = inp.numel()
     block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
     mid_size = triton.cdiv(M, block_size)
     block_mid = triton.next_power_of_2(mid_size)
     dtype = inp.dtype
+    is_float = inp.is_floating_point()
+
+    if out0 is None:
+        min_out = torch.empty([], dtype=dtype, device=inp.device)
+        max_out = torch.empty([], dtype=dtype, device=inp.device)
+    else:
+        # ATen validates dtype and device but resizes a mis-shaped output to a
+        # scalar in place, keeping the caller's objects so the returned tensors
+        # alias out0/out1.
+        for name, o in (("out0", out0), ("out1", out1)):
+            if o.dtype != dtype:
+                raise RuntimeError(
+                    f"Expected out tensor to have dtype {dtype}, but got "
+                    f"{o.dtype} instead"
+                )
+            if o.device != inp.device:
+                raise RuntimeError(
+                    f"Expected out tensor to have device {inp.device}, but got "
+                    f"{o.device} instead"
+                )
+        if out0.shape != torch.Size([]):
+            out0.resize_(())
+        if out1.shape != torch.Size([]):
+            out1.resize_(())
+        min_out, max_out = out0, out1
+
     min_mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
     max_mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
-
-    min_out = torch.empty([], dtype=dtype, device=inp.device)
-    max_out = torch.empty([], dtype=dtype, device=inp.device)
 
     with torch_device_fn.device(inp.device):
         _aminmax_kernel_1[(mid_size, 1)](
@@ -98,36 +165,25 @@ def _aminmax(inp):
             max_mid,
             M,
             block_size,
+            IS_FLOAT=is_float,
         )
         _aminmax_kernel_2[(1, 1)](
-            min_mid, max_mid, min_out, max_out, mid_size, block_mid
+            min_mid,
+            max_mid,
+            min_out,
+            max_out,
+            mid_size,
+            block_mid,
+            IS_FLOAT=is_float,
         )
     return min_out, max_out
+
+
+def _aminmax(inp):
+    logger.debug("GEMS _AMINMAX")
+    return _aminmax_run(inp)
 
 
 def _aminmax_out(inp, *, out0, out1):
     logger.debug("GEMS _AMINMAX_OUT")
-
-    M = inp.numel()
-    block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
-    mid_size = triton.cdiv(M, block_size)
-    block_mid = triton.next_power_of_2(mid_size)
-    dtype = inp.dtype
-    min_mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
-    max_mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
-
-    min_out = out0
-    max_out = out1
-
-    with torch_device_fn.device(inp.device):
-        _aminmax_kernel_1[(mid_size, 1)](
-            inp,
-            min_mid,
-            max_mid,
-            M,
-            block_size,
-        )
-        _aminmax_kernel_2[(1, 1)](
-            min_mid, max_mid, min_out, max_out, mid_size, block_mid
-        )
-    return min_out, max_out
+    return _aminmax_run(inp, out0=out0, out1=out1)
