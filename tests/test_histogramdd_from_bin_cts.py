@@ -276,3 +276,139 @@ def test_histogramdd_from_bin_cts_out_weighted_density(dtype):
     )
     _assert_close(res_out, ref_out, dtype)
     _assert_close(out, ref_out, dtype)
+
+
+# ---------------------------------------------------------------------------
+# Precision, density edge cases and the full out= contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize("dtype", HIST_DTYPES)
+def test_histogramdd_from_bin_cts_bin_boundary_precision(dtype):
+    """Points sitting exactly on a bin edge, and one ulp either side of it.
+
+    Bin placement uses an exact comparison against the edges, so a 1-ulp error in
+    an edge moves the point a whole bin. FP64 is the sensitive case: narrowing the
+    coordinates or the edges to fp32 puts e.g. 0.2999999999999999 over [0, 1] with
+    10 bins into bin 3 instead of bin 2.
+    """
+    nbins = 10
+    rng = [0.0, 1.0]
+    edges = torch.linspace(rng[0], rng[1], nbins + 1, dtype=dtype)
+
+    # Every edge, plus its two neighbours in the floating point ordering.
+    probes = []
+    for e in edges.tolist():
+        t = torch.tensor(e, dtype=dtype)
+        probes += [
+            e,
+            torch.nextafter(t, torch.tensor(-1.0, dtype=dtype)).item(),
+            torch.nextafter(t, torch.tensor(2.0, dtype=dtype)).item(),
+        ]
+    inp = torch.tensor(probes, dtype=dtype, device=flag_gems.device).reshape(-1, 1)
+    ref_inp = _to_cpu_ref(inp)
+
+    ref_out = torch._histogramdd_from_bin_cts(ref_inp, [nbins], range=rng)
+    res_out = flag_gems._histogramdd_from_bin_cts(inp, [nbins], range=rng)
+    # Counts are integers, so this must agree exactly, not approximately.
+    utils.gems_assert_equal(res_out.to(ref_out.device), ref_out)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize("dtype", HIST_DTYPES)
+def test_histogramdd_from_bin_cts_density_zero_total(dtype):
+    """density with a zero total count must not be forced to zero.
+
+    ATen divides by the total count directly, so an empty or fully out-of-range
+    input yields NaN rather than a zero-filled histogram.
+    """
+    rng = [0.0, 1.0, 0.0, 1.0]
+
+    # All points outside the explicit range.
+    inp = torch.tensor([[5.0, 5.0], [6.0, 6.0]], dtype=dtype, device=flag_gems.device)
+    ref_out = torch._histogramdd_from_bin_cts(
+        _to_cpu_ref(inp), [2, 2], range=rng, density=True
+    )
+    res_out = flag_gems._histogramdd_from_bin_cts(inp, [2, 2], range=rng, density=True)
+    assert torch.isnan(ref_out).all(), "reference should produce NaN here"
+    _assert_close(res_out, ref_out, dtype, equal_nan=True)
+
+    # Empty input: same reasoning, zero points and therefore a zero total.
+    empty = torch.zeros(0, 2, dtype=dtype, device=flag_gems.device)
+    ref_empty = torch._histogramdd_from_bin_cts(
+        _to_cpu_ref(empty), [2, 2], range=rng, density=True
+    )
+    res_empty = flag_gems._histogramdd_from_bin_cts(
+        empty, [2, 2], range=rng, density=True
+    )
+    _assert_close(res_empty, ref_empty, dtype, equal_nan=True)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize("dtype", HIST_DTYPES)
+def test_histogramdd_from_bin_cts_density_cancelling_weights(dtype):
+    """Weights that cancel to zero give infinities, with the signs preserved."""
+    rng = [0.0, 1.0, 0.0, 1.0]
+    inp = torch.tensor(
+        [[0.25, 0.25], [0.75, 0.75]], dtype=dtype, device=flag_gems.device
+    )
+    weight = torch.tensor([1.0, -1.0], dtype=dtype, device=flag_gems.device)
+
+    ref_out = torch._histogramdd_from_bin_cts(
+        _to_cpu_ref(inp),
+        [2, 2],
+        range=rng,
+        weight=_to_cpu_ref(weight),
+        density=True,
+    )
+    res_out = flag_gems._histogramdd_from_bin_cts(
+        inp, [2, 2], range=rng, weight=weight, density=True
+    )
+    assert torch.isinf(ref_out).any(), "reference should produce infinities here"
+    _assert_close(res_out, ref_out, dtype, equal_nan=True)
+
+
+@pytest.mark.histogramdd_from_bin_cts_out
+@pytest.mark.parametrize("dtype", HIST_DTYPES)
+def test_histogramdd_from_bin_cts_out_resize(dtype):
+    """A mis-shaped out is resized in place and the caller's object is returned."""
+    inp = _make_input((256, 2), dtype, flag_gems.device)
+    bins = [3, 3]
+    rng = _range_for(2)
+    ref_out = torch._histogramdd_from_bin_cts(_to_cpu_ref(inp), bins, range=rng)
+
+    for start_shape in [(0,), (5, 7)]:
+        out = torch.empty(start_shape, dtype=dtype, device=flag_gems.device)
+        res = flag_gems._histogramdd_from_bin_cts_out(inp, bins, range=rng, out=out)
+        assert res is out, "the out tensor itself must be returned"
+        assert tuple(out.shape) == tuple(bins)
+        _assert_close(out, ref_out, dtype)
+
+
+@pytest.mark.histogramdd_from_bin_cts_out
+def test_histogramdd_from_bin_cts_out_dtype_mismatch():
+    """A dtype mismatch raises rather than being silently cast or re-bound."""
+    inp = _make_input((64, 2), torch.float32, flag_gems.device)
+    out = torch.empty((3, 3), dtype=torch.float64, device=flag_gems.device)
+    with pytest.raises(RuntimeError, match="dtype"):
+        flag_gems._histogramdd_from_bin_cts_out(
+            inp, [3, 3], range=_range_for(2), out=out
+        )
+
+
+@pytest.mark.histogramdd_from_bin_cts_out
+@pytest.mark.parametrize("dtype", HIST_DTYPES)
+def test_histogramdd_from_bin_cts_out_non_contiguous(dtype):
+    """A non-contiguous out of the right shape is accepted, as in ATen."""
+    inp = _make_input((256, 2), dtype, flag_gems.device)
+    bins = [3, 3]
+    rng = _range_for(2)
+    ref_out = torch._histogramdd_from_bin_cts(_to_cpu_ref(inp), bins, range=rng)
+
+    base = torch.empty((3, 6), dtype=dtype, device=flag_gems.device)
+    out = base[:, ::2]
+    assert not out.is_contiguous()
+    res = flag_gems._histogramdd_from_bin_cts_out(inp, bins, range=rng, out=out)
+    assert res is out
+    _assert_close(out, ref_out, dtype)

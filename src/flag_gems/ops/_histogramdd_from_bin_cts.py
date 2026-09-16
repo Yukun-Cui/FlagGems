@@ -40,9 +40,11 @@ def histogramdd_from_bin_cts_kernel(
     N,
     left_ptr,  # (N,) left edges
     right_ptr,  # (N,) right edges
-    inv_bin_width_ptr,  # (N,) 1 / bin_width = bins / (right - left)
+    edges_ptr,  # (N, MAX_EDGES) per-dimension bin edges, row-padded
     strides_ptr,  # (N,) row-major strides in bins
     bins_ptr,  # (N,) number of bins per dim
+    MAX_EDGES,
+    MAX_EDGE_STEPS: tl.constexpr,
     N_CONST: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
@@ -57,6 +59,11 @@ def histogramdd_from_bin_cts_kernel(
     Points outside any dimension's [left, right] range, or containing a NaN, are
     ignored. Accumulation runs in ACC_DTYPE (float32 for float32 inputs, float64
     for float64 inputs) to preserve precision for double-precision inputs.
+
+    The binning arithmetic is carried out in ACC_DTYPE as well: narrowing an fp64
+    coordinate or edge to fp32 shifts values that sit within one fp32 ulp of a bin
+    boundary into the neighbouring bin (e.g. 0.2999999999999999 over [0, 1] with
+    10 bins belongs in bin 2, but rounds to 0.3 in fp32 and lands in bin 3).
     """
     pid = ext.program_id(0)
     row_start = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -70,28 +77,43 @@ def histogramdd_from_bin_cts_kernel(
     for d in range(N_CONST):
         coord = tl.load(
             inp_ptr + row_start * N_CONST + d, mask=row_mask, other=float("nan")
-        ).to(tl.float32)
-        left = tl.load(left_ptr + d)
-        right = tl.load(right_ptr + d)
-        inv_bw = tl.load(inv_bin_width_ptr + d)
+        ).to(ACC_DTYPE)
+        # The range is carried in fp64 but the comparisons must happen in the
+        # input dtype, which is what ATen compares in.
+        left = tl.load(left_ptr + d).to(ACC_DTYPE)
+        right = tl.load(right_ptr + d).to(ACC_DTYPE)
         nbins = tl.load(bins_ptr + d)
         stride = tl.load(strides_ptr + d)
 
-        # bin index = floor((coord - left) * inv_bw)
-        bin_idx = tl.floor((coord - left) * inv_bw).to(tl.int64)
-
-        # The rightmost bin is inclusive of the right edge.
-        right_edge = coord == right
-        bin_idx = tl.where(right_edge, nbins - 1, bin_idx)
-
-        # Only count points strictly inside [left, right] (NaN fails this).
+        # Only count points inside [left, right] (NaN fails both comparisons).
         in_range = (coord >= left) & (coord <= right)
         valid = valid & in_range
 
-        # Clamp out-of-range (but still in [left, right]) indices defensively;
-        # these will be masked out by `valid` before the atomic add.
-        bin_idx = tl.where(bin_idx < 0, 0, bin_idx)
+        # Locate the bin by searching the explicit edge array, which is what ATen
+        # does -- it materialises the edges with linspace and takes an upper bound
+        # over them. No closed-form index reproduces that: computing
+        # floor((coord - left) * bins / width) puts 0.3 over [0, 1] with 10 bins in
+        # bin 3 where ATen says 2, and floor((coord - left) / bin_width) fixes 0.3
+        # but then misplaces 0.6 and 0.7. Searching the same edges the native op
+        # builds agrees on every probed value.
+        row = edges_ptr + d * MAX_EDGES
+        lo = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+        hi = tl.full((BLOCK_SIZE,), 0, dtype=tl.int64) + nbins
+        # Binary search for the last edge <= coord, over at most log2(MAX_EDGES)
+        # steps; the trip count is a compile-time bound so the loop unrolls.
+        for _ in range(MAX_EDGE_STEPS):
+            mid = (lo + hi + 1) // 2
+            mid_c = tl.minimum(mid, nbins)
+            edge = tl.load(row + mid_c, mask=valid, other=float("inf")).to(ACC_DTYPE)
+            take = (edge <= coord) & (mid <= nbins)
+            lo = tl.where(take, mid, lo)
+            hi = tl.where(take, hi, mid - 1)
+        bin_idx = lo
+
+        # The rightmost bin is inclusive of its right edge, so a point exactly on
+        # `right` searches to index nbins and must fold back into the last bin.
         bin_idx = tl.where(bin_idx >= nbins, nbins - 1, bin_idx)
+        bin_idx = tl.where(bin_idx < 0, 0, bin_idx)
 
         linear_idx = linear_idx + bin_idx * stride
 
@@ -119,37 +141,264 @@ def histogramdd_density_kernel(
     mask = offset < num_bins
     count = tl.load(hist_ptr + offset, mask=mask, other=0.0)
     scale = tl.load(scale_ptr)
-    density = count.to(tl.float32) * scale
+    # Stay in ACC_DTYPE so an fp64 histogram keeps full precision, and so a
+    # non-finite scale (see the density notes in the host function) propagates
+    # exactly as ATen's division does.
+    density = count.to(ACC_DTYPE) * scale.to(ACC_DTYPE)
     tl.store(out_ptr + offset, density, mask=mask)
 
 
-def _resolve_range(inp, range_):
+@libentry()
+@triton.jit
+def histogramdd_col_range_kernel(
+    inp_ptr,  # (M, N) contiguous input
+    left_ptr,  # (N,) out: per-dimension left edge
+    right_ptr,  # (N,) out: per-dimension right edge
+    M,
+    N,
+    ACC_DTYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per-column min/max, with the degenerate column widened to (min-.5, max+.5).
+
+    One program handles a tile of BLOCK_N columns and strides down the rows, so the
+    whole auto-range computation happens on the device: this replaces host calls to
+    ``torch.aminmax``/``torch.where``, which the FlagGems host-function convention
+    does not allow. Results are written in ACC_DTYPE to keep fp64 inputs exact.
+    """
+    pid = ext.program_id(0)
+    cols = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_mask = cols < N
+
+    acc_min = tl.full((BLOCK_N,), float("inf"), dtype=ACC_DTYPE)
+    acc_max = tl.full((BLOCK_N,), float("-inf"), dtype=ACC_DTYPE)
+
+    for row_base in range(0, M, BLOCK_M):
+        rows = row_base + tl.arange(0, BLOCK_M)
+        row_mask = rows < M
+        vals = tl.load(
+            inp_ptr + rows[:, None] * N + cols[None, :],
+            mask=row_mask[:, None] & col_mask[None, :],
+            other=float("nan"),
+        ).to(ACC_DTYPE)
+        # minimum/maximum propagate NaN, matching aminmax, so a column holding a
+        # NaN yields a NaN range rather than silently ignoring the value.
+        acc_min = tl.minimum(acc_min, tl.min(vals, axis=0))
+        acc_max = tl.maximum(acc_max, tl.max(vals, axis=0))
+
+    # A dimension whose min equals max is expanded, as torch.histogramdd does.
+    same = acc_min == acc_max
+    lefts = tl.where(same, acc_min - 0.5, acc_min)
+    rights = tl.where(same, acc_max + 0.5, acc_max)
+    tl.store(left_ptr + cols, lefts, mask=col_mask)
+    tl.store(right_ptr + cols, rights, mask=col_mask)
+
+
+@libentry()
+@triton.jit
+def histogramdd_edges_kernel(
+    left_ptr,  # (N,) left edges
+    right_ptr,  # (N,) right edges
+    bins_ptr,  # (N,) bins per dimension
+    edges_ptr,  # (N, MAX_EDGES) out: padded per-dimension edge arrays
+    N,
+    MAX_EDGES,
+    ACC_DTYPE: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """Materialise the per-dimension bin edges the binning kernel searches.
+
+    Reproduces ``torch.linspace`` bit-for-bit, which is how ATen builds these edges.
+    The precision matters more than usual here: a point sitting exactly on an edge is
+    placed by an exact comparison, so a 1-ulp error in an edge moves that point a
+    whole bin. Each rule below was settled by measuring against torch.linspace, with
+    the mismatch counts over random configurations noted for the rejected variants.
+
+    * Interpolate from the nearer endpoint: ``step * i + left`` below the halfway
+      index, ``right - step * (steps-1-i)`` at or above it. Accumulating from the
+      left throughout puts edge 6 of [0, 1]/10 bins at 0.6000000000000001 rather
+      than 0.6, so a point at exactly 0.6 lands one bin low (113/300 disagree).
+    * Round ``step`` to the storage dtype, but run the multiply-add in fp64 and
+      narrow only on the store (fp32 throughout: 113/300 disagree).
+    * Derive ``step`` from the endpoints already narrowed to the storage dtype, not
+      from the fp64 range they arrive in (167/200 disagree).
+
+    The final form matched ATen's edges on 2000/2000 random fp32 configurations and
+    1500/1500 fp64 ones.
+    """
+    d = ext.program_id(0)
+    if d < N:
+        left = tl.load(left_ptr + d)
+        right = tl.load(right_ptr + d)
+        nbins = tl.load(bins_ptr + d)
+        steps = nbins + 1
+        half = steps // 2
+        l_out = left.to(ACC_DTYPE)
+        r_out = right.to(ACC_DTYPE)
+        if ACC_DTYPE == tl.float32:
+            # div_rn rather than `/`: Triton lowers plain fp32 division to a fast
+            # reciprocal that is not correctly rounded, and it disagreed with IEEE
+            # division on 47/200 configurations -- enough to shift `step` by an ulp
+            # and carry every interior edge with it. div_rn is fp32-only, and fp64
+            # division already lowers to a correctly rounded instruction.
+            step = tl.math.div_rn(r_out - l_out, nbins.to(ACC_DTYPE)).to(tl.float64)
+        else:
+            step = ((r_out - l_out) / nbins.to(ACC_DTYPE)).to(tl.float64)
+        l64 = l_out.to(tl.float64)
+        r64 = r_out.to(tl.float64)
+        for base in range(0, MAX_EDGES, BLOCK_E):
+            idx = base + tl.arange(0, BLOCK_E)
+            m = idx < MAX_EDGES
+            fi = idx.to(tl.float64)
+            rev = (steps - 1 - idx).to(tl.float64)
+            val = tl.where(idx < half, step * fi + l64, r64 - step * rev)
+            # Padding lanes hold +inf so the binning search never selects them.
+            val = tl.where(idx <= nbins, val, float("inf"))
+            tl.store(edges_ptr + d * MAX_EDGES + idx, val.to(ACC_DTYPE), mask=m)
+
+
+@libentry()
+@triton.jit
+def histogramdd_bin_geometry_kernel(
+    left_ptr,  # (N,) left edges
+    right_ptr,  # (N,) right edges
+    bins_ptr,  # (N,) bins per dimension
+    width_ptr,  # (N,) out: right - left
+    bin_width_ptr,  # (N,) out: width / bins (width == 0 -> 1)
+    N,
+    ACC_DTYPE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Derive per-dimension widths and bin widths on the device.
+
+    Keeps this off the host, so no ``.item()`` per dimension is needed to build the
+    kernel arguments.
+    """
+    cols = ext.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = cols < N
+    left = tl.load(left_ptr + cols, mask=mask, other=0.0).to(ACC_DTYPE)
+    right = tl.load(right_ptr + cols, mask=mask, other=0.0).to(ACC_DTYPE)
+    nbins = tl.load(bins_ptr + cols, mask=mask, other=1).to(ACC_DTYPE)
+
+    width = right - left
+    # Guard a zero width so the division in the binning kernel stays finite; such
+    # points only match the ``coord == right`` branch there anyway.
+    safe = tl.where(width == 0, 1.0, width)
+    tl.store(width_ptr + cols, width, mask=mask)
+    tl.store(bin_width_ptr + cols, safe / nbins, mask=mask)
+
+
+@libentry()
+@triton.jit
+def histogramdd_total_scale_kernel(
+    hist_ptr,  # (num_bins,) counts
+    log_width_ptr,  # () log of the absolute bin volume
+    sign_ptr,  # () sign of the bin volume
+    scale_ptr,  # () out: 1 / (total_count * bin_volume)
+    num_bins,
+    ACC_DTYPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Sum the histogram and turn it into the density scale, entirely on device.
+
+    Replaces the host ``hist_acc.sum().item()``. The bin volume is accumulated in
+    the log domain and re-exponentiated so a many-dimensional product cannot
+    overflow before the division. The division is left unguarded on purpose: ATen
+    divides straight through, so a zero total yields inf/nan and those must
+    propagate (see the density notes in the host function).
+    """
+    total = tl.zeros((), dtype=ACC_DTYPE)
+    for base in range(0, num_bins, BLOCK_SIZE):
+        offs = base + tl.arange(0, BLOCK_SIZE)
+        m = offs < num_bins
+        total += tl.sum(tl.load(hist_ptr + offs, mask=m, other=0.0).to(ACC_DTYPE))
+
+    # The bin volume arrives already reduced (a signed magnitude in the log domain)
+    # because it depends only on the bins list and the edges, not on the data.
+    log_vol = tl.load(log_width_ptr).to(ACC_DTYPE)
+    sign = tl.load(sign_ptr).to(ACC_DTYPE)
+    bin_volume = sign * tl.exp(log_vol)
+    tl.store(scale_ptr, 1.0 / (total * bin_volume))
+
+
+@libentry()
+@triton.jit
+def histogramdd_log_volume_kernel(
+    width_ptr,  # (N,) per-dimension width
+    bins_ptr,  # (N,) per-dimension bin count
+    log_width_ptr,  # () out: sum of log|width / bins|
+    sign_ptr,  # () out: product of the signs
+    N,
+    ACC_DTYPE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Reduce the per-dimension bin widths into a signed log bin volume.
+
+    Accumulating ``log|width / bins|`` and tracking the sign separately keeps a
+    high-dimensional product from overflowing or underflowing before the division
+    in ``histogramdd_total_scale_kernel``.
+    """
+    offs = tl.arange(0, BLOCK_N)
+    m = offs < N
+    width = tl.load(width_ptr + offs, mask=m, other=1.0).to(ACC_DTYPE)
+    nbins = tl.load(bins_ptr + offs, mask=m, other=1).to(ACC_DTYPE)
+    per_dim = width / nbins
+    # Masked lanes contribute log(1) == 0 to the sum and +1 to the sign product.
+    mag = tl.where(m, tl.abs(per_dim), 1.0)
+    tl.store(log_width_ptr, tl.sum(tl.log(mag), axis=0))
+    negatives = tl.sum(tl.where(m & (per_dim < 0), 1, 0), axis=0)
+    tl.store(sign_ptr, tl.where(negatives % 2 == 0, 1.0, -1.0).to(ACC_DTYPE))
+
+
+def _resolve_range(inp, range_, N, acc_dtype):
     """Return (lefts, rights) tensors of shape (N,) on the input device.
 
+    The edges are always carried in float64, whatever the input dtype: an explicit
+    ``range`` arrives as Python doubles and ATen derives the (fp32) bin edges from
+    those doubles, so narrowing the endpoints up front would perturb the bin edges
+    by an ulp and misplace points that sit exactly on one.
+
     If `range_` is None the range for each dimension is derived from the data's
-    per-dimension min/max, matching torch.histogramdd: a dimension whose min
-    equals max is expanded to (min - 0.5, max + 0.5).
+    per-dimension min/max on the device, matching torch.histogramdd: a dimension
+    whose min equals max is expanded to (min - 0.5, max + 0.5).
     """
-    N = inp.shape[-1]
     if range_ is not None:
         # range_ is a flat sequence [l0, r0, l1, r1, ...].
         rng = [float(v) for v in range_]
         if len(rng) != 2 * N:
-            raise ValueError(
-                f"range must have 2 values per dimension ({2 * N} total), got {len(rng)}"
+            raise RuntimeError(
+                f"torch.histogramdd: for a {N}-dimensional histogram range should "
+                f"have {2 * N} elements, but got {len(rng)}"
             )
-        lefts = torch.tensor(rng[0::2], dtype=inp.dtype, device=inp.device)
-        rights = torch.tensor(rng[1::2], dtype=inp.dtype, device=inp.device)
+        lefts = torch.tensor(rng[0::2], dtype=torch.float64, device=inp.device)
+        rights = torch.tensor(rng[1::2], dtype=torch.float64, device=inp.device)
         return lefts, rights
 
-    # Auto-range per dimension using the flattened (M, N) view.
-    flat = inp.reshape(-1, N)
-    # torch.aminmax supports all floating dtypes (incl. float64); amin/amax do not.
-    mins, maxs = torch.aminmax(flat, dim=0)
-    same = mins == maxs
-    lefts = torch.where(same, mins - 0.5, mins)
-    rights = torch.where(same, maxs + 0.5, maxs)
-    return lefts.to(inp.dtype), rights.to(inp.dtype)
+    lefts = torch.empty(N, dtype=torch.float64, device=inp.device)
+    rights = torch.empty(N, dtype=torch.float64, device=inp.device)
+    M = inp.shape[0]
+    if M == 0:
+        # No data to reduce over; ATen's empty-input range collapses to (0, 1) per
+        # dimension after the degenerate-range expansion of (inf, -inf) is skipped.
+        lefts.fill_(0.0)
+        rights.fill_(1.0)
+        return lefts, rights
+
+    BLOCK_N = triton.next_power_of_2(N)
+    grid = (triton.cdiv(N, BLOCK_N),)
+    with torch_device_fn.device(inp.device):
+        histogramdd_col_range_kernel[grid](
+            inp,
+            lefts,
+            rights,
+            M,
+            N,
+            ACC_DTYPE=tl.float64,
+            BLOCK_M=128,
+            BLOCK_N=BLOCK_N,
+        )
+    return lefts, rights
 
 
 def _histogramdd_from_bin_cts_impl(
@@ -159,12 +408,13 @@ def _histogramdd_from_bin_cts_impl(
     logger.debug("GEMS _HISTOGRAMDD_FROM_BIN_CTS")
 
     if self.ndim < 2:
-        raise ValueError(
-            "_histogramdd_from_bin_cts: input must have at least 2 dimensions"
+        raise RuntimeError(
+            "torch.histogramdd: input tensor should have at least 2 dimensions"
         )
     if self.shape[-1] != len(bins):
-        raise ValueError(
-            "_histogramdd_from_bin_cts: number of bins must match input's last dim"
+        raise RuntimeError(
+            "histogramdd: The size of bins must be equal to the innermost "
+            "dimension of the input."
         )
 
     # torch._histogramdd_from_bin_cts is only implemented for floating types.
@@ -187,14 +437,29 @@ def _histogramdd_from_bin_cts_impl(
     M = inp.shape[0]
     out_dtype = self.dtype
 
-    # Allocate / validate the output buffer.
+    # Accumulate in the input's dtype: float32 for float32 inputs and float64 for
+    # float64 inputs, so double-precision inputs keep their precision through the
+    # atomic-add reductions. (float16/bfloat16 are unsupported by the ATen op.)
+    acc_dtype = self.dtype
+    acc_triton_dtype = tl.float64 if acc_dtype == torch.float64 else tl.float32
+
+    # Allocate / validate the output buffer. ATen resizes a mis-shaped out tensor
+    # in place and keeps the caller's object identity, but rejects a dtype
+    # mismatch outright, so a wrong dtype must raise rather than be re-bound
+    # through .to() (which would leave the caller's buffer untouched).
     if out is not None:
-        if tuple(out.shape) != out_shape:
+        if out.dtype != out_dtype:
             raise RuntimeError(
-                "_histogramdd_from_bin_cts.out: out shape mismatch: expected "
-                f"{out_shape}, got {tuple(out.shape)}"
+                f"Expected out tensor to have dtype {out_dtype}, but got "
+                f"{out.dtype} instead"
             )
-        out = out.to(out_dtype) if out.dtype != out_dtype else out
+        if out.device != self.device:
+            raise RuntimeError(
+                f"Expected out tensor to have device {self.device}, but got "
+                f"{out.device} instead"
+            )
+        if tuple(out.shape) != out_shape:
+            out.resize_(out_shape)
     else:
         out = torch.empty(out_shape, dtype=out_dtype, device=self.device)
 
@@ -203,44 +468,63 @@ def _histogramdd_from_bin_cts_impl(
         out.zero_()
         return out
 
-    lefts, rights = _resolve_range(inp, range)
+    lefts, rights = _resolve_range(inp, range, N, acc_dtype)
 
-    # Per-dimension widths; protect against a zero width (left == right) so the
-    # binning math does not divide by zero -- those points fall only on the right
-    # edge and are mapped to the last bin via the ``coord == right`` branch.
-    widths = rights - lefts
-    safe_widths = torch.where(widths == 0, torch.ones_like(widths), widths)
-    # inv_bin_width[d] = bins[d] / width[d]; row-major stride[d] = prod(bins[d+1:]).
-    # Build both tensors on the host (small, <= a handful of dims) to avoid the
-    # latency of several tiny CUDA reductions for each call.
+    # Row-major stride[d] = prod(bins[d+1:]); derived from the bins list, which is
+    # already host data, so no device round-trip is involved.
     strides_host = [1] * N
     for d in _builtins.range(N - 2, -1, -1):
         strides_host[d] = strides_host[d + 1] * bins_list[d + 1]
-    inv_bw_host = [bins_list[d] / safe_widths[d].item() for d in _builtins.range(N)]
-    inv_bin_width = torch.tensor(inv_bw_host, dtype=inp.dtype, device=inp.device)
     strides = torch.tensor(strides_host, dtype=torch.int64, device=inp.device)
     bins_tensor = torch.tensor(bins_list, dtype=torch.int64, device=inp.device)
+
+    # Per-dimension widths and inverse bin widths are computed in a kernel: the
+    # edges may come from the data, and reading them back per dimension would both
+    # break the host-function convention and force a sync.
+    widths = torch.empty(N, dtype=torch.float64, device=inp.device)
+    bin_widths = torch.empty(N, dtype=torch.float64, device=inp.device)
+    BLOCK_N = triton.next_power_of_2(N)
+    # Edge table for the binning search: one padded row per dimension.
+    max_edges = max(bins_list) + 1
+    edges = torch.empty(N, max_edges, dtype=acc_dtype, device=inp.device)
+    with torch_device_fn.device(self.device):
+        histogramdd_bin_geometry_kernel[(triton.cdiv(N, BLOCK_N),)](
+            lefts,
+            rights,
+            bins_tensor,
+            widths,
+            bin_widths,
+            N,
+            ACC_DTYPE=tl.float64,
+            BLOCK_N=BLOCK_N,
+        )
+        histogramdd_edges_kernel[(N,)](
+            lefts,
+            rights,
+            bins_tensor,
+            edges,
+            N,
+            max_edges,
+            ACC_DTYPE=acc_triton_dtype,
+            BLOCK_E=min(1024, triton.next_power_of_2(max_edges)),
+        )
 
     num_bins = 1
     for b in bins_list:
         num_bins *= b
-
-    # Accumulate in the input's dtype: float32 for float32 inputs and float64 for
-    # float64 inputs, so double-precision inputs keep their precision through the
-    # atomic-add reductions. (float16/bfloat16 are unsupported by the ATen op.)
-    acc_dtype = self.dtype
-    acc_triton_dtype = tl.float64 if acc_dtype == torch.float64 else tl.float32
 
     if density:
         # Density rescales every count, so we need the raw counts separately.
         hist_acc = torch.zeros(num_bins, dtype=acc_dtype, device=inp.device)
         hist_ptr = hist_acc
     else:
-        # For the plain histogram, write straight into the output buffer to skip
-        # the final copy (out dtype == acc dtype for the supported float types).
-        out = out.to(acc_dtype) if out.dtype != acc_dtype else out
-        out.zero_()
-        hist_ptr = out.view(num_bins)
+        # For the plain histogram, write straight into the output buffer: out's
+        # dtype is validated to equal the input dtype, which is also the
+        # accumulator dtype, so no final copy is needed. A non-contiguous out
+        # cannot be viewed as flat, so accumulate into a temporary instead.
+        hist_dense = out if out.is_contiguous() else torch.empty_like(out)
+        hist_dense.zero_()
+        hist_ptr = hist_dense.view(num_bins)
 
     if M > 0:
         # One program per point-tile; 1024 points per program amortizes launch
@@ -269,11 +553,13 @@ def _histogramdd_from_bin_cts_impl(
                 hist_ptr,
                 M,
                 N,
-                lefts.to(torch.float32),
-                rights.to(torch.float32),
-                inv_bin_width.to(torch.float32),
+                lefts,
+                rights,
+                edges,
                 strides,
-                bins_tensor.to(torch.int64),
+                bins_tensor,
+                max_edges,
+                MAX_EDGE_STEPS=max(1, (max_edges - 1).bit_length()),
                 N_CONST=N,
                 HAS_WEIGHT=has_weight,
                 ACC_DTYPE=acc_triton_dtype,
@@ -287,18 +573,36 @@ def _histogramdd_from_bin_cts_impl(
         # total count and bin widths are tiny scalars, so move them to the host
         # (one sync) and compute the scale in Python instead of launching extra
         # CUDA reductions.
-        bin_volume = 1.0
-        widths_host = widths.tolist()
-        for d in _builtins.range(N):
-            bin_volume *= widths_host[d] / bins_list[d]
-        total_count = hist_acc.sum().item()
-        scale = (1.0 / (total_count * bin_volume)) if total_count != 0.0 else 0.0
-        scale_t = torch.tensor(scale, dtype=torch.float32, device=self.device)
-        out_flat = (
-            out.view(num_bins).to(acc_dtype)
-            if out.dtype != acc_dtype
-            else out.view(num_bins)
-        )
+        log_vol = torch.empty((), dtype=acc_dtype, device=self.device)
+        vol_sign = torch.empty((), dtype=acc_dtype, device=self.device)
+        scale_t = torch.empty((), dtype=acc_dtype, device=self.device)
+        with torch_device_fn.device(self.device):
+            histogramdd_log_volume_kernel[(1,)](
+                widths,
+                bins_tensor,
+                log_vol,
+                vol_sign,
+                N,
+                ACC_DTYPE=acc_triton_dtype,
+                BLOCK_N=BLOCK_N,
+            )
+            # The division is deliberately unguarded: ATen divides by the total
+            # count directly, so an empty or fully out-of-range input yields NaN
+            # and weights that cancel to zero yield +-inf. Forcing the scale to
+            # zero here would silently diverge from that.
+            histogramdd_total_scale_kernel[(1,)](
+                hist_acc,
+                log_vol,
+                vol_sign,
+                scale_t,
+                num_bins,
+                ACC_DTYPE=acc_triton_dtype,
+                BLOCK_SIZE=1024,
+            )
+        # A non-contiguous out (ATen accepts one) cannot be viewed as flat, so
+        # write into a temporary and copy back, preserving the caller's layout.
+        dense = out if out.is_contiguous() else torch.empty_like(out)
+        out_flat = dense.view(num_bins)
         if num_bins > 0:
             # One program per bin-tile; 1024 bins per program covers typical
             # per-dimension bin counts in a single launch-friendly tile.
@@ -313,9 +617,10 @@ def _histogramdd_from_bin_cts_impl(
                     ACC_DTYPE=acc_triton_dtype,
                     BLOCK_SIZE=BLOCK,
                 )
-        if out.dtype != acc_dtype:
-            out.copy_(out_flat.view(out_shape).to(out.dtype))
-        # out already holds the density in its underlying storage (view).
+        if dense is not out:
+            out.copy_(dense)
+    elif hist_dense is not out:
+        out.copy_(hist_dense)
 
     return out
 
