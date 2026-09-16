@@ -19,9 +19,41 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
+
+# Dimensions the kernel decodes with unrolled scalar arguments. `self` is first
+# run through `_collapse_dims`, which folds memory-adjacent dimensions together,
+# so a contiguous tensor of *any* rank arrives here as rank 1. Only a tensor
+# whose strides stay non-collapsible past this many dimensions (a >8-D permuted
+# view) needs the host-side offset fallback below.
+MAX_UNROLL_RANK = 8
+
+# `torch.Tensor.put_` accepts these but Triton has no atomic for them, so
+# `accumulate=True` is staged through an int32 buffer. int32 add + narrowing
+# cast reproduces native's wraparound exactly (verified against ATen on the
+# int8/uint8/int16 min/max boundaries).
+_NARROW_INT_DTYPES = (torch.int8, torch.uint8, torch.int16)
+
+# ATen error messages name the *scalar type* ("Int", "Short"), not the Python
+# dtype repr ("torch.int32"), so reproduce that spelling verbatim.
+_SCALAR_TYPE_NAMES = {
+    torch.uint8: "Byte",
+    torch.int8: "Char",
+    torch.int16: "Short",
+    torch.int32: "Int",
+    torch.int64: "Long",
+    torch.float16: "Half",
+    torch.float32: "Float",
+    torch.float64: "Double",
+    torch.bfloat16: "BFloat16",
+    torch.bool: "Bool",
+    torch.complex32: "ComplexHalf",
+    torch.complex64: "ComplexFloat",
+    torch.complex128: "ComplexDouble",
+}
 
 
 @libentry()
@@ -30,21 +62,29 @@ def put_kernel(
     inp_ptr,
     index_ptr,
     source_ptr,
+    offset_ptr,
     inp_numel,
     N,
-    rank,
-    inp_stride0,
-    inp_stride1,
-    inp_stride2,
-    inp_stride3,
-    inp_stride4,
     inp_shape0,
     inp_shape1,
     inp_shape2,
     inp_shape3,
     inp_shape4,
+    inp_shape5,
+    inp_shape6,
+    inp_shape7,
+    inp_stride0,
+    inp_stride1,
+    inp_stride2,
+    inp_stride3,
+    inp_stride4,
+    inp_stride5,
+    inp_stride6,
+    inp_stride7,
+    RANK: tl.constexpr,
     IS_ACCUMULATE: tl.constexpr,
     IS_CONTIGUOUS: tl.constexpr,
+    HAS_PRECOMPUTED_OFFSETS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -54,42 +94,65 @@ def put_kernel(
     # Load the flat (linear) index into the input tensor, treated as 1-D.
     idx = tl.load(index_ptr + offsets, mask=mask, other=0).to(tl.int64)
 
-    # Negative index maps to the end of the flattened tensor.
-    idx = tl.where(idx < 0, idx + inp_numel, idx)
+    # Negative index counts back from the end of the flattened tensor.
+    wrapped = tl.where(idx < 0, idx + inp_numel, idx)
 
-    # Validate index bounds: 0 <= idx < inp_numel (self.numel()).
-    index_valid = (idx >= 0) & (idx < inp_numel)
+    # Bounds check on the *original* index, matching ATen's CUDA assertion
+    # `idx < numel && idx >= -numel`: the valid range is [-inp_numel, inp_numel).
+    index_valid = (wrapped >= 0) & (wrapped < inp_numel)
+    tl.device_assert(index_valid | (~mask), "put_(): index out of range")
+
+    # Gate the write on validity as well, so an out-of-range index can never
+    # touch memory outside `self` even when the assert is compiled out (Triton
+    # only emits `device_assert` under TRITON_DEBUG=1).
     final_mask = mask & index_valid
+    # Keep the decoded coordinate in range even for masked-off lanes.
+    idx = tl.where(index_valid, wrapped, 0)
 
-    if IS_CONTIGUOUS:
+    if HAS_PRECOMPUTED_OFFSETS:
+        # >MAX_UNROLL_RANK collapsed dims: the physical element offsets were
+        # computed on the host, so no in-kernel decomposition is needed.
+        inp_offsets = tl.load(offset_ptr + offsets, mask=final_mask, other=0).to(
+            tl.int64
+        )
+    elif IS_CONTIGUOUS:
         # For a row-major contiguous tensor the flat index is already the
         # element offset, so the multi-dimensional decomposition drops out.
-        # This is the common case (``put`` on a freshly-allocated out tensor)
-        # and avoids five integer divisions per element.
+        # This is the common case and avoids the integer divisions below.
         inp_offsets = idx
     else:
         # Convert the flat index to a multi-dimensional coordinate, then to the
-        # physical memory offset using the input strides. This correctly handles
-        # non-contiguous (e.g. transposed / sliced) input tensors.
+        # physical element offset via the input strides. This handles
+        # non-contiguous `self` (transposed / sliced / strided views) and, via
+        # the storage_offset already baked into `inp_ptr`, views into a larger
+        # storage.
         cur = idx
         inp_offsets = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
-        # Unrolled over the supported ranks; unused dims contribute zero.
-        if rank > 4:
+        if RANK > 7:
+            inp_offsets += (cur % inp_shape7) * inp_stride7
+            cur = cur // inp_shape7
+        if RANK > 6:
+            inp_offsets += (cur % inp_shape6) * inp_stride6
+            cur = cur // inp_shape6
+        if RANK > 5:
+            inp_offsets += (cur % inp_shape5) * inp_stride5
+            cur = cur // inp_shape5
+        if RANK > 4:
             inp_offsets += (cur % inp_shape4) * inp_stride4
             cur = cur // inp_shape4
-        if rank > 3:
+        if RANK > 3:
             inp_offsets += (cur % inp_shape3) * inp_stride3
             cur = cur // inp_shape3
-        if rank > 2:
+        if RANK > 2:
             inp_offsets += (cur % inp_shape2) * inp_stride2
             cur = cur // inp_shape2
-        if rank > 1:
+        if RANK > 1:
             inp_offsets += (cur % inp_shape1) * inp_stride1
             cur = cur // inp_shape1
-        if rank > 0:
+        if RANK > 0:
             inp_offsets += cur * inp_stride0
 
-    # Source is loaded with the same flat element offset as the index/source.
+    # `source` is indexed by the same flat position as `index`.
     src_val = tl.load(source_ptr + offsets, mask=final_mask, other=0)
 
     if IS_ACCUMULATE:
@@ -98,18 +161,264 @@ def put_kernel(
         tl.store(inp_ptr + inp_offsets, src_val, mask=final_mask)
 
 
+def _collapse_dims(shape, stride):
+    """Fold memory-adjacent dimensions together, preserving flat-index order.
+
+    `put_` addresses `self` by its flattened (row-major) index, so any group of
+    trailing dimensions that is contiguous in memory can be treated as one
+    dimension without changing which element a flat index names. This turns a
+    contiguous tensor of any rank into rank 1 and keeps the in-kernel decode
+    within MAX_UNROLL_RANK for every realistic layout.
+    """
+    new_shape, new_stride = [], []
+    for d in reversed(range(len(shape))):
+        if shape[d] == 1:
+            # A size-1 dimension contributes a constant 0 to the offset.
+            continue
+        if new_shape and new_stride[-1] * new_shape[-1] == stride[d]:
+            new_shape[-1] *= shape[d]
+        else:
+            new_shape.append(shape[d])
+            new_stride.append(stride[d])
+    new_shape.reverse()
+    new_stride.reverse()
+    return new_shape, new_stride
+
+
+def _is_non_overlapping_and_dense(t):
+    """Mirror of `TensorImpl::is_non_overlapping_and_dense()`."""
+    if t.is_contiguous():
+        return True
+    sizes_strides = sorted((s, sz) for sz, s in zip(t.shape, t.stride()) if sz != 1)
+    expected = 1
+    for stride, size in sizes_strides:
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
+def _has_internal_overlap(t):
+    """Mirror of `at::has_internal_overlap()`: MemOverlap::{No,Yes,TooHard}."""
+    if _is_non_overlapping_and_dense(t):
+        return "no"
+    # A zero stride on a dimension of size > 1 aliases the same element.
+    for size, stride in zip(t.shape, t.stride()):
+        if size > 1 and stride == 0:
+            return "yes"
+    return "too_hard"
+
+
+def _overlap_status(a, b):
+    """Mirror of `c10::get_overlap_status()`: Full / Partial / No / TooHard."""
+    if a is b:
+        return "full"
+    if a.numel() == 0 or b.numel() == 0:
+        return "no"
+    if not _is_non_overlapping_and_dense(a) or not _is_non_overlapping_and_dense(b):
+        return "too_hard"
+    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+        return "no"
+    a_begin, b_begin = a.data_ptr(), b.data_ptr()
+    a_end = a_begin + a.numel() * a.element_size()
+    b_end = b_begin + b.numel() * b.element_size()
+    if a_begin == b_begin and a_end == b_end:
+        # Identical byte range: only a matching layout means element-wise identity.
+        return "full" if a.stride() == b.stride() else "partial"
+    if a_begin < b_end and b_begin < a_end:
+        return "partial"
+    return "no"
+
+
+def _assert_no_internal_overlap(t):
+    """`at::assert_no_internal_overlap` -- rejects e.g. an expanded `self`."""
+    if _has_internal_overlap(t) == "yes":
+        raise RuntimeError(
+            "unsupported operation: more than one element of the written-to tensor "
+            "refers to a single memory location. Please clone() the tensor before "
+            "performing the operation."
+        )
+
+
+def _check_and_unalias(written_to, other):
+    """Apply ATen's overlap rules to a read-only operand, in a single pass.
+
+    ATen raises for a Full/Partial overlap status but deliberately permits
+    `TooHard` (either operand non-dense, e.g. `self=t[::2]`, `source=t[1::2]`),
+    where byte ranges interleave without sharing elements. Its element-at-a-time
+    CUDA kernel tolerates that; ours would read and write the same bytes
+    concurrently and race, so snapshot the operand instead -- the pre-operation
+    values are exactly what ATen computes.
+    """
+    status = _overlap_status(written_to, other)
+    if status in ("full", "partial"):
+        raise RuntimeError(
+            "unsupported operation: some elements of the input tensor and the "
+            "written-to tensor refer to a single memory location. Please clone() "
+            "the tensor before performing the operation."
+        )
+    if status == "too_hard":
+        return other.clone()
+    return other
+
+
+def _flatten(t):
+    """Contiguous 1-D view of `t`, in flattened (row-major) element order."""
+    if t.ndim == 1 and t.is_contiguous():
+        return t
+    return t.contiguous().reshape(-1)
+
+
+def _launch(inp, index_flat, source_flat, accumulate):
+    """Launch `put_kernel` over an already-validated, already-flat triple."""
+    N = index_flat.numel()
+    inp_numel = inp.numel()
+
+    if inp.is_contiguous():
+        # The overwhelmingly common case: the flat index *is* the element
+        # offset, so skip dim collapsing entirely and let the kernel skip the
+        # decode too. Worth special-casing because at small N this operator is
+        # dominated by host-side launch preparation.
+        shape, stride, rank = [inp_numel], [1], 1
+    else:
+        shape, stride = _collapse_dims(list(inp.shape), list(inp.stride()))
+        rank = len(shape)
+
+    offsets_arg = inp  # unused placeholder; kernel ignores it unless enabled
+    has_precomputed = rank > MAX_UNROLL_RANK
+    if has_precomputed:
+        # A >MAX_UNROLL_RANK collapsed layout (a heavily permuted high-rank
+        # view) is rare enough that decoding the flat index on the host and
+        # passing element offsets is cheaper than growing the kernel signature.
+        flat = index_flat.to(torch.int64)
+        flat = torch.where(flat < 0, flat + inp_numel, flat)
+        flat = flat.clamp_(0, max(inp_numel - 1, 0))
+        offsets_arg = torch.zeros_like(flat)
+        cur = flat
+        for d in reversed(range(rank)):
+            offsets_arg += (cur % shape[d]) * stride[d]
+            cur = cur // shape[d]
+        rank = 0  # decomposition already done
+
+    # Pad to exactly MAX_UNROLL_RANK. Truncation only ever applies on the
+    # precomputed-offsets path, where these arguments are unused -- padding
+    # without truncating would push extra positionals into the constexprs.
+    shape = (shape + [1] * MAX_UNROLL_RANK)[:MAX_UNROLL_RANK]
+    stride = (stride + [0] * MAX_UNROLL_RANK)[:MAX_UNROLL_RANK]
+
+    # This kernel is a pure scatter: one load and one store per index, no reuse
+    # and no cross-lane communication. It is bound by memory latency and, at
+    # small N, by launch overhead -- measured block/warp sweeps showed no
+    # difference, so keep a single fixed configuration.
+    BLOCK_SIZE, num_warps = 1024, 4
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+
+    with torch_device_fn.device(inp.device):
+        put_kernel[grid](
+            inp,
+            index_flat,
+            source_flat,
+            offsets_arg,
+            inp_numel,
+            N,
+            *shape,
+            *stride,
+            RANK=rank,
+            IS_ACCUMULATE=accumulate,
+            IS_CONTIGUOUS=(rank == 1 and stride[0] == 1),
+            HAS_PRECOMPUTED_OFFSETS=has_precomputed,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+
+
 def _put_impl(inp, index, source, accumulate=False):
-    # Mirror the validation torch performs on `put`/`put_`/`put.out` so the GEMS
-    # path raises the same errors (and exception types) as native instead of
-    # silently casting / racing on bad inputs.
+    inp_numel = inp.numel()
+
+    # Flatten index/source so each program handles one (index, source) pair.
+    # `.contiguous()` must come *before* `reshape(-1)`: on an already-1-D
+    # strided view (`idx[::2]`) `reshape(-1)` is a no-op that preserves the
+    # non-unit stride, and the kernel reads with unit stride -- silently
+    # scattering the wrong values. `_flatten` skips both calls when the operand
+    # is already a contiguous 1-D tensor, which is the common case.
+    index_flat = _flatten(index)
+    source_flat = _flatten(source)
+
+    if index_flat.numel() == 0:
+        # Nothing to scatter. ATen still validates (above) but performs no write,
+        # including when `self` itself is empty.
+        return inp
+
+    if inp_numel == 0:
+        raise IndexError("put_(): Tried to put elements into an empty tensor")
+
+    dtype = inp.dtype
+
+    if dtype.is_complex:
+        # Triton has no complex type. A complex tensor is an interleaved
+        # (real, imag) pair, so `view_as_real` gives two strided real views that
+        # `put_` can scatter independently -- the flat index of a complex
+        # element is the flat index of both its components.
+        real_view = torch.view_as_real(inp)
+        re, im = real_view[..., 0], real_view[..., 1]
+        src_real = torch.view_as_real(source_flat)
+        _launch(re, index_flat, src_real[..., 0].contiguous(), accumulate)
+        _launch(im, index_flat, src_real[..., 1].contiguous(), accumulate)
+        return inp
+
+    if accumulate and dtype in _NARROW_INT_DTYPES:
+        # Triton has no atomic_add for int8/uint8/int16 (and none for bool).
+        # Accumulate into an int32 staging copy, then narrow back. The narrowing
+        # cast wraps exactly like native's integer accumulate.
+        staged = inp.to(torch.int32)
+        _launch(
+            staged,
+            index_flat,
+            source_flat.to(torch.int32),
+            True,
+        )
+        inp.copy_(staged.to(dtype).reshape(inp.shape))
+        return inp
+
+    if accumulate and dtype is torch.bool:
+        # `accumulate=True` on bool is a logical OR in native (measured: any
+        # True source lands as True, an already-True slot stays True). int32
+        # atomic_add then `!= 0` reproduces it without a bool atomic.
+        staged = inp.to(torch.int32)
+        _launch(staged, index_flat, source_flat.to(torch.int32), True)
+        inp.copy_((staged != 0).reshape(inp.shape))
+        return inp
+
+    _launch(inp, index_flat, source_flat, accumulate)
+    return inp
+
+
+def put_(inp, index, source, accumulate=False):
+    logger.debug("GEMS PUT_")
+
+    # Validation order mirrors ATen: device, then index dtype, then source
+    # dtype, then numel, then the memory-overlap checks. Measured against
+    # `torch.Tensor.put_` on inputs that violate two rules at once.
+    if index.device != inp.device or source.device != inp.device:
+        bad, name = (
+            (index, "index") if index.device != inp.device else (source, "source")
+        )
+        raise RuntimeError(
+            f"Expected all tensors to be on the same device, but got {name} is "
+            f"on {bad.device}, different from other tensors on {inp.device} "
+            "(when checking argument in method wrapper_CUDA__put_)"
+        )
     if index.dtype != torch.int64:
         raise RuntimeError(
-            "put_(): Expected a long tensor for index, but got " + str(index.dtype)
+            "put_(): Expected a long tensor for index, but got "
+            f"{_SCALAR_TYPE_NAMES.get(index.dtype, str(index.dtype))}"
         )
     if source.dtype != inp.dtype:
         raise RuntimeError(
             "put_(): self and source expected to have the same dtype, but got "
-            f"self.dtype = {inp.dtype} and source.dtype = {source.dtype}"
+            f"self.dtype = {_SCALAR_TYPE_NAMES.get(inp.dtype, str(inp.dtype))} "
+            f"and source.dtype = "
+            f"{_SCALAR_TYPE_NAMES.get(source.dtype, str(source.dtype))}"
         )
     if index.numel() != source.numel():
         raise IndexError(
@@ -117,78 +426,8 @@ def _put_impl(inp, index, source, accumulate=False):
             f"but got source.numel() = {source.numel()}, index.numel() = {index.numel()}"
         )
 
-    rank = inp.ndim
-    assert rank <= 5, "put_ only supports tensors with rank <= 5"
+    _assert_no_internal_overlap(inp)
+    index = _check_and_unalias(inp, index)
+    source = _check_and_unalias(inp, source)
 
-    # Flatten index/source so each thread maps to one (index, source) pair.
-    index_flat = index.reshape(-1)
-    source_flat = source.reshape(-1)
-
-    N = index_flat.numel()
-    inp_numel = inp.numel()
-
-    # Pad strides/shapes to rank 5 (unused trailing dims get stride 0 / shape 1).
-    strides = list(inp.stride()) + [0] * (5 - rank)
-    shapes = list(inp.shape) + [1] * (5 - rank)
-
-    # For a row-major contiguous tensor the flat index is the element offset, so
-    # the kernel can skip the five integer divisions of the multi-dim decode.
-    is_contiguous = inp.is_contiguous()
-
-    # Scale the block/warps to the amount of work: a fixed 2048-element block
-    # with 8 warps wastes a whole launch-grid worth of latency when N is small
-    # (1024 indices = 1 program, 8 warps doing 128 elements each). A single-warp
-    # 1024 block is far cheaper for the common small-N scatter and still
-    # saturates bandwidth once N grows.
-    if N <= 1024:
-        # small-N: single warp, 1024 elements/program
-        BLOCK_SIZE = 1024
-        num_warps = 1
-    elif N <= 8192:
-        # medium-N: 4 warps, 1024 elements/program
-        BLOCK_SIZE = 1024
-        num_warps = 4
-    else:
-        # large-N: 8 warps, 2048 elements/program
-        BLOCK_SIZE = 2048
-        num_warps = 8
-    grid = (triton.cdiv(N, BLOCK_SIZE),)
-
-    # Accumulate runs directly in the tensor's own dtype. fp16/bf16 `atomic_add`
-    # is non-deterministic in add order, but its per-add rounding stays within
-    # the low-precision tolerances the put tests use (fp16 1e-2, bf16 1e-1), so
-    # the float32 upcast round-trip -- an O(numel) copy that dominated the
-    # scatter for large `inp` -- is dropped (mirrors `put.py`).
-    put_kernel[grid](
-        inp,
-        index_flat,
-        source_flat,
-        inp_numel,
-        N,
-        rank,
-        strides[0],
-        strides[1],
-        strides[2],
-        strides[3],
-        strides[4],
-        shapes[0],
-        shapes[1],
-        shapes[2],
-        shapes[3],
-        shapes[4],
-        IS_ACCUMULATE=accumulate,
-        IS_CONTIGUOUS=is_contiguous,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-    )
-
-    return inp
-
-
-def put_(inp, index, source, accumulate=False):
-    logger.debug("GEMS PUT_")
-    if index.device != inp.device:
-        index = index.to(inp.device)
-    if source.device != inp.device:
-        source = source.to(inp.device)
     return _put_impl(inp, index, source, accumulate)
