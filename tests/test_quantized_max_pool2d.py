@@ -23,6 +23,40 @@ from . import accuracy_utils as utils
 
 device = flag_gems.device
 
+# The two overloads under test, by their FlagGems function names.
+GEMS_OPS = ["quantized_max_pool2d", "quantized_max_pool2d_out"]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def gems_quantized_max_pool2d():
+    """Install the FlagGems QuantizedCUDA override for the module.
+
+    FlagGems is opt-in, so ``aten::quantized_max_pool2d`` only reaches the Triton
+    kernel once the override is registered; the tests below then exercise the
+    operator through plain ``torch.quantized_max_pool2d`` and
+    ``torch.ops.aten.quantized_max_pool2d.out``, i.e. through real dispatch.
+    This matters because PyTorch's own accelerator kernel is cuDNN-backed and
+    handles only qint8 -- quint8/qint32 raise "TensorDescriptor does not support
+    ..." -- so a registration that never took effect would be a hard error for
+    two of the three dtypes and a silent torch-vs-torch comparison for the third.
+
+    ``only_enable`` registers just these two overloads, on a private
+    ``torch.library.Library`` that is destroyed afterwards. Because the override
+    binds to QuantizedCUDA only, the CPU reference in :func:`_reference` keeps
+    dispatching to the native QuantizedCPU kernel, so every comparison below is
+    genuinely FlagGems against PyTorch. ``test_quantized_max_pool2d_gems_path_active``
+    asserts both halves of that.
+    """
+    lib = torch.library.Library("aten", "IMPL")
+    previous = getattr(flag_gems, "current_work_registrar", None)
+    flag_gems.only_enable(lib=lib, include=GEMS_OPS)
+    try:
+        yield
+    finally:
+        lib._destroy()
+        flag_gems.current_work_registrar = previous
+
+
 # ``aten::quantized_max_pool2d`` dispatches over the three per-tensor quantized
 # integer dtypes (its body is wrapped in ``AT_DISPATCH_QINT_TYPES_AND(Byte,...)``).
 # PyTorch's own accelerator kernel is cuDNN-backed and only handles qint8, so the
@@ -147,15 +181,14 @@ def test_quantized_max_pool2d(
         dilation=dilation,
         ceil_mode=ceil_mode,
     )
-    with flag_gems.use_gems():
-        res_out = torch.quantized_max_pool2d(
-            res_inp,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            ceil_mode=ceil_mode,
-        )
+    res_out = torch.quantized_max_pool2d(
+        res_inp,
+        kernel_size,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        ceil_mode=ceil_mode,
+    )
 
     assert res_out.device.type == res_inp.device.type
     _assert_same_quantized(res_out, ref_out, dtype)
@@ -176,8 +209,7 @@ def test_quantized_max_pool2d_channels_last(dtype):
     assert res_inp.is_contiguous(memory_format=torch.channels_last)
 
     ref_out = _reference(res_inp, 3, 2, 1)
-    with flag_gems.use_gems():
-        res_out = torch.quantized_max_pool2d(res_inp, 3, 2, 1)
+    res_out = torch.quantized_max_pool2d(res_inp, 3, 2, 1)
 
     assert ref_out.is_contiguous(memory_format=torch.channels_last)
     assert res_out.is_contiguous(memory_format=torch.channels_last)
@@ -194,8 +226,7 @@ def test_quantized_max_pool2d_contiguous_output_for_strided_input(dtype):
     assert not res_inp.is_contiguous()
 
     ref_out = _reference(res_inp, (2, 2))
-    with flag_gems.use_gems():
-        res_out = torch.quantized_max_pool2d(res_inp, (2, 2))
+    res_out = torch.quantized_max_pool2d(res_inp, (2, 2))
 
     assert res_out.is_contiguous()
     assert res_out.stride() == ref_out.stride()
@@ -209,8 +240,7 @@ def test_quantized_max_pool2d_zero_batch():
     res_inp = _make_quant_tensor((0, 3, 8, 8), torch.quint8, 0.5, 3)
 
     ref_out = _reference(res_inp, [2, 2])
-    with flag_gems.use_gems():
-        res_out = torch.quantized_max_pool2d(res_inp, [2, 2])
+    res_out = torch.quantized_max_pool2d(res_inp, [2, 2])
     assert res_out.shape == ref_out.shape
     assert res_out.numel() == 0
     assert res_out.dtype == torch.quint8
@@ -236,8 +266,7 @@ def test_quantized_max_pool2d_extreme_values(dtype):
         # padding=1 with a 3x3 kernel makes the corner windows read padding,
         # so an all-``low`` input also checks the padding sentinel cannot win.
         ref_out = _reference(res_inp, 3, 1, 1)
-        with flag_gems.use_gems():
-            res_out = torch.quantized_max_pool2d(res_inp, 3, 1, 1)
+        res_out = torch.quantized_max_pool2d(res_inp, 3, 1, 1)
         utils.gems_assert_equal(res_out.int_repr().cpu(), ref_out.int_repr())
 
 
@@ -263,8 +292,7 @@ def test_quantized_max_pool2d_padding_sentinel(dtype):
         ints.to(device), scale=0.5, zero_point=_valid_zero_point(dtype, 0)
     )
     ref_out = _reference(res_inp, 4, 4, 2)
-    with flag_gems.use_gems():
-        res_out = torch.quantized_max_pool2d(res_inp, 4, 4, 2)
+    res_out = torch.quantized_max_pool2d(res_inp, 4, 4, 2)
     utils.gems_assert_equal(res_out.int_repr().cpu(), ref_out.int_repr())
     assert int(res_out.int_repr().min().item()) == low
 
@@ -275,19 +303,34 @@ def test_quantized_max_pool2d_default_stride(stride):
     """An empty/omitted stride falls back to kernel_size (schema default)."""
     res_inp = _make_quant_tensor((2, 3, 12, 12), torch.quint8, 0.2, 5)
     ref_out = _reference(res_inp, (3, 3), [] if stride is None else stride)
-    with flag_gems.use_gems():
-        res_out = torch.quantized_max_pool2d(res_inp, (3, 3), stride)
+    res_out = torch.quantized_max_pool2d(res_inp, (3, 3), stride)
     _assert_same_quantized(res_out, ref_out, torch.quint8)
 
 
 @pytest.mark.quantized_max_pool2d
-def test_quantized_max_pool2d_dispatches_to_gems(monkeypatch):
-    """``torch.quantized_max_pool2d`` on an accelerator tensor reaches FlagGems.
+def test_quantized_max_pool2d_gems_path_active(monkeypatch):
+    """Guard: the tests above really run the Triton kernel, on the device only.
 
-    The native accelerator kernel is cuDNN-backed and rejects quint8/qint32
-    outright, so a registration that never takes effect would be silently
-    unnoticed for qint8 and a hard error for the other two dtypes.
+    Every other test in this file calls ``torch.quantized_max_pool2d`` (or the
+    ``.out`` overload) and compares against a CPU reference. If the FlagGems
+    override were not installed, those calls would fall through to PyTorch's own
+    kernel and the whole file would degenerate into torch-vs-torch, exercising
+    nothing -- which is exactly what the earlier ``CompositeImplicitAutograd``
+    registration did. Three things are asserted here so that cannot hide again:
+
+    1. Both overloads are registered, and on the QuantizedCUDA key.
+    2. A device-tensor call actually launches the Triton kernel.
+    3. A CPU-tensor call does *not*, so ``_reference`` is still native PyTorch.
     """
+    assert set(GEMS_OPS) <= set(flag_gems.all_registered_ops()), (
+        "the FlagGems quantized_max_pool2d override is not installed; the other "
+        "tests in this file would compare PyTorch against itself."
+    )
+    for overload in ("aten::quantized_max_pool2d", "aten::quantized_max_pool2d.out"):
+        assert torch._C._dispatch_has_kernel_for_dispatch_key(
+            overload, flag_gems.QUANTIZED_CUDA_DISPATCH_KEY
+        ), f"{overload} has no QuantizedCUDA kernel"
+
     # ``flag_gems.ops.quantized_max_pool2d`` is re-exported as the function, so
     # reach the module itself to observe the Triton launch.
     gems_impl = importlib.import_module("flag_gems.ops.quantized_max_pool2d")
@@ -303,9 +346,14 @@ def test_quantized_max_pool2d_dispatches_to_gems(monkeypatch):
     monkeypatch.setattr(gems_impl, "quantized_max_pool2d_kernel", _Counting())
 
     res_inp = _make_quant_tensor((2, 3, 8, 8), torch.quint8, 0.1, 5)
-    with flag_gems.use_gems():
-        torch.quantized_max_pool2d(res_inp, (2, 2))
+    torch.quantized_max_pool2d(res_inp, (2, 2))
     assert calls, "the FlagGems Triton kernel was not reached"
+
+    # The override is bound to QuantizedCUDA, so the CPU reference the rest of
+    # the file compares against must still be PyTorch's own kernel.
+    calls.clear()
+    torch.quantized_max_pool2d(res_inp.cpu(), (2, 2))
+    assert not calls, "the CPU reference was answered by FlagGems, not PyTorch"
 
 
 @pytest.mark.quantized_max_pool2d_out
@@ -340,16 +388,15 @@ def test_quantized_max_pool2d_out(
         dtype=dtype,
         device=device,
     )
-    with flag_gems.use_gems():
-        res_r = torch.ops.aten.quantized_max_pool2d.out(
-            res_inp,
-            _as_int_pair(kernel_size),
-            _as_int_pair(stride, allow_empty=True),
-            _as_int_pair(padding),
-            _as_int_pair(dilation),
-            ceil_mode,
-            out=out_tensor,
-        )
+    res_r = torch.ops.aten.quantized_max_pool2d.out(
+        res_inp,
+        _as_int_pair(kernel_size),
+        _as_int_pair(stride, allow_empty=True),
+        _as_int_pair(padding),
+        _as_int_pair(dilation),
+        ceil_mode,
+        out=out_tensor,
+    )
 
     assert res_r is out_tensor
     _assert_same_quantized(res_r, ref_out, dtype)
@@ -380,10 +427,9 @@ def test_quantized_max_pool2d_out_resizes(dtype):
         out_tensor = torch._empty_affine_quantized(
             out_shape, scale=9.0, zero_point=0, dtype=dtype, device=device
         )
-        with flag_gems.use_gems():
-            res_r = torch.ops.aten.quantized_max_pool2d.out(
-                res_inp, [2, 2], [], [0, 0], [1, 1], False, out=out_tensor
-            )
+        res_r = torch.ops.aten.quantized_max_pool2d.out(
+            res_inp, [2, 2], [], [0, 0], [1, 1], False, out=out_tensor
+        )
         assert res_r is out_tensor
         assert tuple(res_r.shape) == tuple(ref_out.shape)
         _assert_same_quantized(res_r, ref_out, dtype)
@@ -411,10 +457,9 @@ def test_quantized_max_pool2d_out_preserves_offset_and_strides():
         )
     )
     view = buffer[..., ::2]
-    with flag_gems.use_gems():
-        torch.ops.aten.quantized_max_pool2d.out(
-            res_inp, [2, 2], [], [0, 0], [1, 1], False, out=view
-        )
+    torch.ops.aten.quantized_max_pool2d.out(
+        res_inp, [2, 2], [], [0, 0], [1, 1], False, out=view
+    )
     utils.gems_assert_equal(view.int_repr().cpu(), ref_out.int_repr())
     # The interleaved columns that are not part of ``out`` keep their sentinel.
     assert bool((buffer[..., 1::2].int_repr() == 11).all().item())
@@ -432,10 +477,9 @@ def test_quantized_max_pool2d_out_preserves_offset_and_strides():
     )
     offset_view = big[1]
     assert offset_view.storage_offset() != 0
-    with flag_gems.use_gems():
-        torch.ops.aten.quantized_max_pool2d.out(
-            res_inp, [2, 2], [], [0, 0], [1, 1], False, out=offset_view
-        )
+    torch.ops.aten.quantized_max_pool2d.out(
+        res_inp, [2, 2], [], [0, 0], [1, 1], False, out=offset_view
+    )
     utils.gems_assert_equal(offset_view.int_repr().cpu(), ref_out.int_repr())
     assert bool((big[0].int_repr() == 11).all().item())
 
@@ -454,10 +498,9 @@ def test_quantized_max_pool2d_out_channels_last_out():
         device=device,
         memory_format=torch.channels_last,
     )
-    with flag_gems.use_gems():
-        torch.ops.aten.quantized_max_pool2d.out(
-            res_inp, [2, 2], [], [0, 0], [1, 1], False, out=out_tensor
-        )
+    torch.ops.aten.quantized_max_pool2d.out(
+        res_inp, [2, 2], [], [0, 0], [1, 1], False, out=out_tensor
+    )
     assert out_tensor.is_contiguous(memory_format=torch.channels_last)
     utils.gems_assert_equal(out_tensor.int_repr().cpu(), ref_out.int_repr())
 
@@ -468,10 +511,9 @@ def test_quantized_max_pool2d_out_aliasing_input():
     res_inp = _make_quant_tensor((1, 1, 4, 4), torch.quint8, 0.5, 0)
     ref_out = _reference(res_inp, [2, 2])
 
-    with flag_gems.use_gems():
-        res_r = torch.ops.aten.quantized_max_pool2d.out(
-            res_inp, [2, 2], [], [0, 0], [1, 1], False, out=res_inp
-        )
+    res_r = torch.ops.aten.quantized_max_pool2d.out(
+        res_inp, [2, 2], [], [0, 0], [1, 1], False, out=res_inp
+    )
     utils.gems_assert_equal(res_r.int_repr().cpu(), ref_out.int_repr())
 
 
@@ -483,20 +525,18 @@ def test_quantized_max_pool2d_out_rejects_mismatched_out():
     bad_dtype = torch._empty_affine_quantized(
         (2, 3, 4, 4), scale=0.25, zero_point=0, dtype=torch.qint8, device=device
     )
-    with flag_gems.use_gems():
-        with pytest.raises(RuntimeError, match="dtype c10::quint8"):
-            torch.ops.aten.quantized_max_pool2d.out(
-                res_inp, [2, 2], [], [0, 0], [1, 1], False, out=bad_dtype
-            )
+    with pytest.raises(RuntimeError, match="dtype c10::quint8"):
+        torch.ops.aten.quantized_max_pool2d.out(
+            res_inp, [2, 2], [], [0, 0], [1, 1], False, out=bad_dtype
+        )
 
     bad_device = torch._empty_affine_quantized(
         (2, 3, 4, 4), scale=0.25, zero_point=7, dtype=torch.quint8, device="cpu"
     )
-    with flag_gems.use_gems():
-        with pytest.raises(RuntimeError, match="Expected out tensor to have device"):
-            torch.ops.aten.quantized_max_pool2d.out(
-                res_inp, [2, 2], [], [0, 0], [1, 1], False, out=bad_device
-            )
+    with pytest.raises(RuntimeError, match="Expected out tensor to have device"):
+        torch.ops.aten.quantized_max_pool2d.out(
+            res_inp, [2, 2], [], [0, 0], [1, 1], False, out=bad_device
+        )
 
 
 # Each entry is (kwargs, the exact message ATen raises).
@@ -571,11 +611,10 @@ def test_quantized_max_pool2d_invalid_params(kwargs, message):
         )
     assert message in str(native.value)
 
-    with flag_gems.use_gems():
-        with pytest.raises(RuntimeError) as gems:
-            torch.ops.aten.quantized_max_pool2d(
-                res_inp, kernel_size, stride, padding, dilation
-            )
+    with pytest.raises(RuntimeError) as gems:
+        torch.ops.aten.quantized_max_pool2d(
+            res_inp, kernel_size, stride, padding, dilation
+        )
     assert message in str(gems.value)
 
 
@@ -600,9 +639,8 @@ def test_quantized_max_pool2d_invalid_shapes(shape, message):
         torch.ops.aten.quantized_max_pool2d(ref_inp, [2, 2])
     assert message in str(native.value)
 
-    with flag_gems.use_gems():
-        with pytest.raises(RuntimeError) as gems:
-            torch.ops.aten.quantized_max_pool2d(res_inp, [2, 2])
+    with pytest.raises(RuntimeError) as gems:
+        torch.ops.aten.quantized_max_pool2d(res_inp, [2, 2])
     assert message in str(gems.value)
 
 
@@ -617,6 +655,5 @@ def test_quantized_max_pool2d_rejects_per_channel_input():
         torch.quint8,
     ).to(device)
 
-    with flag_gems.use_gems():
-        with pytest.raises(RuntimeError, match="kPerTensorAffine"):
-            torch.quantized_max_pool2d(per_channel, [2, 2])
+    with pytest.raises(RuntimeError, match="kPerTensorAffine"):
+        torch.quantized_max_pool2d(per_channel, [2, 2])
