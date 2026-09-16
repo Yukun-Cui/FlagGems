@@ -25,6 +25,41 @@ from flag_gems.utils.limits import get_dtype_min
 
 logger = logging.getLogger(__name__)
 
+# The quantized integer dtypes ``aten::quantized_max_pool2d`` dispatches over
+# (its kernel body is wrapped in ``AT_DISPATCH_QINT_TYPES_AND(Byte, ...)``),
+# mapped to the dtype of their ``int_repr()``. Pooling runs directly on the
+# integer representation, so the kernel only needs their width/signedness.
+_QINT_DTYPES = {
+    torch.quint8: torch.uint8,
+    torch.qint8: torch.int8,
+    torch.qint32: torch.int32,
+}
+
+# ATen reports the *C++* spelling of a dtype in the ``out=`` dtype error, e.g.
+# "Expected out tensor to have dtype c10::quint8, but got c10::qint8 instead".
+# Reproduce the spellings so the message matches the native operator verbatim.
+_ATEN_DTYPE_NAMES = {
+    torch.quint8: "c10::quint8",
+    torch.qint8: "c10::qint8",
+    torch.qint32: "c10::qint32",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.float16: "c10::Half",
+    torch.bfloat16: "c10::BFloat16",
+    torch.bool: "bool",
+    torch.uint8: "unsigned char",
+    torch.int8: "signed char",
+    torch.int16: "short int",
+    torch.int32: "int",
+    torch.int64: "long int",
+    torch.complex64: "c10::complex<float>",
+    torch.complex128: "c10::complex<double>",
+}
+
+
+def _aten_dtype_name(dtype: torch.dtype) -> str:
+    return _ATEN_DTYPE_NAMES.get(dtype, str(dtype))
+
 
 def max_pool2d_output_size(
     in_size: int,
@@ -34,11 +69,24 @@ def max_pool2d_output_size(
     dilation: int,
     ceil_mode: bool = False,
 ) -> int:
+    """Compute one spatial dimension of the 2-D max-pool output.
+
+    Mirrors ``at::native::pooling_output_shape``, including the two checks it
+    performs before computing the size and the ``ceil_mode`` correction that
+    keeps the last pooling window starting inside the image.
+    """
+    if stride == 0:
+        raise RuntimeError("stride should not be zero")
+    if padding < 0:
+        raise RuntimeError(f"pad must be non-negative, but got pad: {padding}")
+
     effective_kernel_size = (kernel_size - 1) * dilation + 1
     numerator = in_size + 2 * padding - effective_kernel_size
     if ceil_mode:
+        # Python's floor division matches ATen's ``div_rtn`` for negatives too.
         output_size = (numerator + stride - 1) // stride + 1
-        # PyTorch-compatible adjustment for ceil_mode
+        # PyTorch-compatible adjustment for ceil_mode: ensure that the last
+        # pooling window starts inside the image.
         if (output_size - 1) * stride >= in_size + padding:
             output_size -= 1
     else:
@@ -61,6 +109,11 @@ def quantized_max_pool2d_kernel(
     in_stride_c,
     in_stride_h,
     in_stride_w,
+    # Output tensor strides
+    out_stride_n,
+    out_stride_c,
+    out_stride_h,
+    out_stride_w,
     # Input/Output shapes
     in_c,
     in_h,
@@ -80,6 +133,27 @@ def quantized_max_pool2d_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
+    """Forward kernel for quantized 2-D max pooling.
+
+    The kernel operates directly on the integer representation (``int_repr``) of
+    a per-tensor quantized tensor -- ``uint8`` for ``quint8``, ``int8`` for
+    ``qint8``, ``int32`` for ``qint32``. Because the quantization mapping
+    ``real = (q - zero_point) * scale`` is monotonically increasing in ``q`` for
+    a positive ``scale``, taking the max over the quantized integers is
+    equivalent to taking the max over the real values. The identity of the max
+    is what is stored, so no requantization is needed and the result is exact
+    for every one of the three dtypes.
+
+    Positions that fall outside the image are filled with the minimum of the
+    *underlying integer* dtype, which is the same sentinel ATen's
+    ``spatial_dilated_max_pooling`` uses
+    (``std::numeric_limits<T::underlying>::lowest()``).
+
+    Both sides are addressed through explicit strides, so a non-contiguous
+    input needs no repacking and a channels-last output can be written in place.
+
+    Grid: (N * C, cdiv(out_h, BLOCK_H) * cdiv(out_w, BLOCK_W))
+    """
     pid_nc = tl.program_id(0)
     pid_hw = tl.program_id(1)
     num_w_blocks = tl.cdiv(out_w, BLOCK_W)
@@ -106,50 +180,96 @@ def quantized_max_pool2d_kernel(
             current_val = tl.load(
                 input_base_ptr + input_offset, mask=in_mask, other=min_val
             )
-            is_new_max = current_val > max_val_acc
-            max_val_acc = tl.where(is_new_max, current_val, max_val_acc)
+            max_val_acc = tl.maximum(max_val_acc, current_val)
 
-    out_base_ptr = output_ptr + pid_nc * out_h * out_w
-    out_h_offsets = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
-    out_w_offsets = w_block_idx * BLOCK_W + tl.arange(0, BLOCK_W)
+    out_base_ptr = output_ptr + n_idx * out_stride_n + c_idx * out_stride_c
     output_block_ptr = (
-        out_base_ptr + out_h_offsets[:, None] * out_w + out_w_offsets[None, :]
+        out_base_ptr
+        + h_out_offsets[:, None] * out_stride_h
+        + w_out_offsets[None, :] * out_stride_w
     )
 
-    out_mask = (out_h_offsets[:, None] < out_h) & (out_w_offsets[None, :] < out_w)
+    out_mask = (h_out_offsets[:, None] < out_h) & (w_out_offsets[None, :] < out_w)
     tl.store(output_block_ptr, max_val_acc, mask=out_mask)
 
 
-def _parse_pool_params(kernel_size, stride, padding, dilation):
-    def _parse_param(param, name, default=None):
-        if param is None:
-            return default
+def _check_maxpool2d_params(kernel_size, stride, padding, dilation):
+    """Mirror ATen's ``check_maxpool2d_params`` argument-shape validation.
+
+    Returns the parameters expanded to 2-tuples. ``stride`` may be an empty
+    sequence, in which case ``None`` is returned for it so the caller can
+    substitute ``kernel_size`` (what ATen does right after this check).
+
+    ATen accepts 1- *or* 2-element lists for kernel_size/padding/dilation, but
+    then indexes ``[0]`` and ``[1]`` unconditionally, so a 1-element list reads
+    past the end of the array. We reject that instead of reproducing the
+    out-of-bounds read; a bare Python int reaches the ``int[2]`` schema slot
+    broadcast to both dims, which is the well-defined way to say "same value".
+    """
+
+    def _length_checked(param, name, message):
         if isinstance(param, int):
+            # A bare int reaches the ATen schema as ``int[2]``, i.e. broadcast.
             return param, param
         if isinstance(param, (list, tuple)):
-            if len(param) == 0:
-                return default
-            if len(param) == 2:
-                return param
-        raise ValueError(f"Invalid {name}: {param}")
+            if len(param) != 2:
+                raise RuntimeError(f"{message}{len(param)}")
+            return tuple(int(p) for p in param)
+        raise RuntimeError(f"Invalid {name}: {param}")
 
-    kernel_h, kernel_w = _parse_param(kernel_size, "kernel_size")
-    stride_h, stride_w = _parse_param(stride, "stride", default=(kernel_h, kernel_w))
-    padding_h, padding_w = _parse_param(padding, "padding", default=(0, 0))
-    dilation_h, dilation_w = _parse_param(dilation, "dilation", default=(1, 1))
+    kernel = _length_checked(
+        kernel_size, "kernel_size", "Expected 1d or 2d kernel size, got "
+    )
 
+    if isinstance(stride, (list, tuple)) and len(stride) == 0:
+        strides = None
+    elif stride is None:
+        # The schema default is ``int[2] stride=[]``; ``None`` from a Python
+        # caller means the same thing as an omitted argument.
+        strides = None
+    else:
+        # Note the missing space after "got": ATen's message really does read
+        # "Expected no strides or 2d strides, got3".
+        strides = _length_checked(
+            stride, "stride", "Expected no strides or 2d strides, got"
+        )
+
+    pads = _length_checked(padding, "padding", "Expected 1d or 2d padding, got ")
+    dilations = _length_checked(
+        dilation, "dilation", "Expected 1d or 2d dilation, got "
+    )
+
+    if any(d < 1 for d in dilations):
+        raise RuntimeError("Expected dilation >= 1")
+
+    return kernel, strides, pads, dilations
+
+
+def _parse_pool_params(kernel_size, stride, padding, dilation):
+    """Parse and validate 2-D pooling parameters the way ATen does.
+
+    Each parameter can be an int (applied to both spatial dims) or a 2-element
+    tuple/list (H, W). An empty or omitted ``stride`` falls back to
+    ``kernel_size``, matching the ``int[2] stride=[]`` schema default of
+    ``aten::quantized_max_pool2d``.
+    """
+    kernel, strides, pads, dilations = _check_maxpool2d_params(
+        kernel_size, stride, padding, dilation
+    )
+    if strides is None:
+        strides = kernel
+
+    kernel_h, kernel_w = kernel
+    stride_h, stride_w = strides
+    padding_h, padding_w = pads
+    dilation_h, dilation_w = dilations
+
+    # ATen validates kernel/stride positivity inside ``q_maxpool_2d``, in this
+    # order, before it looks at the input tensor at all.
+    if kernel_h <= 0 or kernel_w <= 0:
+        raise RuntimeError("kernel_size should be greater than zero.")
     if stride_h <= 0 or stride_w <= 0:
-        raise ValueError(
-            f"stride must be positive, but got stride=({stride_h}, {stride_w})"
-        )
-    if padding_h < 0 or padding_w < 0:
-        raise ValueError(
-            f"padding must be non-negative, but got padding=({padding_h}, {padding_w})"
-        )
-    if dilation_h <= 0 or dilation_w <= 0:
-        raise ValueError(
-            f"dilation must be positive, but got dilation=({dilation_h}, {dilation_w})"
-        )
+        raise RuntimeError("strides should be greater than zero.")
 
     return (
         kernel_h,
@@ -163,30 +283,47 @@ def _parse_pool_params(kernel_size, stride, padding, dilation):
     )
 
 
-def quantized_max_pool2d(
-    input: torch.Tensor,
-    kernel_size,
-    stride=[],
-    padding=0,
-    dilation=1,
-    ceil_mode=False,
-):
-    logger.debug("GEMS QUANTIZED_MAX_POOL2D")
+# Backwards-compatible alias: the benchmark and earlier revisions of this file
+# import ``_parse_pool_params`` under this name.
+_parse_param_pairs = _parse_pool_params
 
-    # Materialize the integer representation of the quantized tensor. Pooling is
-    # performed directly on the quantized integer values (max commutes with the
-    # affine dequantization map since the scale is positive), so the result is
-    # the max of the integer values. The output keeps the same scale/zero_point.
-    in_device = input.device
-    scale = float(input.q_scale())
-    zero_point = int(input.q_zero_point())
 
-    # Run the pooling kernel on the accelerator device. The quantized tensor's
-    # int_repr carries the raw uint8/int8 storage that the kernel operates on.
-    gem_device = runtime.device.name
-    int_repr = input.int_repr().contiguous().to(gem_device)
+def _check_quantized_input(input):
+    """Reject inputs ATen's ``quantized_max_pool2d`` cannot accept.
 
-    params = _parse_pool_params(kernel_size, stride, padding, dilation)
+    ATen runs this *after* the parameter and shape checks: it only touches the
+    quantizer when it reaches ``qx.q_scale()``, so a per-channel input with a
+    bad kernel size reports the kernel size, not the qscheme. Keep the same
+    order by calling this last.
+    """
+    if not input.is_quantized:
+        raise RuntimeError(
+            "quantized_max_pool2d expects a quantized tensor "
+            "(torch.quint8, torch.qint8 or torch.qint32)"
+        )
+    if input.qscheme() != torch.per_tensor_affine:
+        # ATen's TORCH_CHECK inside the quantizer, verbatim (the trailing
+        # boilerplate about improving the message is appended by TORCH_CHECK
+        # itself and is not reproduced here).
+        raise RuntimeError(
+            "Expected quantizer->qscheme() == kPerTensorAffine to be true, "
+            "but got false."
+        )
+    if input.dtype not in _QINT_DTYPES:
+        raise RuntimeError(
+            f"quantized_max_pool2d not implemented for '{input.dtype}'; "
+            "expected one of torch.quint8, torch.qint8, torch.qint32"
+        )
+
+
+def _quantized_max_pool2d_output_shape(input, params, ceil_mode):
+    """Validate the input against ``params`` and return the output shape.
+
+    Reproduces the remaining checks of ATen's ``q_maxpool_2d``, in order: rank
+    (3 or 4), non-zero C/H/W, padding vs. half the kernel, and finally a
+    positive output size. A 3-D input is the native (C, H, W) form -- ATen
+    treats it as a single batch.
+    """
     (
         kernel_h,
         kernel_w,
@@ -198,21 +335,78 @@ def quantized_max_pool2d(
         dilation_w,
     ) = params
 
-    in_n, in_c, in_h, in_w = int_repr.shape
+    ndim = input.dim()
+    if ndim not in (3, 4):
+        raise RuntimeError("Expecting the input tensor of rank 3 or 4.")
+
+    in_n = input.shape[0] if ndim == 4 else 1
+    in_c, in_h, in_w = input.shape[-3:]
+    # ATen only requires C/H/W to be non-zero; an empty batch is legal.
+    if in_c <= 0 or in_h <= 0 or in_w <= 0:
+        raise RuntimeError("input dimensions must be non-zero.")
+    if kernel_h // 2 < padding_h or kernel_w // 2 < padding_w:
+        raise RuntimeError("padding should be smaller than half of kernel_size.")
+
     out_h = max_pool2d_output_size(
         in_h, kernel_h, stride_h, padding_h, dilation_h, ceil_mode
     )
     out_w = max_pool2d_output_size(
         in_w, kernel_w, stride_w, padding_w, dilation_w, ceil_mode
     )
+    if out_h <= 0 or out_w <= 0:
+        raise RuntimeError(
+            f"Given input size: ({in_c}x{in_h}x{in_w}). "
+            f"Calculated output size: ({in_c}x{out_h}x{out_w}). "
+            "Output size is too small."
+        )
 
-    out_int = torch.empty(
-        (in_n, in_c, out_h, out_w), device=int_repr.device, dtype=int_repr.dtype
+    if ndim == 3:
+        return (in_c, out_h, out_w)
+    return (in_n, in_c, out_h, out_w)
+
+
+def _int_view(qtensor):
+    """Alias a quantized tensor's storage as a writable integer tensor.
+
+    ``int_repr()`` returns a *copy*, so it cannot be used as a kernel
+    destination, and for a strided input it would materialise a compacted copy.
+    Aliasing the storage with the tensor's own sizes and strides gives a view
+    the kernel can read from or store into, whatever layout it has.
+    """
+    return torch.empty(
+        0, dtype=_QINT_DTYPES[qtensor.dtype], device=qtensor.device
+    ).set_(
+        qtensor.untyped_storage(),
+        qtensor.storage_offset(),
+        tuple(qtensor.shape),
+        qtensor.stride(),
     )
 
-    if out_int.numel() == 0:
-        out_int = out_int.to(in_device)
-        return torch._make_per_tensor_quantized_tensor(out_int, scale, zero_point)
+
+def _as_4d(int_tensor):
+    """View a 3-D (C, H, W) integer tensor as (1, C, H, W)."""
+    if int_tensor.dim() == 3:
+        return int_tensor.unsqueeze(0)
+    return int_tensor
+
+
+def _launch_quantized_max_pool2d(input_int, out_int, params):
+    """Run the pooling kernel over an integer view of the input."""
+    (
+        kernel_h,
+        kernel_w,
+        stride_h,
+        stride_w,
+        padding_h,
+        padding_w,
+        dilation_h,
+        dilation_w,
+    ) = params
+
+    input_int = _as_4d(input_int)
+    out_int = _as_4d(out_int)
+    in_n, in_c, in_h, in_w = input_int.shape
+    _, _, out_h, out_w = out_int.shape
 
     grid = lambda meta: (
         in_n * in_c,
@@ -220,12 +414,10 @@ def quantized_max_pool2d(
     )
 
     quantized_max_pool2d_kernel[grid](
-        int_repr,
+        input_int,
         out_int,
-        int_repr.stride(0),
-        int_repr.stride(1),
-        int_repr.stride(2),
-        int_repr.stride(3),
+        *input_int.stride(),
+        *out_int.stride(),
         in_c,
         in_h,
         in_w,
@@ -240,35 +432,193 @@ def quantized_max_pool2d(
         dilation_h,
         dilation_w,
     )
+    return out_int
 
-    out_int = out_int.to(in_device)
-    return torch._make_per_tensor_quantized_tensor(out_int, scale, zero_point)
+
+def quantized_max_pool2d(
+    input: torch.Tensor,
+    kernel_size,
+    stride=(),
+    padding=0,
+    dilation=1,
+    ceil_mode=False,
+):
+    """Apply 2-D max pooling to a per-tensor quantized tensor.
+
+    Accepts both native input forms -- 4-D (N, C, H, W) and 3-D (C, H, W) --
+    and the three dtypes the native operator dispatches over:
+    ``torch.quint8``, ``torch.qint8`` and ``torch.qint32``. Pooling is
+    performed directly over the quantized integer representation, which (for a
+    positive scale) yields the same result as pooling over the dequantized
+    values while keeping the input's ``scale``/``zero_point`` on the output.
+
+    An omitted or empty ``stride`` falls back to ``kernel_size``, matching the
+    ``int[2] stride=[]`` schema default of ``aten::quantized_max_pool2d``.
+    """
+    logger.debug("GEMS QUANTIZED_MAX_POOL2D")
+
+    params = _parse_pool_params(kernel_size, stride, padding, dilation)
+    out_shape = _quantized_max_pool2d_output_shape(input, params, ceil_mode)
+    _check_quantized_input(input)
+
+    scale = float(input.q_scale())
+    zero_point = int(input.q_zero_point())
+
+    # ATen has a dedicated channels-last path that keeps a channels_last input
+    # in that layout; every other layout (and every 3-D input) yields an
+    # NCHW-contiguous result.
+    memory_format = (
+        torch.channels_last
+        if input.dim() == 4
+        and input.is_contiguous(memory_format=torch.channels_last)
+        and not input.is_contiguous()
+        else torch.contiguous_format
+    )
+    # Allocate the quantized result directly: ``_empty_affine_quantized``
+    # honours ``memory_format``, whereas wrapping a strided integer tensor with
+    # ``_make_per_tensor_quantized_tensor`` silently normalises its strides on
+    # CUDA and would drop the channels-last layout.
+    out = torch._empty_affine_quantized(
+        out_shape,
+        scale=scale,
+        zero_point=zero_point,
+        dtype=input.dtype,
+        device=input.device,
+        memory_format=memory_format,
+    )
+
+    if out.numel() != 0:
+        _launch_quantized_max_pool2d(_int_view(input), _int_view(out), params)
+
+    return out
+
+
+def _contiguous_strides(shape):
+    strides = []
+    acc = 1
+    for size in reversed(shape):
+        strides.append(acc)
+        acc *= size
+    return tuple(reversed(strides)), acc
+
+
+def _resize_quantized_out(out, shape):
+    """Resize a quantized ``out`` tensor to ``shape``, ATen-style.
+
+    ``aten::resize_`` and ``aten::set_.source_Tensor`` are both unimplemented
+    for the QuantizedCUDA backend, so the metadata is rewritten through
+    ``set_(storage, offset, size, stride)``, which is registered. This
+    reproduces what ``at::native::resize_output`` does for a strided tensor:
+    the storage offset is preserved, the storage only ever grows, and the
+    resized tensor is given contiguous strides.
+    """
+    strides, numel = _contiguous_strides(tuple(shape))
+
+    storage = out.untyped_storage()
+    offset = out.storage_offset()
+    needed = (offset + numel) * out.element_size()
+    if numel != 0 and storage.size() < needed:
+        storage.resize_(needed)
+    out.set_(storage, offset, tuple(shape), strides)
+    return out
+
+
+def _aliases(input, out):
+    """True when ``out`` may share storage with ``input``."""
+    return out.untyped_storage().data_ptr() == input.untyped_storage().data_ptr()
+
+
+def _same_quantizer(input, out):
+    """True when ``out`` already carries the input's per-tensor quantizer.
+
+    A kernel write moves integers only, so it cannot re-point ``out``'s
+    quantizer the way ``copy_`` does; pooling in place is only equivalent when
+    ``out`` is per-tensor affine with the input's ``scale`` and ``zero_point``.
+    """
+    return (
+        out.qscheme() == torch.per_tensor_affine
+        and out.q_scale() == input.q_scale()
+        and out.q_zero_point() == input.q_zero_point()
+    )
 
 
 def quantized_max_pool2d_out(
     input: torch.Tensor,
     kernel_size,
-    stride=[],
+    stride=(),
     padding=0,
     dilation=1,
     ceil_mode=False,
     *,
     out: torch.Tensor,
 ):
-    logger.debug("GEMS QUANTIZED_MAX_POOL2D OUT")
-    result = quantized_max_pool2d(
-        input,
-        kernel_size,
-        stride=stride,
-        padding=padding,
-        dilation=dilation,
-        ceil_mode=ceil_mode,
-    )
-    # The out variant writes the result into the provided quantized tensor.
-    # ``int_repr()`` returns a *copy* of the integer storage, not a view, so
-    # ``out.int_repr().copy_(...)`` does not propagate back into ``out``. Use
-    # ``out.copy_(result)`` instead, which mirrors the quantize_per_channel_out
-    # / quantize_per_tensor_dynamic_out precedent and copies the integer
-    # storage together with the scale/zero_point.
+    """``out`` variant of :func:`quantized_max_pool2d`.
+
+    Follows the contract of the autogenerated ``quantized_max_pool2d.out``
+    kernel, which is written in terms of the functional one:
+
+    .. code-block:: cpp
+
+        auto tmp_output = at::quantized_max_pool2d(self, ...);
+        resize_out_helper(out, tmp_output);   // resize_output(out, tmp.sizes())
+        copy_arg(out, tmp_output);            // dtype check, device check, copy_
+
+    So the result is computed *first* (which is also what makes an ``out`` that
+    aliases the input safe), then ``out`` is resized to the result's shape, then
+    its dtype and device are checked, and finally ``copy_`` writes the values
+    through ``out``'s own strides and carries over the input's ``scale`` /
+    ``zero_point``. A mismatched-dtype ``out`` is therefore still resized before
+    the error surfaces, exactly as in ATen.
+    """
+    logger.debug("GEMS QUANTIZED_MAX_POOL2D_OUT")
+
+    # The functional result's shape, dtype and device are all known without
+    # running the kernel, so the resize and the two checks happen in ATen's
+    # order either way; computing first is only *required* when ``out`` aliases
+    # the input, where the resize would otherwise reshape the input out from
+    # under the pooling.
+    params = _parse_pool_params(kernel_size, stride, padding, dilation)
+    out_shape = _quantized_max_pool2d_output_shape(input, params, ceil_mode)
+    _check_quantized_input(input)
+
+    result = None
+    if _aliases(input, out):
+        result = quantized_max_pool2d(
+            input, kernel_size, stride, padding, dilation, ceil_mode
+        )
+
+    if tuple(out.shape) != tuple(out_shape):
+        _resize_quantized_out(out, out_shape)
+
+    if out.dtype != input.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {_aten_dtype_name(input.dtype)}, "
+            f"but got {_aten_dtype_name(out.dtype)} instead"
+        )
+    if out.device != input.device:
+        raise RuntimeError(
+            f"Expected out tensor to have device {input.device}, "
+            f"but got {out.device} instead"
+        )
+
+    if result is None and _same_quantizer(input, out):
+        # ``out`` already carries the input's quantizer and cannot overlap it, so
+        # writing the pooled integers straight into its storage is
+        # indistinguishable from ``out.copy_(functional_result)`` -- without the
+        # extra allocation and copy.
+        if out.numel() != 0:
+            _launch_quantized_max_pool2d(_int_view(input), _int_view(out), params)
+        return out
+
+    if result is None:
+        result = quantized_max_pool2d(
+            input, kernel_size, stride, padding, dilation, ceil_mode
+        )
+
+    # ``Tensor.copy_`` between two per-tensor quantized tensors moves both the
+    # integers and the quantizer, honours ``out``'s strides and storage offset
+    # (so a strided or offset ``out`` never disturbs its neighbours), and raises
+    # "Quantized Copy only works with same qscheme" for a per-channel ``out`` --
+    # the message ATen surfaces as well.
     out.copy_(result)
     return out

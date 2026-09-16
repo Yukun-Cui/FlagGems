@@ -24,11 +24,13 @@ from flag_gems.ops.quantized_max_pool2d import (
 
 from . import base, consts
 
-# quantized_max_pool2d consumes per-tensor quantized tensors (torch.quint8 /
-# torch.qint8). The native quantized pooling kernel only runs on CPU in this
-# build, so the input is kept on CPU; the FlagGems kernel moves the integer
-# representation onto the accelerator and returns a CPU quantized tensor.
-QUANT_DTYPES = [torch.quint8, torch.qint8]
+# ``aten::quantized_max_pool2d`` dispatches over the three per-tensor quantized
+# integer dtypes. The accelerator baseline it is measured against is
+# ``quantized_max_pool2d_cudnn``, which only accepts qint8 -- for quint8 and
+# qint32 the native op raises, so there is no same-device latency_base to
+# compare against and the benchmark would fail before reaching the kernel.
+# Benchmark the dtype both sides implement.
+QUANT_DTYPES = [torch.qint8]
 
 # Spatial shapes exercised by the quantized pooling benchmark, spanning the
 # typical ResNet stage outputs from the input image down to the final layer.
@@ -44,16 +46,17 @@ POOL_SHAPES = [
 def _pool_configs(shape, dtype, comprehensive):
     """Yield (kernel_size, stride, padding, dilation, ceil_mode) pooling configs.
 
-    Mirrors the representative pooling configurations used by the forward
-    benchmark: a default 3x3 stride-2 pool, plus extra kernel/stride/padding
-    and dilation/ceil_mode variants under the comprehensive bench level.
+    A default 3x3 stride-2 pool, plus extra kernel/stride/padding and ceil_mode
+    variants under the comprehensive bench level. Dilation is deliberately left
+    at 1: the accelerator baseline is cuDNN-backed and rejects any dilation
+    other than [1, 1], so a dilated config has no reference to time against.
     """
     yield 3, 2, 1, 1, False
 
     if comprehensive:
         if shape[-2] > 5 and shape[-1] > 5:
             yield (3, 5), (2, 1), (1, 2), 1, False
-        yield 3, 1, 1, 2, False
+        yield 2, 2, 0, 1, False
         yield 3, 2, 1, 1, True
 
 
@@ -66,18 +69,27 @@ class QuantizedMaxPool2dBenchmark(base.GenericBenchmark):
             )
 
 
-def quantized_max_pool2d_input_fn(shape, dtype, device, comprehensive=True):
+_SCALE = 0.1
+
+
+def _quantized_input(shape, dtype, device):
+    """Build a per-tensor quantized input on ``device``.
+
+    The tensor has to live on the accelerator: the FlagGems kernel is registered
+    on the quantized-accelerator dispatch key, so a CPU input would be handled
+    by the native CPU kernel and the benchmark would time that instead.
+    """
     if dtype == torch.quint8:
-        data = torch.rand(shape) * 255.0
+        data = torch.rand(shape, device=device) * 255.0
         zero_point = 128
     else:
-        data = torch.randint(-128, 128, shape).float()
+        data = torch.randint(-128, 128, shape, device=device).float()
         zero_point = 0
-    scale = 0.1
-    # Quantized tensors are kept on CPU because the native quantized pooling
-    # kernel is CPU-only in this build; the FlagGems implementation handles the
-    # accelerator round-trip internally.
-    inp = torch.quantize_per_tensor(data, scale, zero_point, dtype)
+    return torch.quantize_per_tensor(data, _SCALE, zero_point, dtype), zero_point
+
+
+def quantized_max_pool2d_input_fn(shape, dtype, device, comprehensive=True):
+    inp, _ = _quantized_input(shape, dtype, device)
 
     for kernel_size, stride, padding, dilation, ceil_mode in _pool_configs(
         shape, dtype, comprehensive
@@ -109,14 +121,7 @@ class QuantizedMaxPool2dOutBenchmark(base.GenericBenchmark):
 
 
 def quantized_max_pool2d_out_input_fn(shape, dtype, device, comprehensive=True):
-    if dtype == torch.quint8:
-        data = torch.rand(shape) * 255.0
-        zero_point = 128
-    else:
-        data = torch.randint(-128, 128, shape).float()
-        zero_point = 0
-    scale = 0.1
-    inp = torch.quantize_per_tensor(data, scale, zero_point, dtype)
+    inp, zero_point = _quantized_input(shape, dtype, device)
 
     for kernel_size, stride, padding, dilation, ceil_mode in _pool_configs(
         shape, dtype, comprehensive
@@ -138,11 +143,15 @@ def quantized_max_pool2d_out_input_fn(shape, dtype, device, comprehensive=True):
         out_w = max_pool2d_output_size(
             in_w, kernel_w, stride_w, padding_w, dilation_w, ceil_mode
         )
-        # Pre-allocate the quantized ``out`` tensor with the correct output
-        # shape and the input's scale/zero_point via the public API. The
-        # FlagGems out kernel overwrites its integer storage.
-        out_tensor = torch.quantize_per_tensor(
-            torch.zeros((*shape[:2], out_h, out_w)), scale, zero_point, dtype
+        # Pre-allocate the quantized ``out`` tensor on the same device, with the
+        # correct output shape and the input's scale/zero_point, so the timed
+        # call neither resizes nor reallocates it.
+        out_tensor = torch._empty_affine_quantized(
+            (*shape[:2], out_h, out_w),
+            scale=_SCALE,
+            zero_point=zero_point,
+            dtype=dtype,
+            device=device,
         )
         yield inp, {
             "kernel_size": kernel_size,

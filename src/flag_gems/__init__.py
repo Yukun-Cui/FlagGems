@@ -67,7 +67,6 @@ SpecOpRegistrar(registry=globals(), vendor=vendor_name).apply()
 registrar = GeneralOpRegistrar
 current_work_registrar = None
 AUTOGRAD_DISPATCH_KEY = torch._C.DispatchKey.Autograd.name
-COMPOSITE_IMPLICIT_DISPATCH_KEY = torch._C.DispatchKey.CompositeImplicitAutograd.name
 CONJUGATE_DISPATCH_KEY = torch._C.DispatchKey.Conjugate.name
 QUANTIZED_CUDA_DISPATCH_KEY = torch._C.DispatchKey.QuantizedCUDA.name
 SPARSE_CSR_DISPATCH_KEY = "SparseCsr" + backend_info.dispatch_key
@@ -1169,13 +1168,13 @@ _FULL_CONFIG = (
         "quantized_max_pool2d",
         quantized_max_pool2d,
         None,
-        (COMPOSITE_IMPLICIT_DISPATCH_KEY,),
+        (QUANTIZED_CUDA_DISPATCH_KEY,),
     ),
     (
         "quantized_max_pool2d.out",
         quantized_max_pool2d_out,
         None,
-        (COMPOSITE_IMPLICIT_DISPATCH_KEY,),
+        (QUANTIZED_CUDA_DISPATCH_KEY,),
     ),
     (
         "quantized_max_pool3d",
