@@ -27,20 +27,34 @@ logger = logging.getLogger(__name__)
 # Fixed inner block size for the mat-vec reduction loops (compile-time literal).
 _CHUNK = 64
 
+# uint8 activation range used by the FBGEMM dynamic-quantization path.
+_ACT_QMIN = tl.constexpr(0.0)
+_ACT_QMAX = tl.constexpr(255.0)
+
+# FBGEMM's SMALL_SCALE_THRESHOLD. It is a `float` constant in quant_utils.h, so
+# C++ `double scale = SMALL_SCALE_THRESHOLD` stores the fp32 value widened to
+# double rather than the double literal 6.1e-5. That single bit decides whether
+# the zero point of a perfectly symmetric range lands on 128 or 127.
+_SMALL_SCALE_THRESHOLD_F32 = float(torch.tensor(6.1e-5, dtype=torch.float32).item())
+
 
 @libentry()
 @triton.jit
 def quantized_gru_cell_kernel(
-    input_ptr,  # (batch, input_size)
-    hx_ptr,  # (batch, hidden_size)
+    input_ptr,  # (batch, input_size) fp
+    hx_ptr,  # (batch, hidden_size) fp
     w_ih_ptr,  # (3*hidden_size, input_size) int8
     w_hh_ptr,  # (3*hidden_size, hidden_size) int8
-    b_ih_ptr,  # (3*hidden_size,) or None
-    b_hh_ptr,  # (3*hidden_size,) or None
+    b_ih_ptr,  # (3*hidden_size,) fp
+    b_hh_ptr,  # (3*hidden_size,) fp
     hy_ptr,  # (batch, hidden_size) output
-    scale_ih,
-    scale_hh,
-    zero_point_ih,
+    inv_act_scale_ih_ptr,  # 0-dim fp32: 1.0f / act_scale_ih
+    inv_act_scale_hh_ptr,
+    act_zp_ih_ptr,  # 0-dim int32: uint8 activation zero point
+    act_zp_hh_ptr,
+    mult_ih_ptr,  # 0-dim fp32: act_scale_ih * scale_ih
+    mult_hh_ptr,
+    zero_point_ih,  # int8 weight zero point (int)
     zero_point_hh,
     input_size,
     hidden_size,
@@ -53,19 +67,36 @@ def quantized_gru_cell_kernel(
 
     Grid: (batch_size,) -- one program per batch element.
 
-    The aten op is a CompositeImplicitAutograd op that decomposes into two
-    ``fbgemm_linear_int8_weight_fp32_activation`` calls plus the standard GRU
-    gate combination.  Equivalently (verified against the aten op)::
+    ``aten::quantized_gru_cell`` is a CompositeImplicitAutograd op that
+    decomposes into two ``fbgemm_linear_int8_weight_fp32_activation`` calls
+    plus the standard GRU gate combination.  The FBGEMM linear does *dynamic
+    per-tensor uint8 quantization of its fp32 activation* before the int8
+    GEMM -- it is not a plain float matmul against dequantized weights.  Per
+    linear::
 
-        gi = scale_ih * (x @ w_ih_q.T - zp_ih * sum(x)) + b_ih   # (batch, 3H)
-        gh = scale_hh * (hx @ w_hh_q.T - zp_hh * sum(hx)) + b_hh  # (batch, 3H)
-        r = sigmoid(gi_r + gh_r); z = sigmoid(gi_z + gh_z)
-        n = tanh(gi_n + r * gh_n); h = (1 - z) * n + z * hx
+        act_scale, act_zp = ChooseQuantizationParams(activation)   # per tensor
+        qa   = clamp(nearbyint(fmaf(a, 1f/act_scale, act_zp)), 0, 255)
+        acc  = (qa - act_zp) @ (w_q - w_zp).T                      # int32
+        out  = acc * (act_scale * w_scale) + bias                  # fp32
 
-    The ``- zp * sum(x)`` term is the per-batch correction induced by the
-    quantized-weight zero point.  ``col_offsets`` and the FBGEMM ``packed``
-    weights that the aten op also receives are redundant here (col_offsets
-    equal ``rowsum(w_q) - zp * N``), so they are not used by this kernel.
+    Both the activation quantization and the int32 accumulation are
+    load-bearing: skipping them and multiplying the raw fp32 activation by
+    dequantized weights drifts from the aten op by up to ~0.9 absolute (see
+    the tests), because the uint8 activation carries only ~8 bits.
+
+    The gate combination then follows ``aten``'s ``GRUCell`` expression order
+    exactly (``RNN.cpp``)::
+
+        r = sigmoid(gi_r + gh_r)
+        z = sigmoid(gi_z + gh_z)
+        n = tanh(gi_n + gh_n * r)
+        hy = (hx - n) * z + n
+
+    ``col_offsets`` and the FBGEMM ``packed`` weights that the aten op also
+    receives are redundant here: ``col_offsets == rowsum(w_q) - w_zp * K``,
+    which the centred ``(qa - act_zp) @ (w_q - w_zp)`` form already accounts
+    for (verified bit-identical), and ``packed`` is just a re-tiling of
+    ``w_q``.
     """
     batch_idx = tl.program_id(0)
 
@@ -73,44 +104,70 @@ def quantized_gru_cell_kernel(
     h_mask = h_offs < hidden_size
     H = hidden_size
 
+    # Activation qparams are read from device memory: computing them on the
+    # host would need a sync that costs orders of magnitude more than the
+    # kernel itself.
+    inv_act_scale_ih = tl.load(inv_act_scale_ih_ptr)
+    inv_act_scale_hh = tl.load(inv_act_scale_hh_ptr)
+    mult_ih = tl.load(mult_ih_ptr)
+    mult_hh = tl.load(mult_hh_ptr)
+    zp_ih_i = tl.load(act_zp_ih_ptr)
+    zp_hh_i = tl.load(act_zp_hh_ptr)
+    zp_ih_f = zp_ih_i.to(tl.float32)
+    zp_hh_f = zp_hh_i.to(tl.float32)
+    # ``tl.full`` rather than ``.to()``: Triton specializes an integer argument
+    # whose value is 0 or 1 into a Python ``int`` constexpr, which has no
+    # ``.to`` method. A zero weight zero_point is a perfectly normal input.
+    w_zp_ih_i = tl.full([1], zero_point_ih, tl.int32)
+    w_zp_hh_i = tl.full([1], zero_point_hh, tl.int32)
+
     # ------------------------------------------------------------------
     # Input-side quantized linear -> reset / update / new gate pre-activations.
+    #
+    # Accumulate in int32, exactly like FBGEMM: for input_size 4096 the
+    # accumulator reaches ~2.7e8, past fp32's 2**24 exact-integer range, so
+    # an fp32 accumulator would silently lose low bits.
     # ------------------------------------------------------------------
     x_base = input_ptr + batch_idx * input_size
-    x_sum = tl.zeros([1], dtype=tl.float32)
-    gi_r_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-    gi_z_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-    gi_n_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    gi_r_acc = tl.zeros([BLOCK_H], dtype=tl.int32)
+    gi_z_acc = tl.zeros([BLOCK_H], dtype=tl.int32)
+    gi_n_acc = tl.zeros([BLOCK_H], dtype=tl.int32)
     for k_start in range(0, input_size, CHUNK):
         k_offs = k_start + tl.arange(0, CHUNK)
         k_mask = k_offs < input_size
         x_tile = tl.load(x_base + k_offs, mask=k_mask, other=0.0).to(tl.float32)
-        x_sum += tl.sum(x_tile, axis=0)
+        # Dynamic uint8 quantization. A single-rounding fma is required: the
+        # two-step ``rint(x * inv) + zp`` disagrees with FBGEMM on ~5% of
+        # values whose scaled magnitude lands on an exact half-way point.
+        # Masked-out lanes load 0.0 and quantize to exactly ``zp``, so the
+        # centred value below is 0 and contributes nothing.
+        qx = tl_extra_shim.rint(tl_extra_shim.fma(x_tile, inv_act_scale_ih, zp_ih_f))
+        qx = tl.minimum(tl.maximum(qx, _ACT_QMIN), _ACT_QMAX)
+        xc = qx.to(tl.int32) - zp_ih_i  # (CHUNK,) int32, centred activation
 
         # w_ih row slices for r/z/n: rows [0,H), [H,2H), [2H,3H).
         w_r = tl.load(
             w_ih_ptr + (h_offs[:, None]) * input_size + k_offs[None, :],
             mask=h_mask[:, None] & k_mask[None, :],
             other=0,
-        ).to(tl.float32)
+        ).to(tl.int32)
         w_z = tl.load(
             w_ih_ptr + (H + h_offs[:, None]) * input_size + k_offs[None, :],
             mask=h_mask[:, None] & k_mask[None, :],
             other=0,
-        ).to(tl.float32)
+        ).to(tl.int32)
         w_n = tl.load(
             w_ih_ptr + (2 * H + h_offs[:, None]) * input_size + k_offs[None, :],
             mask=h_mask[:, None] & k_mask[None, :],
             other=0,
-        ).to(tl.float32)
-        gi_r_acc += tl.sum(w_r * x_tile[None, :], axis=1)
-        gi_z_acc += tl.sum(w_z * x_tile[None, :], axis=1)
-        gi_n_acc += tl.sum(w_n * x_tile[None, :], axis=1)
+        ).to(tl.int32)
+        gi_r_acc += tl.sum((w_r - w_zp_ih_i) * xc[None, :], axis=1)
+        gi_z_acc += tl.sum((w_z - w_zp_ih_i) * xc[None, :], axis=1)
+        gi_n_acc += tl.sum((w_n - w_zp_ih_i) * xc[None, :], axis=1)
 
-    corr_ih = scale_ih * zero_point_ih * x_sum
-    gi_r = scale_ih * gi_r_acc - corr_ih
-    gi_z = scale_ih * gi_z_acc - corr_ih
-    gi_n = scale_ih * gi_n_acc - corr_ih
+    gi_r = gi_r_acc.to(tl.float32) * mult_ih
+    gi_z = gi_z_acc.to(tl.float32) * mult_ih
+    gi_n = gi_n_acc.to(tl.float32) * mult_ih
     if HAS_BIAS_IH:
         b_ih_r = tl.load(b_ih_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
         b_ih_z = tl.load(b_ih_ptr + H + h_offs, mask=h_mask, other=0.0).to(tl.float32)
@@ -125,39 +182,39 @@ def quantized_gru_cell_kernel(
     # Hidden-side quantized linear -> reset / update / new gate pre-activations.
     # ------------------------------------------------------------------
     hx_base = hx_ptr + batch_idx * hidden_size
-    hx_sum = tl.zeros([1], dtype=tl.float32)
-    gh_r_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-    gh_z_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-    gh_n_acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    gh_r_acc = tl.zeros([BLOCK_H], dtype=tl.int32)
+    gh_z_acc = tl.zeros([BLOCK_H], dtype=tl.int32)
+    gh_n_acc = tl.zeros([BLOCK_H], dtype=tl.int32)
     for k_start in range(0, hidden_size, CHUNK):
         k_offs = k_start + tl.arange(0, CHUNK)
         k_mask = k_offs < hidden_size
         hx_tile = tl.load(hx_base + k_offs, mask=k_mask, other=0.0).to(tl.float32)
-        hx_sum += tl.sum(hx_tile, axis=0)
+        qh = tl_extra_shim.rint(tl_extra_shim.fma(hx_tile, inv_act_scale_hh, zp_hh_f))
+        qh = tl.minimum(tl.maximum(qh, _ACT_QMIN), _ACT_QMAX)
+        hc = qh.to(tl.int32) - zp_hh_i
 
         w_r = tl.load(
             w_hh_ptr + (h_offs[:, None]) * hidden_size + k_offs[None, :],
             mask=h_mask[:, None] & k_mask[None, :],
             other=0,
-        ).to(tl.float32)
+        ).to(tl.int32)
         w_z = tl.load(
             w_hh_ptr + (H + h_offs[:, None]) * hidden_size + k_offs[None, :],
             mask=h_mask[:, None] & k_mask[None, :],
             other=0,
-        ).to(tl.float32)
+        ).to(tl.int32)
         w_n = tl.load(
             w_hh_ptr + (2 * H + h_offs[:, None]) * hidden_size + k_offs[None, :],
             mask=h_mask[:, None] & k_mask[None, :],
             other=0,
-        ).to(tl.float32)
-        gh_r_acc += tl.sum(w_r * hx_tile[None, :], axis=1)
-        gh_z_acc += tl.sum(w_z * hx_tile[None, :], axis=1)
-        gh_n_acc += tl.sum(w_n * hx_tile[None, :], axis=1)
+        ).to(tl.int32)
+        gh_r_acc += tl.sum((w_r - w_zp_hh_i) * hc[None, :], axis=1)
+        gh_z_acc += tl.sum((w_z - w_zp_hh_i) * hc[None, :], axis=1)
+        gh_n_acc += tl.sum((w_n - w_zp_hh_i) * hc[None, :], axis=1)
 
-    corr_hh = scale_hh * zero_point_hh * hx_sum
-    gh_r = scale_hh * gh_r_acc - corr_hh
-    gh_z = scale_hh * gh_z_acc - corr_hh
-    gh_n = scale_hh * gh_n_acc - corr_hh
+    gh_r = gh_r_acc.to(tl.float32) * mult_hh
+    gh_z = gh_z_acc.to(tl.float32) * mult_hh
+    gh_n = gh_n_acc.to(tl.float32) * mult_hh
     if HAS_BIAS_HH:
         b_hh_r = tl.load(b_hh_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
         b_hh_z = tl.load(b_hh_ptr + H + h_offs, mask=h_mask, other=0.0).to(tl.float32)
@@ -169,16 +226,234 @@ def quantized_gru_cell_kernel(
         gh_n = gh_n + b_hh_n
 
     # ------------------------------------------------------------------
-    # GRU gate combination.
+    # GRU gate combination, in aten's GRUCell expression order.
     # ------------------------------------------------------------------
     r_gate = tl.sigmoid(gi_r + gh_r)
     z_gate = tl.sigmoid(gi_z + gh_z)
-    n_gate = tl_extra_shim.tanh(gi_n + r_gate * gh_n)
+    n_gate = tl_extra_shim.tanh(gi_n + gh_n * r_gate)
 
     hx_vec = tl.load(hx_base + h_offs, mask=h_mask, other=0.0).to(tl.float32)
-    hy = (1.0 - z_gate) * n_gate + z_gate * hx_vec
+    hy = (hx_vec - n_gate) * z_gate + n_gate
 
     tl.store(hy_ptr + batch_idx * hidden_size + h_offs, hy, mask=h_mask)
+
+
+@libentry()
+@triton.jit
+def act_qparams_kernel(
+    act_ptr,  # activation, contiguous
+    inv_scale_ptr,  # out: 0-dim fp32, 1.0f / act_scale
+    zero_point_ptr,  # out: 0-dim int32
+    mult_ptr,  # out: 0-dim fp32, act_scale * weight_scale
+    n_elements,
+    weight_scale,  # fp32 weight scale from the aten schema
+    BLOCK: tl.constexpr,
+):
+    """Dynamic per-tensor uint8 activation qparams, as FBGEMM computes them.
+
+    A single-program port of ``fbgemm::ChooseQuantizationParams`` (qmin=0,
+    qmax=255, preserve_sparsity=false).  Fused into one kernel deliberately:
+    expressed as ~30 eager torch ops the same math costs ~0.93 ms of launch
+    overhead against a ~0.01 ms main kernel, and ATen's own
+    ``_choose_qparams_per_tensor`` binding returns Python scalars, forcing a
+    device-to-host sync worth ~6.6 ms per call.
+
+    fp64 is used for ``scale`` and the zero-point solve because FBGEMM does:
+    a fp32 ``scale`` would move the zero point by one step on some inputs.
+    """
+    # ---- reduce for min/max over the whole tensor ----
+    acc_min = tl.full([BLOCK], float("inf"), tl.float32)
+    acc_max = tl.full([BLOCK], float("-inf"), tl.float32)
+    for start in range(0, n_elements, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < n_elements
+        vals = tl.load(act_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        acc_min = tl.where(mask, tl.minimum(acc_min, vals), acc_min)
+        acc_max = tl.where(mask, tl.maximum(acc_max, vals), acc_max)
+    act_min = tl.min(acc_min)
+    act_max = tl.max(acc_max)
+    # FBGEMM widens the observed range to include zero.
+    act_min = tl.minimum(act_min, 0.0)
+    act_max = tl.maximum(act_max, 0.0)
+
+    qmin = 0.0
+    qmax = 255.0
+    # SMALL_SCALE_THRESHOLD is a `float` constant in quant_utils.h, so C++
+    # `double scale = SMALL_SCALE_THRESHOLD` stores the fp32 value widened to
+    # double, not the double literal. That bit decides whether a perfectly
+    # symmetric range gets zero point 128 or 127.
+    small = 6.099999882280827e-05
+
+    scale = (act_max.to(tl.float64) - act_min.to(tl.float64)) / (qmax - qmin)
+    # FBGEMM's degenerate fallback: a zero or non-representable scale -> 0.1.
+    s32 = scale.to(tl.float32)
+    inv_s32 = tl_extra_shim.div_rn(1.0, s32)
+    degenerate = (s32 == 0.0) | (inv_s32 == float("inf")) | (inv_s32 == float("-inf"))
+    scale = tl.where(degenerate, 0.1, scale)
+
+    # Cut off a too-small scale, rescaling min/max by the fp32 amplifier.
+    is_small = scale < small
+    span = (6.1e-5 * (qmax - qmin)).to(tl.float32)
+    # ``div_rn``, not ``/``: Triton lowers fp32 ``/`` to an approximate
+    # reciprocal-multiply that differs from an IEEE round-to-nearest divide on
+    # ~28% of inputs here, which shifts the amplified min/max enough to move
+    # the zero point by one step.
+    amp = tl_extra_shim.div_rn(small.to(tl.float32), scale.to(tl.float32))
+    new_min = tl.where(
+        act_min == 0.0, act_min, tl.where(act_max == 0.0, -span, act_min * amp)
+    )
+    new_max = tl.where(
+        act_min == 0.0, span, tl.where(act_max == 0.0, act_max, act_max * amp)
+    )
+    act_min = tl.where(is_small, new_min, act_min)
+    act_max = tl.where(is_small, new_max, act_max)
+    scale = tl.where(is_small, small, scale)
+
+    # Solve for the zero point from whichever end has the smaller error, then
+    # nudge into [qmin, qmax]. rint is round-half-to-even, like nearbyint.
+    dmin = act_min.to(tl.float64)
+    dmax = act_max.to(tl.float64)
+    zp_from_min = qmin - dmin / scale
+    zp_from_max = qmax - dmax / scale
+    err_min = tl.abs(qmin) + tl.abs(dmin / scale)
+    err_max = tl.abs(qmax) + tl.abs(dmax / scale)
+    initial = tl.where(err_min < err_max, zp_from_min, zp_from_max)
+    nudged = tl.where(
+        initial < qmin,
+        qmin,
+        tl.where(initial > qmax, qmax, tl_extra_shim.rint(initial)),
+    )
+
+    scale_f32 = scale.to(tl.float32)
+    # ``inv_scale`` is the value FBGEMM's ``Quantize`` multiplies by, computed
+    # there as the fp32 expression ``1.0f / scale``. An approximate reciprocal
+    # here would shift the uint8 code of half-way activations.
+    tl.store(inv_scale_ptr, tl_extra_shim.div_rn(1.0, scale_f32).to(tl.float32))
+    tl.store(zero_point_ptr, nudged.to(tl.int32))
+    tl.store(mult_ptr, (scale_f32 * weight_scale).to(tl.float32))
+
+
+def _act_qparams(activation, weight_scale):
+    """Launch :func:`act_qparams_kernel` for one activation tensor.
+
+    Validated bit-exact against ``torch._choose_qparams_per_tensor`` over 302
+    cases spanning 1e-20..1e11, symmetric / one-sided / constant ranges and
+    fp16/bf16 inputs; the only disagreement is an exact 127.5 zero-point tie
+    at +-3.4e38, outside any realistic activation range.
+
+    Returns ``(inv_scale, zero_point, mult)`` as 0-dim device tensors, so the
+    launch of the main kernel never has to sync on the host.
+    """
+    dev = activation.device
+    inv_scale = torch.empty((), dtype=torch.float32, device=dev)
+    zero_point = torch.empty((), dtype=torch.int32, device=dev)
+    mult = torch.empty((), dtype=torch.float32, device=dev)
+
+    n_elements = activation.numel()
+    # fp32-narrowed weight scale: FBGEMM's requantize multiplier is an fp32
+    # product, and the aten schema hands the weight scale over as a double.
+    w_scale_f32 = float(torch.tensor(float(weight_scale), dtype=torch.float32).item())
+
+    if n_elements == 0:
+        # ChooseQuantizationParams cannot reduce an empty tensor. FBGEMM's own
+        # fallback for a zero-width range is scale 0.1, zero point 0.
+        inv_scale.fill_(1.0 / float(torch.tensor(0.1, dtype=torch.float32)))
+        zero_point.zero_()
+        mult.fill_(
+            float(
+                torch.tensor(0.1, dtype=torch.float32)
+                * torch.tensor(w_scale_f32, dtype=torch.float32)
+            )
+        )
+        return inv_scale, zero_point, mult
+
+    BLOCK = 1024 if n_elements >= 1024 else triton.next_power_of_2(n_elements)
+    with runtime.torch_device_fn.device(dev):
+        act_qparams_kernel[(1,)](
+            activation,
+            inv_scale,
+            zero_point,
+            mult,
+            n_elements,
+            w_scale_f32,
+            BLOCK,
+        )
+    return inv_scale, zero_point, mult
+
+
+def _validate(input, hx, w_ih, w_hh, b_ih, b_hh):
+    """Reject malformed shapes before they reach raw pointer arithmetic.
+
+    The kernel indexes ``w_ih``/``w_hh``/``b_ih``/``b_hh`` from the batch,
+    input and hidden extents, so a mismatch reads out of bounds instead of
+    raising. ATen raises for every case checked here.
+    """
+    torch._check(
+        input.dim() == 2,
+        lambda: f"quantized_gru_cell: expected 2-D input, got {input.dim()}-D",
+    )
+    torch._check(
+        hx.dim() == 2,
+        lambda: f"quantized_gru_cell: expected 2-D hx, got {hx.dim()}-D",
+    )
+    torch._check(
+        w_ih.dim() == 2,
+        lambda: f"quantized_gru_cell: expected 2-D w_ih, got {w_ih.dim()}-D",
+    )
+    torch._check(
+        w_hh.dim() == 2,
+        lambda: f"quantized_gru_cell: expected 2-D w_hh, got {w_hh.dim()}-D",
+    )
+
+    batch_size, input_size = input.shape
+    hx_batch, hidden_size = hx.shape
+    torch._check(
+        hx_batch == batch_size,
+        lambda: (
+            "quantized_gru_cell: input batch size "
+            f"{batch_size} does not match hx batch size {hx_batch}"
+        ),
+    )
+    torch._check(
+        w_ih.shape == (3 * hidden_size, input_size),
+        lambda: (
+            "quantized_gru_cell: expected w_ih of shape "
+            f"{(3 * hidden_size, input_size)}, got {tuple(w_ih.shape)}"
+        ),
+    )
+    torch._check(
+        w_hh.shape == (3 * hidden_size, hidden_size),
+        lambda: (
+            "quantized_gru_cell: expected w_hh of shape "
+            f"{(3 * hidden_size, hidden_size)}, got {tuple(w_hh.shape)}"
+        ),
+    )
+    for name, bias in (("b_ih", b_ih), ("b_hh", b_hh)):
+        if bias is None:
+            continue
+        torch._check(
+            bias.dim() == 1,
+            lambda name=name, bias=bias: (
+                f"quantized_gru_cell: expected 1-D {name}, got {bias.dim()}-D"
+            ),
+        )
+        torch._check(
+            bias.shape[0] == 3 * hidden_size,
+            lambda name=name, bias=bias: (
+                f"quantized_gru_cell: expected {name} of size "
+                f"{3 * hidden_size}, got {bias.shape[0]}"
+            ),
+        )
+    torch._check(
+        hx.device == input.device
+        and w_ih.device == input.device
+        and w_hh.device == input.device,
+        lambda: (
+            "quantized_gru_cell: expected input, hx, w_ih and w_hh on the same "
+            f"device, got {input.device}, {hx.device}, {w_ih.device}, {w_hh.device}"
+        ),
+    )
+    return batch_size, input_size, hidden_size
 
 
 def quantized_gru_cell(
@@ -199,33 +474,45 @@ def quantized_gru_cell(
 ):
     """Quantized GRU cell.
 
-    Computes a single GRU cell step with int8 quantized weights. The
-    ``packed_*`` and ``col_offsets_*`` arguments come from the aten op
+    Computes a single GRU cell step with int8 quantized weights and
+    dynamically uint8-quantized activations, matching
+    ``aten::quantized_gru_cell``.
+
+    The ``packed_*`` and ``col_offsets_*`` arguments come from the aten op
     signature (they describe the FBGEMM-packed weight layout) but are not
-    needed by this Triton kernel, which works directly off the int8
-    weight tensors ``w_ih`` / ``w_hh``.
+    needed by this Triton kernel, which works directly off the int8 weight
+    tensors ``w_ih`` / ``w_hh``.
     """
     logger.debug("GEMS QUANTIZED_GRU_CELL")
 
+    batch_size, input_size, hidden_size = _validate(input, hx, w_ih, w_hh, b_ih, b_hh)
+
+    # The kernel indexes every operand linearly, so materialise any
+    # non-contiguous operand -- including the biases, which ATen accepts
+    # strided. A strided bias read as contiguous storage silently picks up
+    # the wrong elements (measured: 1.5 absolute error on a stride-2 bias).
     input = input.contiguous()
     hx = hx.contiguous()
     w_ih = w_ih.contiguous()
     w_hh = w_hh.contiguous()
 
-    batch_size, input_size = input.shape
-    hidden_size = hx.shape[1]
-
     # Output hidden state.
     hy = torch.empty((batch_size, hidden_size), device=input.device, dtype=input.dtype)
+    if hy.numel() == 0:
+        return hy
 
     # Biases are required tensors in the aten schema, but tolerate None
     # defensively by passing a zero-length placeholder.
     has_bias_ih = b_ih is not None
     has_bias_hh = b_hh is not None
-    if not has_bias_ih:
-        b_ih = input.new_empty(0)
-    if not has_bias_hh:
-        b_hh = input.new_empty(0)
+    b_ih = b_ih.contiguous() if has_bias_ih else input.new_empty(0)
+    b_hh = b_hh.contiguous() if has_bias_hh else input.new_empty(0)
+
+    # Dynamic per-tensor activation quantization, as the FBGEMM linear does.
+    # These stay as 0-dim device tensors and are loaded inside the kernel, so
+    # the launch never syncs on the host.
+    inv_scale_ih, act_zp_ih, mult_ih = _act_qparams(input, scale_ih)
+    inv_scale_hh, act_zp_hh, mult_hh = _act_qparams(hx, scale_hh)
 
     BLOCK_H = triton.next_power_of_2(hidden_size)
     BLOCK_H = max(16, BLOCK_H)
@@ -240,10 +527,14 @@ def quantized_gru_cell(
             b_ih,
             b_hh,
             hy,
-            float(scale_ih),
-            float(scale_hh),
-            float(zero_point_ih),
-            float(zero_point_hh),
+            inv_scale_ih,
+            inv_scale_hh,
+            act_zp_ih,
+            act_zp_hh,
+            mult_ih,
+            mult_hh,
+            int(zero_point_ih),
+            int(zero_point_hh),
             input_size,
             hidden_size,
             has_bias_ih,

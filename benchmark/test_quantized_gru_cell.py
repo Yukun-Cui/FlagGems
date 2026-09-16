@@ -48,24 +48,34 @@ def _torch_quantized_gru_cell_ref(
     scale_hh,
     zero_point_ih,
     zero_point_hh,
+    w_ih_deq=None,
+    w_hh_deq=None,
 ):
-    """CUDA-runnable mathematical reference for ``aten::quantized_gru_cell``.
+    """GPU latency baseline for ``aten::quantized_gru_cell``.
 
-    The aten op is CPU-only (it dispatches to the FBGEMM packed kernel), so
-    for a GPU latency baseline we run the mathematically-equivalent plain
-    ``torch.gru_cell`` on dequantized weights ``scale * (w_q - zero_point)``.
-    This is exactly what the fused Triton kernel computes.
+    The aten op is CPU-only -- it dispatches to the FBGEMM packed kernel and
+    raises "matmul is not supported with quantized cell params" on CUDA -- so
+    there is no like-for-like GPU baseline to time.  The closest available one
+    is ``torch.gru_cell`` on *pre-dequantized* weights, which is what this
+    measures.
+
+    Two caveats, so the reported speedup is not over-read:
+
+    * It does less work than the kernel under test.  ``torch.gru_cell`` skips
+      the dynamic per-tensor activation quantization that the aten op performs
+      (choose qparams, quantize to uint8, int32 accumulate, requantize), so
+      this is a *lower bound* on the baseline's cost, not an equivalent
+      computation.
+    * The dequantized weights are hoisted out of the timed region by the input
+      function (passed in as ``w_ih_deq``/``w_hh_deq``).  Dequantizing inside
+      the call would time two ``(3H, K)`` elementwise conversions that the
+      Triton kernel never performs, inflating the speedup.
     """
-    w_ih_deq = scale_ih * (w_ih.to(torch.float32) - zero_point_ih)
-    w_hh_deq = scale_hh * (w_hh.to(torch.float32) - zero_point_hh)
-    return torch.gru_cell(
-        input.to(torch.float32),
-        hx.to(torch.float32),
-        w_ih_deq,
-        w_hh_deq,
-        b_ih.to(torch.float32),
-        b_hh.to(torch.float32),
-    ).to(input.dtype)
+    if w_ih_deq is None:
+        w_ih_deq = scale_ih * (w_ih.to(torch.float32) - zero_point_ih)
+    if w_hh_deq is None:
+        w_hh_deq = scale_hh * (w_hh.to(torch.float32) - zero_point_hh)
+    return torch.gru_cell(input, hx, w_ih_deq, w_hh_deq, b_ih, b_hh)
 
 
 def quantized_gru_cell_input_fn(shape, dtype, device):
@@ -75,10 +85,10 @@ def quantized_gru_cell_input_fn(shape, dtype, device):
     b_ih = torch.randn(3 * hidden_size, dtype=dtype, device=device)
     b_hh = torch.randn(3 * hidden_size, dtype=dtype, device=device)
 
-    # Quantize weights on CPU (fbgemm helpers are CPU-only) then move the
-    # int8 weight + col_offsets to the benchmark device. The packed weights
-    # are not needed by either kernel path but are passed to keep the
-    # signature identical to the aten op.
+    # Quantize weights on CPU (the fbgemm helpers are CPU-only) then move the
+    # int8 weight + col_offsets to the benchmark device. The packed weights are
+    # not needed by either path but are passed to keep the signature identical
+    # to the aten op.
     w_ih_float = torch.randn(3 * hidden_size, input_size, dtype=torch.float32)
     w_hh_float = torch.randn(3 * hidden_size, hidden_size, dtype=torch.float32)
     w_ih_q, col_ih, scale_ih, zp_ih = torch.fbgemm_linear_quantize_weight(w_ih_float)
@@ -89,6 +99,11 @@ def quantized_gru_cell_input_fn(shape, dtype, device):
     col_offsets_hh = col_hh.to(device)
     packed_ih = torch.empty(0, device=device)
     packed_hh = torch.empty(0, device=device)
+
+    # Pre-dequantized weights for the baseline, built outside the timed region.
+    w_ih_deq = (scale_ih * (w_ih.to(torch.float32) - zp_ih)).to(dtype)
+    w_hh_deq = (scale_hh * (w_hh.to(torch.float32) - zp_hh)).to(dtype)
+
     yield (
         inp,
         hx,
@@ -104,7 +119,13 @@ def quantized_gru_cell_input_fn(shape, dtype, device):
         scale_hh,
         zp_ih,
         zp_hh,
+        {"w_ih_deq": w_ih_deq, "w_hh_deq": w_hh_deq},
     )
+
+
+def _gems_quantized_gru_cell(*args, w_ih_deq=None, w_hh_deq=None):
+    """Drop the baseline-only dequantized weights before calling the kernel."""
+    return gems_quantized_gru_cell(*args)
 
 
 class QuantizedGruCellBenchmark(base.GenericBenchmark):
@@ -127,7 +148,7 @@ def test_quantized_gru_cell():
         input_fn=quantized_gru_cell_input_fn,
         op_name="quantized_gru_cell",
         torch_op=_torch_quantized_gru_cell_ref,
-        gems_op=gems_quantized_gru_cell,
+        gems_op=_gems_quantized_gru_cell,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
