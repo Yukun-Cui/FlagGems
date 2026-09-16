@@ -320,16 +320,22 @@ def test_slice_copy_non_contiguous_input(dtype):
     # Transposed / strided / expanded inputs must be gathered by value, not by
     # flat offset.
     base = torch.randn((6, 8, 4), dtype=dtype, device=flag_gems.device)
-    views = [
-        base.transpose(0, 1),
-        base.permute(2, 0, 1),
-        base[:, ::2, :],
-        base.flip(0),
-        base[1:5, 2:7, :],
-    ]
-    for view in views:
+    # Rebuild the same views on the reference tensor rather than moving each view,
+    # so the stride patterns match on both sides in quick-cpu mode (--ref=cpu).
+    ref_base = utils.to_reference(base)
+
+    def _views(t):
+        return [
+            t.transpose(0, 1),
+            t.permute(2, 0, 1),
+            t[:, ::2, :],
+            t.flip(0),
+            t[1:5, 2:7, :],
+        ]
+
+    for view, ref_view in zip(_views(base), _views(ref_base)):
         for dim in range(view.ndim):
-            ref_out = _aten_slice_copy(view, dim, 0, view.size(dim), 2)
+            ref_out = _aten_slice_copy(ref_view, dim, 0, ref_view.size(dim), 2)
             res_out = flag_gems.slice_copy(view, dim, 0, view.size(dim), 2)
             assert res_out.is_contiguous()
             utils.gems_assert_equal(res_out, ref_out)
@@ -382,14 +388,17 @@ def test_slice_copy_out(shape, dtype):
 @pytest.mark.slice_copy_out
 @pytest.mark.parametrize("dtype", _ALL_NON_COMPLEX_DTYPES + _COMPLEX_DTYPES)
 def test_slice_copy_out_vs_aten_all_dtypes(dtype):
-    # Compare slice_copy.Tensor_out against ATen directly for every dtype.
+    # Compare slice_copy.Tensor_out against ATen directly for every dtype. The
+    # reference runs on the reference device (CPU under --ref=cpu), so allocate
+    # its out= there too.
     inp = _make_input((5, 9), dtype)
+    ref_inp = utils.to_reference(inp)
     for dim, start, end, step in [(0, 1, 5, 2), (1, 2, 8, 3), (1, 0, 9, 1)]:
         target = list(inp.shape)
         target[dim] = (end - start + step - 1) // step
-        ref_out = torch.empty(target, dtype=dtype, device=flag_gems.device)
+        ref_out = torch.empty(target, dtype=dtype, device=ref_inp.device)
         res_out = torch.empty(target, dtype=dtype, device=flag_gems.device)
-        _aten_slice_copy_out(inp, dim, start, end, step, ref_out)
+        _aten_slice_copy_out(ref_inp, dim, start, end, step, ref_out)
         r = flag_gems.slice_copy_out(inp, dim, start, end, step, out=res_out)
         assert r is res_out
         _assert_bitwise_equal(res_out, ref_out)
@@ -531,8 +540,10 @@ def test_slice_copy_out_internal_overlap():
 
 @pytest.mark.slice_copy_out
 def test_slice_copy_out_non_contiguous_input():
-    inp = torch.randn((6, 8, 4), device=flag_gems.device).transpose(0, 1)
-    ref_out = _aten_slice_copy(inp, 1, 1, 6, 2)
+    base = torch.randn((6, 8, 4), device=flag_gems.device)
+    inp = base.transpose(0, 1)
+    # Transpose the reference on its own device so both sides share the layout.
+    ref_out = _aten_slice_copy(utils.to_reference(base).transpose(0, 1), 1, 1, 6, 2)
     buf = torch.zeros(tuple(reversed(ref_out.shape)), device=flag_gems.device)
     out = buf.permute(2, 1, 0)
     flag_gems.slice_copy_out(inp, 1, 1, 6, 2, out=out)
