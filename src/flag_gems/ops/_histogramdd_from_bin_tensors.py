@@ -38,6 +38,7 @@ def histogramdd_from_bin_tensors_kernel(
     BLOCK_SIZE: tl.constexpr,
     D_CONST: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
 ):
     """Compute a multi-dimensional histogram from explicit bin-edge tensors.
 
@@ -67,13 +68,22 @@ def histogramdd_from_bin_tensors_kernel(
         edge_ptr_d = edge_ptrs[d]
 
         # Coordinate of this point along dimension d (innermost dim is D).
+        #
+        # Kept in ACC_DTYPE rather than narrowed to fp32: bin placement compares
+        # the coordinate against the edges exactly, so narrowing an fp64 input
+        # moves points across edges wholesale. Measured on 30 fp64 values probed
+        # around the 11 edges of linspace(0, 1, 11), narrowing the edges alone
+        # turns the reference counts [3,3,3,3,3,3,3,3,3,4] into
+        # [5,3,3,3,1,5,0,6,0,5].
         coord = tl.load(in_ptr + offsets * D_CONST + d, mask=mask, other=0.0).to(
-            tl.float32
+            ACC_DTYPE
         )
         # Load (padded) edges for this dimension.  Padding edges are +inf so
         # they never satisfy ``edges <= coord`` and do not affect le_count.
         e_mask = e_offs < bin_count_d
-        edges = tl.load(edge_ptr_d + e_offs, mask=e_mask, other=float("inf"))
+        edges = tl.load(edge_ptr_d + e_offs, mask=e_mask, other=float("inf")).to(
+            ACC_DTYPE
+        )
         # Count edges <= coord for every point (broadcast points x edges).
         le = (edges[None, :] <= coord[:, None]).to(tl.int64)
         le_count = tl.sum(le, axis=1)
@@ -85,7 +95,7 @@ def histogramdd_from_bin_tensors_kernel(
         # which is one past the last bin; clamp it into the last (rightmost)
         # bin, which is inclusive of that edge.
         bin_idx = le_count - 1
-        top_edge = tl.load(edge_ptr_d + (bin_count_d - 1))
+        top_edge = tl.load(edge_ptr_d + (bin_count_d - 1)).to(ACC_DTYPE)
         at_top = coord == top_edge
         # ``bin_count_d`` is the number of edges, so the last bin index is
         # ``bin_count_d - 2``.  Clamp the rightmost bin (inclusive of its right
@@ -103,10 +113,152 @@ def histogramdd_from_bin_tensors_kernel(
         out_index = out_index + bin_idx.to(tl.int64) * stride_d
 
     if HAS_WEIGHT:
-        contrib = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
+        contrib = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(ACC_DTYPE)
     else:
-        contrib = tl.full((BLOCK_SIZE,), 1.0, dtype=tl.float32)
+        contrib = tl.full((BLOCK_SIZE,), 1.0, dtype=ACC_DTYPE)
     tl.atomic_add(out_ptr + out_index, contrib, mask=valid, sem="relaxed")
+
+
+def _validate(self, bins, weight):
+    """Validate inputs with ATen's error types and wording.
+
+    Uses exceptions rather than ``assert`` so the checks survive ``python -O`` and
+    so callers see the same messages the native op produces.
+    """
+    D = len(bins)
+    if self.ndim < 2:
+        raise RuntimeError(
+            "torch.histogramdd: input tensor should have at least 2 dimensions"
+        )
+    if self.shape[-1] != D:
+        raise RuntimeError(
+            f"torch.histogramdd: expected {self.shape[-1]} sequences of bin edges "
+            f"for a {self.shape[-1]}-dimensional histogram but got {D}"
+        )
+    if not self.is_floating_point():
+        raise RuntimeError(
+            "torch.histogramdd: input tensor and bins tensors should have the same "
+            "dtype, but got input with dtype " + str(self.dtype)
+        )
+    for d, b in enumerate(bins):
+        if b.dtype != self.dtype:
+            raise RuntimeError(
+                "torch.histogramdd: input tensor and bins tensors should have the "
+                f"same dtype, but got input {self.dtype} and bins[{d}] {b.dtype}"
+            )
+        if b.numel() < 2:
+            raise RuntimeError(
+                f"torch.histogram(): bins must be > 0, but got {b.numel() - 1} "
+                f"for dimension {d}"
+            )
+    if weight is not None:
+        # ATen requires an exact dtype match and rejects anything else; the
+        # previous ``pass`` branch silently accepted a mismatched weight.
+        if weight.dtype != self.dtype:
+            raise RuntimeError(
+                "torch.histogramdd: if weight tensor is provided, input tensor and "
+                "weight tensor should have the same dtype, but got "
+                f"input({self.dtype}), and weight({weight.dtype})"
+            )
+        if weight.numel() != self.numel() // self.shape[-1]:
+            raise RuntimeError(
+                "torch.histogramdd: if weight tensor is provided it should have "
+                "the same shape as the input tensor excluding its innermost "
+                "dimension"
+            )
+
+
+def _run_histogram(self, bins, weight, density, out):
+    """Shared driver for the base and ``.out`` variants.
+
+    Both variants previously duplicated this logic, which is how the ``.out``
+    path came to skip the weight-dtype check and to accumulate differently.
+    """
+    _validate(self, bins, weight)
+    D = len(bins)
+
+    inp = self.reshape(-1, D).contiguous()
+    M = inp.shape[0]
+
+    # Edges keep the input dtype; see the note in the kernel about narrowing.
+    edges = [b.contiguous() for b in bins]
+    bin_counts = [b.numel() for b in edges]
+    out_shape = tuple(bc - 1 for bc in bin_counts)
+    out_dtype = self.dtype
+
+    # fp16/bf16 accumulate in fp32: tl.atomic_add reduces in a different order
+    # than the reference's serial loop, so a low-precision accumulator would
+    # drift beyond the reference's own rounding error.
+    acc_dtype = (
+        torch.float32 if out_dtype in (torch.float16, torch.bfloat16) else out_dtype
+    )
+    acc_triton = tl.float64 if acc_dtype == torch.float64 else tl.float32
+
+    has_weight = weight is not None
+    if has_weight:
+        w = weight.reshape(-1).contiguous()
+        if w.dtype != acc_dtype:
+            w = w.to(acc_dtype)
+        weight_ptr = w
+    else:
+        weight_ptr = inp  # unused by the kernel (HAS_WEIGHT=False)
+
+    # Validate / resize the caller's output before computing, matching ATen: a
+    # mis-shaped output is resized in place and the same object is returned, but a
+    # dtype or device mismatch raises rather than being silently re-bound.
+    if out is not None:
+        if out.dtype != out_dtype:
+            raise RuntimeError(
+                f"Expected out tensor to have dtype {out_dtype}, but got "
+                f"{out.dtype} instead"
+            )
+        if out.device != self.device:
+            raise RuntimeError(
+                f"Expected out tensor to have device {self.device}, but got "
+                f"{out.device} instead"
+            )
+        if tuple(out.shape) != out_shape:
+            out.resize_(out_shape)
+
+    # Accumulate into the output itself when its dtype and layout allow it; a
+    # non-contiguous or low-precision output needs a dense temporary because the
+    # kernel writes through a flat stride computation.
+    if out is not None and out.dtype == acc_dtype and out.is_contiguous():
+        acc = out.zero_()
+    else:
+        acc = torch.zeros(out_shape, dtype=acc_dtype, device=self.device)
+
+    max_edges = max(bin_counts) if bin_counts else 1
+    edge_block = triton.next_power_of_2(max(2, max_edges))
+    # One program per point-tile; 1024 points amortizes launch overhead while
+    # keeping occupancy high for typical point-cloud sizes.
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(M, BLOCK_SIZE),)
+
+    if M > 0:
+        histogramdd_from_bin_tensors_kernel[grid](
+            inp,
+            weight_ptr,
+            acc,
+            M,
+            out_strides=tuple(acc.stride()),
+            bin_counts=tuple(bin_counts),
+            edge_ptrs=tuple(edges),
+            EDGE_BLOCK=edge_block,
+            BLOCK_SIZE=BLOCK_SIZE,
+            D_CONST=D,
+            HAS_WEIGHT=has_weight,
+            ACC_DTYPE=acc_triton,
+        )
+
+    if density:
+        acc = _apply_density(acc, edges, D, out_shape, acc_dtype, acc_triton)
+
+    if out is None:
+        return acc if acc.dtype == out_dtype else acc.to(out_dtype)
+    if acc.data_ptr() != out.data_ptr():
+        out.copy_(acc)
+    return out
 
 
 def _histogramdd_from_bin_tensors(self, bins, *, weight=None, density=False):
@@ -114,200 +266,148 @@ def _histogramdd_from_bin_tensors(self, bins, *, weight=None, density=False):
 
     Args:
         self (Tensor): input with innermost dimension ``D``; all leading
-            dimensions are flattened to ``M`` rows of ``D``-dimensional
-            points.
-        bins (sequence of Tensor): ``D`` strictly-increasing 1D edge
-            tensors. ``len(bins[d]) - 1`` bins per dimension.
+            dimensions are flattened to ``M`` rows of ``D``-dimensional points.
+        bins (sequence of Tensor): ``D`` strictly-increasing 1D edge tensors,
+            with ``len(bins[d]) - 1`` bins per dimension.
         weight (Tensor, optional): weights of shape ``self.shape[:-1]``.
-        density (bool): if True, normalise counts by total weight and bin
-            volume.
+        density (bool): if True, normalise by total weight and bin volume.
 
     Returns:
-        Tensor: the N-dimensional histogram of shape
-        ``(len(bins[0])-1, ..., len(bins[D-1])-1)``.
+        Tensor: the histogram, shaped ``(len(bins[0])-1, ..., len(bins[D-1])-1)``.
     """
     logger.debug("GEMS _HISTOGRAMDD_FROM_BIN_TENSORS")
-
-    assert self.ndim >= 2, "_histogramdd_from_bin_tensors: input must have >= 2 dims"
-    D = len(bins)
-    assert (
-        self.shape[-1] == D
-    ), "_histogramdd_from_bin_tensors: innermost dimension must equal len(bins)"
-    assert 1 <= D <= 5, "_histogramdd_from_bin_tensors: supports 1..5 dimensions"
-
-    # Flatten all leading dimensions into M points.
-    inp = self.reshape(-1, D).contiguous()
-    M = inp.shape[0]
-
-    # Normalise bin edges: contiguous 1D float tensors.
-    edges = [b.contiguous().to(torch.float32) for b in bins]
-    bin_counts = [b.numel() for b in edges]
-    out_shape = tuple(bc - 1 for bc in bin_counts)
-
-    # The aten reference only supports floating-point input/bins and returns
-    # the histogram in the input dtype (the weight dtype must match the input
-    # dtype when a weight tensor is provided).
-    has_weight = weight is not None
-    out_dtype = self.dtype
-    if has_weight:
-        w = weight.reshape(-1).contiguous()
-        assert (
-            w.numel() == M
-        ), "_histogramdd_from_bin_tensors: weight must have self.shape[:-1] elements"
-        assert (
-            w.dtype == out_dtype
-        ), "_histogramdd_from_bin_tensors: weight must have the same dtype as input"
-        # Accumulate in float32 for numerical fidelity and cast back to the
-        # input dtype at the end.  ``tl.atomic_add`` ordering differs from the
-        # aten reference's reduction order, so accumulating low-precision
-        # weights directly would diverge bit-for-bit; a wider accumulator
-        # keeps the per-bin sum within the reference's own rounding error.
-        acc_dtype = (
-            torch.float32 if out_dtype in (torch.float16, torch.bfloat16) else out_dtype
-        )
-        if acc_dtype != out_dtype:
-            w = w.to(acc_dtype)
-        weight_ptr = w
-    else:
-        weight_ptr = inp  # unused by kernel (HAS_WEIGHT=False)
-        acc_dtype = (
-            torch.float32 if out_dtype in (torch.float16, torch.bfloat16) else out_dtype
-        )
-
-    hist = torch.zeros(out_shape, dtype=acc_dtype, device=self.device)
-    out_strides = tuple(hist.stride())
-
-    # Next power of two >= max edge count, used to pad per-dim edge loads.
-    max_edges = max(bin_counts) if bin_counts else 1
-    edge_block = triton.next_power_of_2(max(2, max_edges))
-
-    # One program per point-tile; 1024 points per program amortizes launch overhead
-    # while keeping occupancy high for typical point-cloud sizes.
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(M, BLOCK_SIZE),)
-
-    histogramdd_from_bin_tensors_kernel[grid](
-        inp,
-        weight_ptr,
-        hist,
-        M,
-        out_strides=out_strides,
-        bin_counts=tuple(bin_counts),
-        edge_ptrs=tuple(edges),
-        EDGE_BLOCK=edge_block,
-        BLOCK_SIZE=BLOCK_SIZE,
-        D_CONST=D,
-        HAS_WEIGHT=has_weight,
-    )
-
-    if density:
-        hist = _apply_density(hist, edges, D, out_shape)
-
-    # Cast the accumulator back to the input dtype to match the aten output.
-    if hist.dtype != out_dtype:
-        hist = hist.to(out_dtype)
-    return hist
+    return _run_histogram(self, bins, weight, density, None)
 
 
 def _histogramdd_from_bin_tensors_out(
     self, bins, *, weight=None, density=False, out=None
 ):
-    """Out variant of :func:`_histogramdd_from_bin_tensors`.
-
-    Writes the histogram into the caller-provided ``out`` tensor (used as the
-    accumulation buffer) and returns it.
-    """
+    """Out variant of :func:`_histogramdd_from_bin_tensors`."""
     logger.debug("GEMS _HISTOGRAMDD_FROM_BIN_TENSORS_OUT")
-
-    assert self.ndim >= 2, "_histogramdd_from_bin_tensors: input must have >= 2 dims"
-    D = len(bins)
-    assert (
-        self.shape[-1] == D
-    ), "_histogramdd_from_bin_tensors: innermost dimension must equal len(bins)"
-    assert 1 <= D <= 5, "_histogramdd_from_bin_tensors: supports 1..5 dimensions"
-
-    edges = [b.contiguous().to(torch.float32) for b in bins]
-    bin_counts = [b.numel() for b in edges]
-    out_shape = tuple(bc - 1 for bc in bin_counts)
-
-    inp = self.reshape(-1, D).contiguous()
-    M = inp.shape[0]
-
-    has_weight = weight is not None
-    if has_weight:
-        w = weight.reshape(-1).contiguous()
-        assert (
-            w.numel() == M
-        ), "_histogramdd_from_bin_tensors: weight must have self.shape[:-1] elements"
-
-    # The aten .out schema passes the output tensor to accumulate into.  Its
-    # dtype must match the input dtype.  For low-precision (float16/bfloat16)
-    # outputs we accumulate into an internal float32 buffer and cast back at
-    # the end so the per-bin sums stay within the reference's rounding error
-    # despite ``tl.atomic_add``'s different reduction order.
     if out is None:
-        out = torch.zeros(out_shape, dtype=self.dtype, device=self.device)
-    else:
-        out = out.reshape(out_shape)
-    out_dtype = out.dtype
-    if has_weight and w.dtype not in (out_dtype,):
-        # Promote weights to the accumulator dtype.
-        pass
+        raise RuntimeError(
+            "_histogramdd_from_bin_tensors.out: 'out' argument is required"
+        )
+    return _run_histogram(self, bins, weight, density, out)
 
-    if out_dtype in (torch.float16, torch.bfloat16):
-        acc = torch.zeros(out_shape, dtype=torch.float32, device=self.device)
-        acc_weight = w.to(torch.float32) if has_weight else None
-    else:
-        acc = out.zero_()
-        acc_weight = w if has_weight else None
 
-    weight_ptr = acc_weight if has_weight else inp
-    out_strides = tuple(acc.stride())
-    max_edges = max(bin_counts) if bin_counts else 1
-    edge_block = triton.next_power_of_2(max(2, max_edges))
+@libentry()
+@triton.jit
+def histogramdd_density_kernel(
+    hist_ptr,
+    total_ptr,  # () total weight, may be zero or negative
+    vol_ptr,  # (num_bins,) per-bin volume
+    num_bins,
+    ACC_DTYPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """hist[i] /= total * volume[i], with no guard on the total.
 
-    # One program per point-tile; 1024 points per program amortizes launch overhead
-    # while keeping occupancy high for typical point-cloud sizes.
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(M, BLOCK_SIZE),)
+    ATen divides through unconditionally, so an empty or fully out-of-range input
+    yields NaN, weights that cancel yield +-inf, and a net-negative total keeps
+    the sign of each bin. Skipping the division when total <= 0 diverges from all
+    three (measured: net-negative weights give [1.0, -0.0, -0.0, 3.0], not the
+    unnormalised counts).
+    """
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    m = offs < num_bins
+    h = tl.load(hist_ptr + offs, mask=m, other=0.0).to(ACC_DTYPE)
+    vol = tl.load(vol_ptr + offs, mask=m, other=1.0).to(ACC_DTYPE)
+    total = tl.load(total_ptr).to(ACC_DTYPE)
+    tl.store(hist_ptr + offs, h / total / vol, mask=m)
 
-    histogramdd_from_bin_tensors_kernel[grid](
-        inp,
-        weight_ptr,
-        acc,
-        M,
-        out_strides=out_strides,
-        bin_counts=tuple(bin_counts),
-        edge_ptrs=tuple(edges),
-        EDGE_BLOCK=edge_block,
-        BLOCK_SIZE=BLOCK_SIZE,
-        D_CONST=D,
-        HAS_WEIGHT=has_weight,
+
+@libentry()
+@triton.jit
+def histogramdd_total_kernel(
+    hist_ptr,
+    total_ptr,  # () out
+    num_bins,
+    ACC_DTYPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Sum the histogram on device, replacing a host ``hist.sum().item()``."""
+    total = tl.zeros((), dtype=ACC_DTYPE)
+    for base in range(0, num_bins, BLOCK_SIZE):
+        offs = base + tl.arange(0, BLOCK_SIZE)
+        m = offs < num_bins
+        total += tl.sum(tl.load(hist_ptr + offs, mask=m, other=0.0).to(ACC_DTYPE))
+    tl.store(total_ptr, total)
+
+
+@libentry()
+@triton.jit
+def histogramdd_volume_kernel(
+    edge_ptrs,  # tl.constexpr tuple of per-dimension edge pointers
+    vol_ptr,  # (num_bins,) out
+    out_strides,  # tl.constexpr tuple of row-major strides
+    bin_sizes,  # tl.constexpr tuple of bins per dimension
+    num_bins,
+    D_CONST: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Per-bin volume: the product of the per-dimension edge widths.
+
+    Computed on device so the host does not need the width subtraction, the
+    reshape/broadcast_to and the running product that the convention disallows.
+    Each flat bin index is decomposed back into per-dimension indices using the
+    row-major strides.
+    """
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    m = offs < num_bins
+    vol = tl.full((BLOCK_SIZE,), 1.0, dtype=ACC_DTYPE)
+    for d in tl.static_range(D_CONST):
+        stride_d = out_strides[d]
+        size_d = bin_sizes[d]
+        idx_d = (offs // stride_d) % size_d
+        lo = tl.load(edge_ptrs[d] + idx_d, mask=m, other=0.0).to(ACC_DTYPE)
+        hi = tl.load(edge_ptrs[d] + idx_d + 1, mask=m, other=1.0).to(ACC_DTYPE)
+        vol = vol * (hi - lo)
+    tl.store(vol_ptr + offs, vol, mask=m)
+
+
+def _apply_density(hist, edges, D, out_shape, acc_dtype, acc_triton):
+    """Normalise the histogram by total weight and per-bin volume, on device."""
+    num_bins = hist.numel()
+    if num_bins == 0:
+        return hist
+    dev = hist.device
+    total = torch.empty((), dtype=acc_dtype, device=dev)
+    vol = torch.empty(num_bins, dtype=acc_dtype, device=dev)
+
+    histogramdd_total_kernel[(1,)](
+        hist, total, num_bins, ACC_DTYPE=acc_triton, BLOCK_SIZE=1024
     )
+    BLOCK = 1024
+    grid = (triton.cdiv(num_bins, BLOCK),)
+    # Strides of the contiguous histogram, in elements.
+    contig_strides = []
+    acc = 1
+    for size in reversed(out_shape):
+        contig_strides.append(acc)
+        acc *= size
+    contig_strides = tuple(reversed(contig_strides))
 
-    if density:
-        acc = _apply_density(acc, edges, D, out_shape)
-
-    if acc.data_ptr() != out.data_ptr():
-        out.copy_(acc)
-    else:
-        out = acc
-    return out
-
-
-def _apply_density(hist, edges, D, out_shape):
-    """Normalise the histogram by total weight and per-bin volume."""
-    total = hist.sum()
-    if total.item() > 0:
-        hist = hist / total
-    # Divide by the volume of each bin: product of (edges[d][i+1]-edges[d][i]).
-    volumes = torch.ones(out_shape, dtype=torch.float32, device=hist.device)
-    for d in range(D):
-        e = edges[d]
-        widths = e[1:] - e[:-1]
-        shape = [1] * D
-        shape[d] = -1
-        volumes = volumes * widths.reshape(shape)
-    volumes = torch.broadcast_to(volumes, out_shape)
-    hist = hist / volumes
+    histogramdd_volume_kernel[grid](
+        edge_ptrs=tuple(edges),
+        vol_ptr=vol,
+        out_strides=contig_strides,
+        bin_sizes=tuple(out_shape),
+        num_bins=num_bins,
+        D_CONST=D,
+        ACC_DTYPE=acc_triton,
+        BLOCK_SIZE=BLOCK,
+    )
+    flat = hist if hist.is_contiguous() else hist.contiguous()
+    histogramdd_density_kernel[grid](
+        flat.view(num_bins),
+        total,
+        vol,
+        num_bins,
+        ACC_DTYPE=acc_triton,
+        BLOCK_SIZE=BLOCK,
+    )
+    if flat.data_ptr() != hist.data_ptr():
+        hist.copy_(flat)
     return hist

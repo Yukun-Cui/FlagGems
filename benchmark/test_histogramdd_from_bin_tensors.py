@@ -19,11 +19,16 @@ import flag_gems
 
 from . import base, consts
 
-# ``aten::_histogramdd_from_bin_tensors`` has no native CUDA implementation in
-# this PyTorch build, so the torch baseline is computed on CPU (the inputs are
-# moved to CPU, the reference histogram is run there, and the result is moved
-# back to the original device).  The FlagGems kernel runs on the GPU, so the
-# reported speedup compares the CPU reference against the Triton kernel.
+# ``aten::_histogramdd_from_bin_tensors`` has no native CUDA implementation, so the
+# baseline necessarily runs on CPU. Two consequences, both handled below:
+#
+#  * The transfers must not be timed. Moving the inputs to CPU and the result back
+#    inside the timed call charges the native op for copies the Triton kernel never
+#    performs, which inflates the ratio by transfer cost rather than measuring the
+#    kernel. CPU copies of each generated input are staged up front instead.
+#  * ``speedup`` is not reported at all: ``latency_base`` is a CPU measurement and
+#    ``latency`` a CUDA one, so their ratio is not operator parity. Both latencies
+#    are still shown individually, which is the honest form of this comparison.
 HISTDD_BENCH_SHAPES = [
     (1024, 2),
     (4096, 2),
@@ -33,15 +38,32 @@ HISTDD_BENCH_SHAPES = [
 ]
 
 
+# Pre-staged CPU copies of the generated inputs, keyed by storage identity, so the
+# timed baseline call does no host-device traffic.
+_CPU_CACHE = {}
+
+
+def _stage(t):
+    """Remember a CPU copy of ``t`` and return the key used to look it up."""
+    key = (t.data_ptr(), tuple(t.shape), t.dtype)
+    _CPU_CACHE[key] = t.detach().to("cpu")
+    return key
+
+
+def _cpu(t):
+    """Return the pre-staged CPU copy of ``t``, falling back to a fresh copy."""
+    staged = _CPU_CACHE.get((t.data_ptr(), tuple(t.shape), t.dtype))
+    return t.detach().to("cpu") if staged is None else staged
+
+
 def _histogramdd_reference(inp, bins, *, weight=None, density=False):
-    """CPU reference baseline (no native CUDA impl is available)."""
-    inp_cpu = inp.detach().to("cpu")
-    bins_cpu = tuple(b.detach().to("cpu") for b in bins)
-    weight_cpu = weight.detach().to("cpu") if weight is not None else None
-    out = torch._histogramdd_from_bin_tensors(
-        inp_cpu, bins_cpu, weight=weight_cpu, density=density
+    """Native CPU baseline; reads pre-staged CPU tensors so no copies are timed."""
+    return torch._histogramdd_from_bin_tensors(
+        _cpu(inp),
+        tuple(_cpu(b) for b in bins),
+        weight=None if weight is None else _cpu(weight),
+        density=density,
     )
-    return out.to(inp.device)
 
 
 def _histogramdd_input_fn(shape, dtype, device):
@@ -51,16 +73,24 @@ def _histogramdd_input_fn(shape, dtype, device):
     bins = tuple(
         torch.linspace(-3.0, 3.0, 11, dtype=dtype, device=device) for _ in range(D)
     )
+    _stage(inp)
+    for b in bins:
+        _stage(b)
     # Plain histogram (no weights).
     yield (inp, bins, {})
     # Weighted histogram.
     weight = torch.rand(shape[:-1], dtype=dtype, device=device)
+    _stage(weight)
     yield (inp, bins, {"weight": weight})
     # Density histogram.
     yield (inp, bins, {"density": True})
 
 
 class HistogramddBenchmark(base.GenericBenchmark):
+    # No speedup column: the baseline is CPU-only, so the ratio would compare two
+    # different devices. See the module docstring above.
+    DEFAULT_METRICS = ["latency_base", "latency"]
+
     def set_shapes(self, shape_file_path=None):
         # Override the default (gigabyte-scale) shapes with point-cloud sizes
         # that are meaningful for a multi-dimensional histogram.
@@ -87,19 +117,22 @@ def test_histogramdd_from_bin_tensors_out():
         bins = tuple(
             torch.linspace(-3.0, 3.0, 11, dtype=dtype, device=device) for _ in range(D)
         )
+        _stage(inp)
+        for b in bins:
+            _stage(b)
         out = torch.zeros((10,) * D, dtype=dtype, device=device)
         # ``out`` is passed as a keyword argument to the aten .out overload.
         yield (inp, bins, {"out": out})
         weight = torch.rand(shape[:-1], dtype=dtype, device=device)
+        _stage(weight)
         out_w = torch.zeros((10,) * D, dtype=dtype, device=device)
         yield (inp, bins, {"weight": weight, "out": out_w})
 
     def _out_reference(inp, bins, *, weight=None, density=False, out=None):
-        ref = _histogramdd_reference(inp, bins, weight=weight, density=density)
-        if out is not None:
-            out.copy_(ref)
-            return out
-        return ref
+        # Deliberately does not copy back into ``out``: that would be a D2H/H2D
+        # round trip the gems path never performs. The baseline measures the
+        # native kernel only.
+        return _histogramdd_reference(inp, bins, weight=weight, density=density)
 
     bench = HistogramddBenchmark(
         input_fn=_out_input_fn,

@@ -289,3 +289,158 @@ def test_histogramdd_from_bin_tensors_out_weighted(shape, num_bins, dtype):
     # returned tensor shares storage with ``out`` (reshape may return a view).
     assert res_out.data_ptr() == out.data_ptr()
     _assert_weighted_close(res_out, ref_out, dtype, inp.numel() // D)
+
+
+# ---------------------------------------------------------------------------
+# Precision, density edge cases and the full out= contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.histogramdd_from_bin_tensors
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_histogramdd_from_bin_tensors_bin_edge_precision(dtype):
+    """Points exactly on a bin edge, and one ulp either side of it.
+
+    Bin placement compares each coordinate against the edges exactly, so
+    narrowing an fp64 coordinate or edge to fp32 moves points across edges. With
+    the edges of linspace(0, 1, 11) narrowed, the reference counts
+    [3,3,3,3,3,3,3,3,3,4] become [5,3,3,3,1,5,0,6,0,5].
+    """
+    edges = torch.linspace(0.0, 1.0, 11, dtype=dtype)
+    probes = []
+    for v in edges.tolist():
+        t = torch.tensor(v, dtype=dtype)
+        probes += [
+            v,
+            torch.nextafter(t, torch.tensor(-1.0, dtype=dtype)).item(),
+            torch.nextafter(t, torch.tensor(2.0, dtype=dtype)).item(),
+        ]
+    inp = torch.tensor(probes, dtype=dtype, device=flag_gems.device).reshape(-1, 1)
+    bins = (edges.to(flag_gems.device),)
+
+    ref = _ref_histogramdd(inp, bins)
+    res = flag_gems._histogramdd_from_bin_tensors(inp, bins)
+    # Counts are integers; this must agree exactly, not approximately.
+    utils.gems_assert_equal(res.to("cpu"), ref)
+
+
+@pytest.mark.histogramdd_from_bin_tensors
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_histogramdd_from_bin_tensors_density_zero_total(dtype):
+    """density normalisation is applied even when the total weight is zero.
+
+    ATen divides through unconditionally, so an empty or fully out-of-range input
+    yields NaN rather than the unnormalised counts.
+    """
+    bins = tuple(
+        torch.tensor([0.0, 0.5, 1.0], dtype=dtype, device=flag_gems.device)
+        for _ in range(2)
+    )
+
+    # Every point outside the bin range -> total weight 0.
+    inp = torch.tensor([[5.0, 5.0], [6.0, 6.0]], dtype=dtype, device=flag_gems.device)
+    ref = _ref_histogramdd(inp, bins, density=True)
+    res = flag_gems._histogramdd_from_bin_tensors(inp, bins, density=True)
+    assert torch.isnan(ref).all(), "reference should produce NaN here"
+    utils.gems_assert_close(res.to("cpu"), ref, dtype, equal_nan=True)
+
+    # Empty input -> same reasoning.
+    empty = torch.zeros(0, 2, dtype=dtype, device=flag_gems.device)
+    ref_e = _ref_histogramdd(empty, bins, density=True)
+    res_e = flag_gems._histogramdd_from_bin_tensors(empty, bins, density=True)
+    utils.gems_assert_close(res_e.to("cpu"), ref_e, dtype, equal_nan=True)
+
+
+@pytest.mark.histogramdd_from_bin_tensors
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_histogramdd_from_bin_tensors_density_signed_weights(dtype):
+    """Cancelling and net-negative weights keep ATen's infinities and signs."""
+    bins = tuple(
+        torch.tensor([0.0, 0.5, 1.0], dtype=dtype, device=flag_gems.device)
+        for _ in range(2)
+    )
+    inp = torch.tensor(
+        [[0.25, 0.25], [0.75, 0.75]], dtype=dtype, device=flag_gems.device
+    )
+
+    # Weights cancel to a zero total -> infinities, with per-bin signs kept.
+    w_cancel = torch.tensor([1.0, -1.0], dtype=dtype, device=flag_gems.device)
+    ref = _ref_histogramdd(inp, bins, weight=w_cancel, density=True)
+    res = flag_gems._histogramdd_from_bin_tensors(
+        inp, bins, weight=w_cancel, density=True
+    )
+    assert torch.isinf(ref).any(), "reference should produce infinities here"
+    utils.gems_assert_close(res.to("cpu"), ref, dtype, equal_nan=True)
+
+    # Net-negative total: normalisation still applies (skipping it when
+    # total <= 0 would leave the raw counts instead).
+    w_neg = torch.tensor([-1.0, -3.0], dtype=dtype, device=flag_gems.device)
+    ref_n = _ref_histogramdd(inp, bins, weight=w_neg, density=True)
+    res_n = flag_gems._histogramdd_from_bin_tensors(
+        inp, bins, weight=w_neg, density=True
+    )
+    utils.gems_assert_close(res_n.to("cpu"), ref_n, dtype, equal_nan=True)
+
+
+@pytest.mark.histogramdd_from_bin_tensors
+def test_histogramdd_from_bin_tensors_weight_dtype_mismatch():
+    """A weight dtype differing from the input is rejected, as ATen rejects it."""
+    dev = flag_gems.device
+    inp = torch.randn(32, 2, dtype=torch.float32, device=dev)
+    bins = tuple(
+        torch.linspace(-2.0, 2.0, 5, dtype=torch.float32, device=dev) for _ in range(2)
+    )
+    weight = torch.rand(32, dtype=torch.float64, device=dev)
+    with pytest.raises(RuntimeError, match="same dtype"):
+        flag_gems._histogramdd_from_bin_tensors(inp, bins, weight=weight)
+
+
+@pytest.mark.histogramdd_from_bin_tensors_out
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_histogramdd_from_bin_tensors_out_resize(dtype):
+    """A mis-shaped out is resized in place and the caller's object returned."""
+    dev = flag_gems.device
+    inp = torch.randn(256, 2, dtype=dtype, device=dev)
+    bins = tuple(
+        torch.linspace(-2.0, 2.0, 4, dtype=dtype, device=dev) for _ in range(2)
+    )
+    ref = _ref_histogramdd(inp, bins)
+
+    for start_shape in [(0,), (5, 7)]:
+        out = torch.empty(start_shape, dtype=dtype, device=dev)
+        res = flag_gems._histogramdd_from_bin_tensors_out(inp, bins, out=out)
+        assert res is out, "the out tensor itself must be returned"
+        assert tuple(out.shape) == (3, 3)
+        utils.gems_assert_close(out.to("cpu"), ref, dtype)
+
+
+@pytest.mark.histogramdd_from_bin_tensors_out
+def test_histogramdd_from_bin_tensors_out_dtype_mismatch():
+    """A dtype mismatch raises instead of being silently accepted."""
+    dev = flag_gems.device
+    inp = torch.randn(64, 2, dtype=torch.float32, device=dev)
+    bins = tuple(
+        torch.linspace(-2.0, 2.0, 4, dtype=torch.float32, device=dev) for _ in range(2)
+    )
+    out = torch.empty((3, 3), dtype=torch.float64, device=dev)
+    with pytest.raises(RuntimeError, match="dtype"):
+        flag_gems._histogramdd_from_bin_tensors_out(inp, bins, out=out)
+
+
+@pytest.mark.histogramdd_from_bin_tensors_out
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_histogramdd_from_bin_tensors_out_non_contiguous(dtype):
+    """A non-contiguous out of the right shape is accepted, as in ATen."""
+    dev = flag_gems.device
+    inp = torch.randn(256, 2, dtype=dtype, device=dev)
+    bins = tuple(
+        torch.linspace(-2.0, 2.0, 4, dtype=dtype, device=dev) for _ in range(2)
+    )
+    ref = _ref_histogramdd(inp, bins)
+
+    base = torch.empty((3, 6), dtype=dtype, device=dev)
+    out = base[:, ::2]
+    assert not out.is_contiguous()
+    res = flag_gems._histogramdd_from_bin_tensors_out(inp, bins, out=out)
+    assert res is out
+    utils.gems_assert_close(out.to("cpu"), ref, dtype)
