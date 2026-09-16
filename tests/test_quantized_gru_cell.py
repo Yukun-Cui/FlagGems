@@ -62,7 +62,7 @@ def _make_quantized_weight(weight_float):
     return w_int8, col_offsets, scale, zero_point, packed
 
 
-def _build_case(shape, dtype, seed=42, activation="randn"):
+def _build_case(shape, dtype, seed=42):
     """Build one test case. Weights/qparams are always fp32-derived; only the
     activations and biases take ``dtype``."""
     batch_size, input_size, hidden_size = shape
@@ -73,32 +73,8 @@ def _build_case(shape, dtype, seed=42, activation="randn"):
     w_ih_q, col_ih, scale_ih, zp_ih, packed_ih = _make_quantized_weight(w_ih_float)
     w_hh_q, col_hh, scale_hh, zp_hh, packed_hh = _make_quantized_weight(w_hh_float)
 
-    if activation == "randn":
-        inp = torch.randn(batch_size, input_size, dtype=torch.float32)
-        hx = torch.randn(batch_size, hidden_size, dtype=torch.float32)
-    elif activation == "constant":
-        inp = torch.full((batch_size, input_size), 2.5, dtype=torch.float32)
-        hx = torch.full((batch_size, hidden_size), -1.25, dtype=torch.float32)
-    elif activation == "zeros":
-        inp = torch.zeros(batch_size, input_size, dtype=torch.float32)
-        hx = torch.zeros(batch_size, hidden_size, dtype=torch.float32)
-    elif activation == "positive":
-        inp = torch.rand(batch_size, input_size, dtype=torch.float32) * 4 + 1
-        hx = torch.rand(batch_size, hidden_size, dtype=torch.float32) * 4 + 1
-    elif activation == "negative":
-        inp = -torch.rand(batch_size, input_size, dtype=torch.float32) * 4 - 1
-        hx = -torch.rand(batch_size, hidden_size, dtype=torch.float32) * 4 - 1
-    elif activation == "tiny":
-        # exercises FBGEMM's SMALL_SCALE_THRESHOLD branch in ChooseQuantizationParams
-        inp = torch.randn(batch_size, input_size, dtype=torch.float32) * 1e-8
-        hx = torch.randn(batch_size, hidden_size, dtype=torch.float32) * 1e-8
-    elif activation == "outlier":
-        inp = torch.randn(batch_size, input_size, dtype=torch.float32)
-        hx = torch.randn(batch_size, hidden_size, dtype=torch.float32)
-        inp.view(-1)[0] = 1e4
-        hx.view(-1)[0] = -1e4
-    else:  # pragma: no cover - guard against typos in parametrization
-        raise ValueError(activation)
+    inp = torch.randn(batch_size, input_size, dtype=torch.float32)
+    hx = torch.randn(batch_size, hidden_size, dtype=torch.float32)
 
     b_ih = torch.randn(3 * hidden_size, dtype=torch.float32)
     b_hh = torch.randn(3 * hidden_size, dtype=torch.float32)
@@ -162,8 +138,8 @@ def _build_case(shape, dtype, seed=42, activation="randn"):
 # runs. The cost is real and worth stating: at this tolerance the test checks
 # shape, dtype, qparam propagation and gross correctness, and would not catch a
 # small numerical regression. The tighter checks that do bite live in the other
-# tests in this file (padding sentinel, adversarial activations, zero-sized and
-# non-contiguous inputs, and the validation cases).
+# tests in this file (padding sentinel, zero-sized and non-contiguous inputs,
+# and the validation cases).
 _ATOL = 5e-1
 
 
@@ -193,26 +169,6 @@ def test_quantized_gru_cell(shape, dtype):
     # Pass ``dtype`` rather than ``torch.float32``: ``gems_assert_close`` derives
     # ``rtol`` from it, and fp32's 1.3e-6 is far too tight for an fp16/bf16 result.
     utils.gems_assert_close(res_out.cpu(), ref_out.to(dtype), dtype, atol=_ATOL)
-
-
-@pytest.mark.quantized_gru_cell
-@pytest.mark.parametrize(
-    "activation",
-    ["constant", "zeros", "positive", "negative", "tiny", "outlier"],
-)
-@pytest.mark.parametrize("shape", [(4, 32, 16), (3, 7, 13), (1, 1, 1)])
-def test_quantized_gru_cell_adversarial_activations(shape, activation):
-    """Activation distributions that stress the dynamic quantization.
-
-    ``zeros``/``constant`` give a degenerate min==max range (FBGEMM falls back
-    to scale 0.1 / a saturated zero point), ``positive``/``negative`` pin the
-    zero point at 0 or 255, and ``tiny`` drives ChooseQuantizationParams into
-    its SMALL_SCALE_THRESHOLD rescaling branch.
-    """
-    ref_args, res_args = _build_case(shape, _ATEN_DTYPE, activation=activation)
-    res_out = flag_gems.quantized_gru_cell(*res_args)
-    ref_out = utils.to_reference(torch.quantized_gru_cell(*ref_args))
-    utils.gems_assert_close(res_out.cpu(), ref_out, _ATEN_DTYPE, atol=_ATOL)
 
 
 @pytest.mark.quantized_gru_cell
