@@ -24,6 +24,12 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
+_QUANT_TO_INT_DTYPE = {
+    torch.quint8: torch.uint8,
+    torch.qint8: torch.int8,
+    torch.qint32: torch.int32,
+}
+
 
 def max_pool1d_output_size(in_size, kernel_size, stride, padding, dilation, ceil_mode):
     effective_kernel_size = (kernel_size - 1) * dilation + 1
@@ -38,45 +44,129 @@ def max_pool1d_output_size(in_size, kernel_size, stride, padding, dilation, ceil
 
 
 def _parse_params(kernel_size, stride, padding, dilation):
-    def _parse(param, name, default):
+    """Normalise the int[1] arguments, mirroring aten's max_pool1d checks.
+
+    aten validates every argument's *length* first and only then their values,
+    so the ordering here is load bearing: it decides which message a call with
+    two bad arguments reports.
+    """
+
+    def _length_check(param, name, message):
+        if param is None or isinstance(param, int):
+            return
+        if not isinstance(param, (list, tuple)):
+            raise RuntimeError(f"max_pool1d() {name} must be an int or a list of ints")
+        if len(param) != 1:
+            raise RuntimeError(message.format(size=len(param)))
+
+    _length_check(
+        kernel_size,
+        "kernel_size",
+        "max_pool1d() kernel_size must be an int, list of ints or tuple of ints "
+        "of size 1 but got size {size}",
+    )
+    if not (stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0)):
+        _length_check(
+            stride,
+            "stride",
+            "max_pool1d() stride must be None, an int, list of ints, or tuple of "
+            "ints of size 1 but got size {size}",
+        )
+    _length_check(
+        padding,
+        "padding",
+        "max_pool1d() padding must be an int, list of ints, or tuple of ints of "
+        "size 1 but got size {size}",
+    )
+    _length_check(
+        dilation,
+        "dilation",
+        "max_pool1d() dilation must be an int, list of ints or tuple of ints of "
+        "size 1 but got size {size}",
+    )
+
+    def _value(param, default):
         if param is None:
             return default
         if isinstance(param, int):
             return param
-        if isinstance(param, (list, tuple)) and len(param) == 0:
+        if len(param) == 0:
             return default
-        if isinstance(param, (list, tuple)) and len(param) == 1:
-            return param[0]
-        raise ValueError(f"Invalid {name}: {param}")
+        return param[0]
 
-    kernel_size = _parse(kernel_size, "kernel_size", None)
-    stride = _parse(stride, "stride", kernel_size)
-    padding = _parse(padding, "padding", 0)
-    dilation = _parse(dilation, "dilation", 1)
+    kernel_size = _value(kernel_size, None)
+    stride = _value(stride, kernel_size)
+    padding = _value(padding, 0)
+    dilation = _value(dilation, 1)
 
+    if kernel_size <= 0:
+        raise RuntimeError(
+            f"max_pool1d() kernel_size must be greater than zero, but got {kernel_size}"
+        )
     if stride <= 0:
-        raise ValueError(f"stride must be positive, but got stride={stride}")
+        raise RuntimeError(
+            f"max_pool1d() stride must be greater than zero, but got {stride}"
+        )
     if padding < 0:
-        raise ValueError(f"padding must be non-negative, but got padding={padding}")
+        raise RuntimeError(
+            f"max_pool1d() padding must be non-negative, but got {padding}"
+        )
     if padding > kernel_size // 2:
-        raise ValueError(
-            f"padding must be <= kernel_size / 2, but got padding={padding}, "
-            f"kernel_size={kernel_size}"
+        raise RuntimeError(
+            "max_pool1d() padding should be at most half of kernel size, but got "
+            f"padding={padding} and kernel_size={kernel_size}"
         )
     if dilation <= 0:
-        raise ValueError(f"dilation must be positive, but got dilation={dilation}")
+        raise RuntimeError(
+            f"max_pool1d() dilation must be greater than zero, but got {dilation}"
+        )
 
     return kernel_size, stride, padding, dilation
 
 
 def _int_dtype_for(qdtype):
-    if qdtype == torch.quint8:
-        return torch.uint8
-    if qdtype == torch.qint8:
-        return torch.int8
-    if qdtype == torch.qint32:
-        return torch.int32
-    raise ValueError(f"Unsupported quantized dtype: {qdtype}")
+    try:
+        return _QUANT_TO_INT_DTYPE[qdtype]
+    except KeyError:
+        raise ValueError(f"Unsupported quantized dtype: {qdtype}") from None
+
+
+def _neutral_for(int_dtype):
+    """Padding fill value for max: the minimum of the underlying integer dtype.
+
+    aten pads with ``std::numeric_limits<T>::lowest()`` of the *underlying*
+    integer type, so quint8 pads with 0, qint8 with -128 and qint32 with
+    -2147483648. Using -128 for qint32 loses to any real value below -128.
+    """
+    return torch.iinfo(int_dtype).min
+
+
+def _check_input(input):
+    if input.dtype not in _QUANT_TO_INT_DTYPE:
+        raise ValueError(
+            f"quantized_max_pool1d expects a quantized tensor, but got {input.dtype}"
+        )
+    if input.dim() not in (2, 3):
+        raise RuntimeError(
+            "max_pool1d() Expected 2D or 3D input tensor, but got "
+            f"{list(input.shape)}"
+        )
+    if input.qscheme() != torch.per_tensor_affine:
+        raise RuntimeError(
+            "Expected quantizer->qscheme() == kPerTensorAffine to be true, but got "
+            "false."
+        )
+
+
+def _check_shapes(input, out_l):
+    """aten checks the computed output size before rejecting zero-sized dims."""
+    if out_l <= 0:
+        raise RuntimeError(f"max_pool1d() Invalid computed output size: {out_l}")
+    # aten normalises a 2D (C, L) input to (1, C, L), so the batch dimension of
+    # a 3D input may be zero but C and L may not.
+    non_batch = input.shape if input.dim() == 2 else input.shape[1:]
+    if any(size == 0 for size in non_batch):
+        raise RuntimeError("input dimensions must be non-zero.")
 
 
 @libentry()
@@ -88,35 +178,38 @@ def _int_dtype_for(qdtype):
 def quantized_max_pool1d_forward_kernel(
     in_ptr,
     out_ptr,
-    nc,
+    n,
+    c,
     in_l,
     out_l,
-    in_stride_nc,
+    in_stride_n,
+    in_stride_c,
     in_stride_l,
-    out_stride_nc,
+    out_stride_n,
+    out_stride_c,
+    out_stride_l,
     kernel_size: tl.constexpr,
     stride: tl.constexpr,
     padding: tl.constexpr,
     dilation: tl.constexpr,
-    is_unsigned: tl.constexpr,
+    neutral: tl.constexpr,
     BLOCK_L: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    nc_idx = pid // tl.cdiv(out_l, BLOCK_L)
-    l_block_idx = pid % tl.cdiv(out_l, BLOCK_L)
+    num_l_blocks = tl.cdiv(out_l, BLOCK_L)
+    nc_idx = pid // num_l_blocks
+    l_block_idx = pid % num_l_blocks
+    n_idx = nc_idx // c
+    c_idx = nc_idx % c
 
     l_out_offsets = l_block_idx * BLOCK_L + tl.arange(0, BLOCK_L)
     out_mask = l_out_offsets < out_l
 
-    # Neutral element for max: the smallest representable value of the
-    # underlying integer dtype (0 for unsigned, -128 for int8, ...).
-    if is_unsigned:
-        neutral: tl.constexpr = 0
-    else:
-        neutral: tl.constexpr = -128
+    # Neutral element for max: the minimum of the underlying integer dtype, so
+    # that padding never wins against a real value.
     max_acc = tl.full((BLOCK_L,), neutral, dtype=in_ptr.type.element_ty)
 
-    in_base = nc_idx * in_stride_nc
+    in_base = n_idx * in_stride_n + c_idx * in_stride_c
     for k in tl.static_range(0, kernel_size):
         l_in = l_out_offsets * stride - padding + k * dilation
         in_mask = (l_in >= 0) & (l_in < in_l) & out_mask
@@ -125,39 +218,150 @@ def quantized_max_pool1d_forward_kernel(
         )
         max_acc = tl.maximum(max_acc, current)
 
-    out_base = nc_idx * out_stride_nc
-    tl.store(out_ptr + out_base + l_out_offsets, max_acc, mask=out_mask)
+    out_base = n_idx * out_stride_n + c_idx * out_stride_c
+    tl.store(out_ptr + out_base + l_out_offsets * out_stride_l, max_acc, mask=out_mask)
+
+
+def _nc_strides(tensor):
+    """Return (n, c, stride_n, stride_c) treating 2D as a single channel axis."""
+    if tensor.dim() == 2:
+        return tensor.shape[0], 1, tensor.stride(0), 0
+    return tensor.shape[0], tensor.shape[1], tensor.stride(0), tensor.stride(1)
 
 
 def _run_kernel(int_repr, out_int_repr, kernel_size, stride, padding, dilation):
     in_l = int_repr.shape[-1]
     out_l = out_int_repr.shape[-1]
-    nc = int_repr.numel() // in_l
 
-    in_stride_nc = int_repr.stride(0) if int_repr.dim() == 2 else int_repr.stride(1)
-    in_stride_l = int_repr.stride(-1)
-    out_stride_nc = (
-        out_int_repr.stride(0) if out_int_repr.dim() == 2 else out_int_repr.stride(1)
-    )
+    n, c, in_stride_n, in_stride_c = _nc_strides(int_repr)
+    _, _, out_stride_n, out_stride_c = _nc_strides(out_int_repr)
 
-    is_unsigned = int_repr.dtype == torch.uint8
-
-    grid = lambda meta: (nc * triton.cdiv(out_l, meta["BLOCK_L"]),)
+    grid = lambda meta: (n * c * triton.cdiv(out_l, meta["BLOCK_L"]),)
     quantized_max_pool1d_forward_kernel[grid](
         int_repr,
         out_int_repr,
-        nc,
+        n,
+        c,
         in_l,
         out_l,
-        in_stride_nc,
-        in_stride_l,
-        out_stride_nc,
+        in_stride_n,
+        in_stride_c,
+        int_repr.stride(-1),
+        out_stride_n,
+        out_stride_c,
+        out_int_repr.stride(-1),
         kernel_size,
         stride,
         padding,
         dilation,
-        is_unsigned,
+        _neutral_for(int_repr.dtype),
     )
+
+
+def _contiguous_strides(shape):
+    strides = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        strides[i] = strides[i + 1] * shape[i + 1]
+    return tuple(strides)
+
+
+def _int_view_of(qtensor):
+    """An integer tensor aliasing ``qtensor``'s exact layout.
+
+    ``Tensor.int_repr()`` allocates a fresh contiguous copy, so writing to it
+    would not touch the quantized tensor at all. ``set_`` on an integer tensor
+    of the matching width gives a real view that honours ``qtensor``'s strides
+    and storage offset.
+    """
+    return torch.empty(
+        (), dtype=_int_dtype_for(qtensor.dtype), device=qtensor.device
+    ).set_(
+        qtensor.untyped_storage(),
+        qtensor.storage_offset(),
+        tuple(qtensor.shape),
+        qtensor.stride(),
+    )
+
+
+def _resize_out(out, out_shape):
+    """Resize ``out`` in place the way aten's out= wrapper does.
+
+    ``Tensor.resize_`` has no QuantizedCUDA kernel, so the resize is done with
+    ``set_``: sizes become ``out_shape``, strides become contiguous, and the
+    storage offset is preserved (growing the storage only when the new extent
+    no longer fits).
+    """
+    if tuple(out.shape) == tuple(out_shape):
+        return
+    numel = 1
+    for size in out_shape:
+        numel *= size
+    offset = out.storage_offset()
+    storage = out.untyped_storage()
+    needed = (offset + numel) * out.element_size()
+    if storage.nbytes() < needed:
+        storage = torch.empty(
+            needed, dtype=torch.uint8, device=out.device
+        ).untyped_storage()
+    out.set_(storage, offset, tuple(out_shape), _contiguous_strides(tuple(out_shape)))
+
+
+def _sync_out_quantizer(out, scale, zero_point):
+    """Give ``out`` the result's quantization parameters, as aten's out= does.
+
+    A quantized tensor's scale/zero-point live in its quantizer, which cannot be
+    reassigned from Python. Copying from a same-storage, same-layout alias that
+    carries the target quantizer moves the parameters over without disturbing
+    the bytes (or the neighbours of a view).
+    """
+    if out.q_scale() == scale and out.q_zero_point() == zero_point:
+        return
+    alias = torch._empty_affine_quantized(
+        (0,), scale=scale, zero_point=zero_point, dtype=out.dtype, device=out.device
+    )
+    alias.set_(
+        out.untyped_storage(),
+        out.storage_offset(),
+        tuple(out.shape),
+        out.stride(),
+    )
+    out.copy_(alias)
+
+
+def _may_overlap(input, out):
+    """True when ``out`` could share bytes with ``input``."""
+    return input.untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
+
+
+def _check_out(input, out):
+    if not isinstance(out, torch.Tensor):
+        raise RuntimeError(f"Expected out to be a Tensor, but got {type(out)}")
+    if out.device != input.device:
+        raise RuntimeError(
+            f"Expected out tensor to have device {input.device}, but got "
+            f"{out.device} instead"
+        )
+    if out.dtype != input.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {input.dtype}, but got {out.dtype} "
+            "instead"
+        )
+    if out.qscheme() != torch.per_tensor_affine:
+        raise RuntimeError("Quantized Copy only works with same qscheme")
+
+
+def _plan(input, kernel_size, stride, padding, dilation, ceil_mode):
+    _check_input(input)
+    kernel_size, stride, padding, dilation = _parse_params(
+        kernel_size, stride, padding, dilation
+    )
+    in_l = input.shape[-1]
+    out_l = max_pool1d_output_size(
+        in_l, kernel_size, stride, padding, dilation, ceil_mode
+    )
+    _check_shapes(input, out_l)
+    out_shape = tuple(input.shape[:-1]) + (out_l,)
+    return out_shape, kernel_size, stride, padding, dilation
 
 
 def quantized_max_pool1d(
@@ -168,40 +372,21 @@ def quantized_max_pool1d(
     dilation=[1],
     ceil_mode=False,
 ):
-    logger.debug("GEMS QUANTIZED_MAX_POOL1D FORWARD")
+    logger.debug("GEMS QUANTIZED_MAX_POOL1D")
 
-    if input.dtype not in (torch.quint8, torch.qint8, torch.qint32):
-        raise ValueError(
-            f"quantized_max_pool1d expects a quantized tensor, but got {input.dtype}"
-        )
-
-    if input.dim() not in (2, 3):
-        raise ValueError(
-            f"quantized_max_pool1d expects a 2D or 3D input, but got {input.dim()}D"
-        )
+    out_shape, kernel_size, stride, padding, dilation = _plan(
+        input, kernel_size, stride, padding, dilation, ceil_mode
+    )
 
     int_dtype = _int_dtype_for(input.dtype)
-    int_repr = input.int_repr().to(input.device).contiguous()
-    scale = float(input.q_scale())
-    zero_point = int(input.q_zero_point())
-
-    kernel_size, stride, padding, dilation = _parse_params(
-        kernel_size, stride, padding, dilation
-    )
-
-    in_l = int_repr.shape[-1]
-    out_l = max_pool1d_output_size(
-        in_l, kernel_size, stride, padding, dilation, ceil_mode
-    )
-
-    out_shape = int_repr.shape[:-1] + (out_l,)
+    int_repr = input.int_repr().contiguous()
     out_int_repr = torch.empty(out_shape, dtype=int_dtype, device=int_repr.device)
 
     if out_int_repr.numel() > 0:
         _run_kernel(int_repr, out_int_repr, kernel_size, stride, padding, dilation)
 
     return torch._make_per_tensor_quantized_tensor(
-        out_int_repr, scale=scale, zero_point=zero_point
+        out_int_repr, scale=float(input.q_scale()), zero_point=int(input.q_zero_point())
     )
 
 
@@ -215,46 +400,41 @@ def quantized_max_pool1d_out(
     *,
     out=None,
 ):
-    logger.debug("GEMS QUANTIZED_MAX_POOL1D FORWARD OUT")
+    logger.debug("GEMS QUANTIZED_MAX_POOL1D_OUT")
 
     if out is None:
         return quantized_max_pool1d(
             input, kernel_size, stride, padding, dilation, ceil_mode
         )
 
-    if input.dtype not in (torch.quint8, torch.qint8, torch.qint32):
-        raise ValueError(
-            f"quantized_max_pool1d expects a quantized tensor, but got {input.dtype}"
+    out_shape, kernel_size, stride, padding, dilation = _plan(
+        input, kernel_size, stride, padding, dilation, ceil_mode
+    )
+    _check_out(input, out)
+
+    scale = float(input.q_scale())
+    zero_point = int(input.q_zero_point())
+
+    _resize_out(out, out_shape)
+    _sync_out_quantizer(out, scale, zero_point)
+
+    if out.numel() == 0:
+        return out
+
+    int_repr = input.int_repr().contiguous()
+    # A view over out's own storage, honouring its strides and storage offset,
+    # so writing the result cannot clobber the neighbours of a strided out.
+    out_int_view = _int_view_of(out)
+
+    if _may_overlap(input, out):
+        # aten tolerates an out that aliases the input; a kernel writing and
+        # reading the same bytes concurrently would not, so stage the result.
+        staged = torch.empty(
+            out_shape, dtype=out_int_view.dtype, device=out_int_view.device
         )
-
-    if input.dim() not in (2, 3):
-        raise ValueError(
-            f"quantized_max_pool1d expects a 2D or 3D input, but got {input.dim()}D"
-        )
-
-    int_dtype = _int_dtype_for(input.dtype)
-    int_repr = input.int_repr().to(input.device).contiguous()
-
-    kernel_size, stride, padding, dilation = _parse_params(
-        kernel_size, stride, padding, dilation
-    )
-
-    in_l = int_repr.shape[-1]
-    out_l = max_pool1d_output_size(
-        in_l, kernel_size, stride, padding, dilation, ceil_mode
-    )
-
-    out_shape = int_repr.shape[:-1] + (out_l,)
-    # Write the pooled integer values directly into ``out``'s underlying
-    # storage so the returned quantized tensor reflects the result.
-    contiguous_strides = torch.empty(
-        out_shape, dtype=int_dtype, device=out.device
-    ).stride()
-    out_int_view = torch.empty((), dtype=int_dtype, device=out.device).set_(
-        out.untyped_storage(), 0, out_shape, contiguous_strides
-    )
-
-    if out_int_view.numel() > 0:
+        _run_kernel(int_repr, staged, kernel_size, stride, padding, dilation)
+        out_int_view.copy_(staged)
+    else:
         _run_kernel(int_repr, out_int_view, kernel_size, stride, padding, dilation)
 
     return out

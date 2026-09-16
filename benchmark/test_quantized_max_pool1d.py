@@ -33,6 +33,14 @@ QUANT_POOL_SHAPES = [
     (16, 8, 2048),
 ]
 
+POOL_PARAMS = {
+    "kernel_size": 3,
+    "stride": 2,
+    "padding": 1,
+    "dilation": 1,
+    "ceil_mode": False,
+}
+
 
 def _make_quantized(shape, device):
     fp_tensor = torch.randn(shape, device="cpu").clamp_(-2, 2)
@@ -41,75 +49,71 @@ def _make_quantized(shape, device):
     ).to(device)
 
 
-def _torch_baseline(q_tensor, kernel_size, stride, padding, dilation, ceil_mode):
-    # The native quantized_max_pool1d has no CUDA kernel, so the baseline
-    # dequantizes, runs a plain max_pool1d on fp32, and requantizes back.
-    # This keeps the comparison fair and fully on-device.
-    fp = q_tensor.dequantize()
-    pooled = torch.nn.functional.max_pool1d(
-        fp,
-        kernel_size=kernel_size,
-        stride=stride,
-        padding=padding,
-        dilation=dilation,
-        ceil_mode=ceil_mode,
+def _out_length(in_l, params):
+    effective = (params["kernel_size"] - 1) * params["dilation"] + 1
+    return (in_l + 2 * params["padding"] - effective) // params["stride"] + 1
+
+
+def torch_quantized_max_pool1d(
+    q_tensor, kernel_size, stride, padding, dilation, ceil_mode
+):
+    """Baseline: the aten quantized op itself, which only has a CPU kernel.
+
+    Dequantize + fp32 max_pool1d + requantize would time a different
+    computation (two elementwise passes plus a float pool) instead of the
+    integer pooling the operator performs, so the honest reference is the same
+    op on CPU even though it makes the comparison cross-device.
+    """
+    return torch.ops.aten.quantized_max_pool1d.default(
+        q_tensor.cpu(),
+        [kernel_size],
+        [stride],
+        [padding],
+        [dilation],
+        ceil_mode,
     )
-    return torch.quantize_per_tensor(
-        pooled,
-        scale=float(q_tensor.q_scale()),
-        zero_point=int(q_tensor.q_zero_point()),
-        dtype=q_tensor.dtype,
+
+
+def torch_quantized_max_pool1d_out(
+    q_tensor, kernel_size, stride, padding, dilation, ceil_mode, *, out
+):
+    return torch.ops.aten.quantized_max_pool1d.out(
+        q_tensor.cpu(),
+        [kernel_size],
+        [stride],
+        [padding],
+        [dilation],
+        ceil_mode,
+        out=out.cpu(),
     )
 
 
 class QuantizedMaxPool1dBenchmark(base.GenericBenchmark):
+    # The aten reference is CPU-only, so keep to the hand-picked shapes above
+    # rather than letting core_shapes.yaml inject huge ones.
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = QUANT_POOL_SHAPES
+
+    def set_more_shapes(self):
+        return []
+
     def get_input_iter(self, dtype) -> Generator:
-        for shape in QUANT_POOL_SHAPES:
-            q_tensor = _make_quantized(shape, self.device)
-            yield q_tensor, {
-                "kernel_size": 3,
-                "stride": 2,
-                "padding": 1,
-                "dilation": 1,
-                "ceil_mode": False,
-            }
+        for shape in self.shapes:
+            yield _make_quantized(shape, self.device), dict(POOL_PARAMS)
 
 
-class QuantizedMaxPool1dOutBenchmark(base.GenericBenchmark):
+class QuantizedMaxPool1dOutBenchmark(QuantizedMaxPool1dBenchmark):
     def get_input_iter(self, dtype) -> Generator:
-        for shape in QUANT_POOL_SHAPES:
+        for shape in self.shapes:
             q_tensor = _make_quantized(shape, self.device)
-            params = {
-                "kernel_size": 3,
-                "stride": 2,
-                "padding": 1,
-                "dilation": 1,
-                "ceil_mode": False,
-            }
-            in_l = q_tensor.shape[-1]
-            ks, st, pd, dl = (
-                params["kernel_size"],
-                params["stride"],
-                params["padding"],
-                params["dilation"],
-            )
-            out_l = (in_l + 2 * pd - (ks - 1) * dl - 1) // st + 1
-            out_shape = q_tensor.shape[:-1] + (out_l,)
+            out_shape = shape[:-1] + (_out_length(shape[-1], POOL_PARAMS),)
             out = torch.quantize_per_tensor(
                 torch.zeros(out_shape),
                 scale=float(q_tensor.q_scale()),
                 zero_point=int(q_tensor.q_zero_point()),
                 dtype=q_tensor.dtype,
             ).to(self.device)
-            yield q_tensor, {**params, "out": out}
-
-
-def _torch_out(q_tensor, kernel_size, stride, padding, dilation, ceil_mode, *, out):
-    result = _torch_baseline(
-        q_tensor, kernel_size, stride, padding, dilation, ceil_mode
-    )
-    out.int_repr().copy_(result.int_repr())
-    return out
+            yield q_tensor, {**POOL_PARAMS, "out": out}
 
 
 @pytest.mark.quantized_max_pool1d
@@ -117,7 +121,7 @@ def test_quantized_max_pool1d():
     bench = QuantizedMaxPool1dBenchmark(
         op_name="quantized_max_pool1d",
         input_fn=None,
-        torch_op=_torch_baseline,
+        torch_op=torch_quantized_max_pool1d,
         dtypes=[torch.quint8],
     )
     bench.set_gems(flag_gems.quantized_max_pool1d)
@@ -129,7 +133,7 @@ def test_quantized_max_pool1d_out():
     bench = QuantizedMaxPool1dOutBenchmark(
         op_name="quantized_max_pool1d_out",
         input_fn=None,
-        torch_op=_torch_out,
+        torch_op=torch_quantized_max_pool1d_out,
         dtypes=[torch.quint8],
     )
     bench.set_gems(flag_gems.quantized_max_pool1d_out)
