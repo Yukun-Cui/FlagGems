@@ -20,8 +20,42 @@ import triton
 import triton.language as tl
 
 from flag_gems.utils import libentry
+from flag_gems.utils.shape_utils import MemOverlap, has_internal_overlapping
 
 logger = logging.getLogger(__name__)
+
+_FALLBACK_KEYSET = torch._C.DispatchKeySet(
+    torch._C.DispatchKey.CompositeExplicitAutograd
+)
+_INT32_MAX = torch.iinfo(torch.int32).max
+
+# BLOCK_SIZE 512 balances bandwidth saturation on large tensors against
+# avoiding wasted work on small ones.
+_BLOCK_SIZE = 512
+
+# C++ ``TypeMeta`` spellings, as printed by ATen's out= dtype check
+# ("Expected out tensor to have dtype double, but got c10::Half instead").
+_CPP_DTYPE_NAMES = {
+    torch.float16: "c10::Half",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.bfloat16: "c10::BFloat16",
+    torch.bool: "bool",
+    torch.uint8: "unsigned char",
+    torch.int8: "signed char",
+    torch.int16: "short int",
+    torch.int32: "int",
+    torch.int64: "long int",
+    torch.complex32: "c10::complex<c10::Half>",
+    torch.complex64: "c10::complex<float>",
+    torch.complex128: "c10::complex<double>",
+    torch.float8_e4m3fn: "c10::Float8_e4m3fn",
+    torch.float8_e5m2: "c10::Float8_e5m2",
+}
+
+# Triton has no scalar type for these, so they are copied through a bitwise
+# reinterpretation of the same storage (see ``_reinterpret_for_triton``).
+_BYTEWISE_DTYPES = (torch.bool, torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 @libentry()
@@ -36,8 +70,11 @@ def slice_copy_kernel(
     start,
     step,
     BLOCK_SIZE: tl.constexpr,
+    INT64_INDEX: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    if INT64_INDEX:
+        pid = pid.to(tl.int64)
 
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
@@ -59,8 +96,7 @@ def slice_copy_kernel(
 # Fast path for slicing the trailing dimension (``inner == 1``). With no inner
 # axis the index math collapses to a single division: ``outer_idx = offsets //
 # slice_len`` and ``slice_idx = offsets % slice_len`` (the inner modulo and the
-# multiply by ``inner`` both drop out). This is the shape exercised by the
-# standard benchmark, which slices a 2-D tensor along dim 1 with step > 1.
+# multiply by ``inner`` both drop out).
 @libentry()
 @triton.jit
 def slice_copy_kernel_inner1(
@@ -72,8 +108,11 @@ def slice_copy_kernel_inner1(
     start,
     step,
     BLOCK_SIZE: tl.constexpr,
+    INT64_INDEX: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    if INT64_INDEX:
+        pid = pid.to(tl.int64)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
 
@@ -103,8 +142,11 @@ def slice_copy_kernel_step1(
     dim_size,
     start,
     BLOCK_SIZE: tl.constexpr,
+    INT64_INDEX: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    if INT64_INDEX:
+        pid = pid.to(tl.int64)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
 
@@ -119,7 +161,11 @@ def slice_copy_kernel_step1(
     tl.store(out_ptr + offsets, val, mask=mask)
 
 
-def _resolve_slice_bounds(dim_size, start, end, step):
+def _dtype_name(dtype: torch.dtype) -> str:
+    return _CPP_DTYPE_NAMES.get(dtype, str(dtype).replace("torch.", ""))
+
+
+def _resolve_slice_bounds(dim_size, start, end):
     # step must be positive (validated by the caller)
     if start is None:
         start = 0
@@ -134,58 +180,69 @@ def _resolve_slice_bounds(dim_size, start, end, step):
     return start, end
 
 
-def _slice_copy_impl(inp, dim, start, end, step, out):
-    if step <= 0:
-        # PyTorch only supports positive step for slice_copy.
-        raise RuntimeError("slice step must be positive")
+def _native_copy_(out: torch.Tensor, src: torch.Tensor):
+    # Call native copy_ directly so the strided scatter (and ATen's
+    # self-overlap diagnostic) does not re-enter FlagGems copy kernels.
+    return torch.ops.aten.copy_.default.redispatch(_FALLBACK_KEYSET, out, src, False)
 
-    ndim = inp.ndim
-    if dim < 0:
-        dim += ndim
-    if dim < 0 or dim >= ndim:
-        raise RuntimeError(
-            f"Dimension out of range (expected to be in range of "
-            f"[{-ndim}, {ndim - 1}], but got {dim})"
-        )
 
-    dim_size = inp.size(dim)
-    start, end = _resolve_slice_bounds(dim_size, start, end, step)
-    slice_len = max(0, (end - start + step - 1) // step)
+def _slice_view(inp, dim, start, slice_len, step):
+    """Build the aliasing ``aten::slice`` view without going through dispatch."""
+    sizes = list(inp.shape)
+    sizes[dim] = slice_len
+    strides = list(inp.stride())
+    strides[dim] = strides[dim] * step
+    offset = inp.storage_offset() + start * inp.stride(dim)
+    return inp.as_strided(sizes, strides, offset)
 
-    if out is None:
-        out_shape = list(inp.shape)
-        out_shape[dim] = slice_len
-        out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
-    else:
-        if out.dtype != inp.dtype:
-            raise RuntimeError(
-                "slice_copy expected out tensor to have the same dtype as input"
-            )
-        target_shape = list(inp.shape)
-        target_shape[dim] = slice_len
-        if list(out.shape) != target_shape:
-            out.resize_(target_shape)
 
-    if out.numel() == 0:
-        return out
+def _reinterpret_for_triton(inp, out, inner):
+    """Bitcast ``inp``/``out`` to a dtype Triton can load and store.
 
+    Triton exposes no complex scalar type, so a complex tensor is copied through
+    ``view_as_real``: every complex scalar becomes two adjacent real scalars, so
+    the flat-index mapping is unchanged apart from ``inner`` doubling. ``bool``
+    and the float8 dtypes are copied through ``uint8`` for the same reason. All
+    three are pure bit-for-bit reinterpretations of the same storage, so NaN
+    payloads and signalling bits survive unchanged.
+    """
+    if inp.is_complex():
+        return torch.view_as_real(inp), torch.view_as_real(out), inner * 2
+    if inp.dtype in _BYTEWISE_DTYPES:
+        return inp.view(torch.uint8), out.view(torch.uint8), inner
+    return inp, out, inner
+
+
+def _launch_slice_copy(inp, out, dim, start, slice_len, step):
+    """Gather ``inp[..., start:start + slice_len * step:step, ...]`` into ``out``.
+
+    ``out`` must be contiguous, of the sliced shape, and must not alias ``inp``.
+    """
+    # ``view_as_real`` and ``Tensor.view(dtype)`` reject tensors that still carry
+    # a lazy conjugate/negative bit, and the raw bytes behind such a tensor are
+    # the un-negated/un-conjugated ones, so materialize them first. ATen's
+    # slice_copy likewise returns a resolved (is_conj/is_neg == False) result.
+    inp = inp.resolve_conj().resolve_neg()
     # Work on a contiguous view of the input so the simple flat-index mapping holds.
     inp = inp.contiguous()
 
     inner = 1
     for d in range(dim + 1, inp.ndim):
         inner *= inp.size(d)
+    dim_size = inp.size(dim)
+
+    inp, out, inner = _reinterpret_for_triton(inp, out, inner)
 
     numel = out.numel()
+    # Flat offsets are computed from the *input* extent, which can exceed the
+    # int32 range even when the slice itself is small.
+    int64_index = max(numel, inp.numel()) > _INT32_MAX
 
-    # BLOCK_SIZE 512 balances bandwidth saturation on large tensors against
-    # avoiding wasted work on small ones.
-    BLOCK_SIZE = 512
-    grid = (triton.cdiv(numel, BLOCK_SIZE),)
+    grid = (triton.cdiv(numel, _BLOCK_SIZE),)
 
     if inner == 1:
         # Trailing-dim slice (incl. step > 1): one integer division instead of
-        # three. This is the benchmark's common case (2-D tensor, dim=1).
+        # three.
         slice_copy_kernel_inner1[grid](
             inp,
             out,
@@ -194,7 +251,8 @@ def _slice_copy_impl(inp, dim, start, end, step, out):
             dim_size,
             start,
             step,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=_BLOCK_SIZE,
+            INT64_INDEX=int64_index,
         )
     elif step == 1:
         # The contiguous-slice fast path: the input dim index is ``start + i``,
@@ -208,7 +266,8 @@ def _slice_copy_impl(inp, dim, start, end, step, out):
             slice_len,
             dim_size,
             start,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=_BLOCK_SIZE,
+            INT64_INDEX=int64_index,
         )
     else:
         slice_copy_kernel[grid](
@@ -220,9 +279,83 @@ def _slice_copy_impl(inp, dim, start, end, step, out):
             dim_size,
             start,
             step,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=_BLOCK_SIZE,
+            INT64_INDEX=int64_index,
         )
 
+
+def _slice_copy_impl(inp, dim, start, end, step, out):
+    ndim = inp.ndim
+    # Validation order matches ATen: the shape/step diagnostics fire before the
+    # out= dtype and device checks (measured on aten::slice_copy.Tensor_out).
+    if ndim == 0:
+        raise IndexError("slice() cannot be applied to a 0-dim tensor.")
+    if dim < -ndim or dim >= ndim:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of "
+            f"[{-ndim}, {ndim - 1}], but got {dim})"
+        )
+    if step <= 0:
+        # PyTorch only supports positive step for slice_copy.
+        raise RuntimeError("slice step must be positive")
+
+    dim = dim % ndim
+    dim_size = inp.size(dim)
+    start, end = _resolve_slice_bounds(dim_size, start, end)
+    slice_len = max(0, (end - start + step - 1) // step)
+
+    target_shape = list(inp.shape)
+    target_shape[dim] = slice_len
+
+    if out is None:
+        out = torch.empty(target_shape, dtype=inp.dtype, device=inp.device)
+    else:
+        # ATen resizes a mismatched out before reporting a dtype/device
+        # mismatch, so keep the resize first.
+        if list(out.shape) != target_shape:
+            out.resize_(target_shape)
+        if out.dtype != inp.dtype:
+            raise RuntimeError(
+                f"Expected out tensor to have dtype {_dtype_name(inp.dtype)}, "
+                f"but got {_dtype_name(out.dtype)} instead"
+            )
+        if out.device != inp.device:
+            raise RuntimeError(
+                f"Expected out tensor to have device {inp.device}, "
+                f"but got {out.device} instead"
+            )
+
+    if out.numel() == 0:
+        return out
+
+    # ``out`` may be a strided view, may alias ``inp``, or may address the same
+    # element twice. In all three cases the flat-offset store of the kernels is
+    # invalid (it would write past the view and read values it has already
+    # overwritten), so route the copy through a contiguous temporary and let the
+    # native strided copy_ place it. For an internally overlapping out that
+    # copy_ raises ATen's "more than one element of the written-to tensor refers
+    # to a single memory location" error, matching aten::slice_copy.Tensor_out.
+    needs_staging = (
+        not out.is_contiguous()
+        or torch._C._is_alias_of(inp, out)
+        or has_internal_overlapping(out) != MemOverlap.No
+    )
+
+    if inp.device.type != "cuda":
+        view = _slice_view(inp, dim, start, slice_len, step)
+        if needs_staging:
+            view = view.clone(memory_format=torch.contiguous_format)
+        _native_copy_(out, view)
+        return out
+
+    dst = (
+        torch.empty(target_shape, dtype=out.dtype, device=out.device)
+        if needs_staging
+        else out
+    )
+    _launch_slice_copy(inp, dst, dim, start, slice_len, step)
+    if needs_staging:
+        _native_copy_(out, dst)
     return out
 
 

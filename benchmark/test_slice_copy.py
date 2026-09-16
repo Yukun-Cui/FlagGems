@@ -33,24 +33,45 @@ class SliceCopyBenchmark(base.GenericBenchmark2DOnly):
         return [(10000, 2**i) for i in (8, 16)]
 
 
-def _input_fn(shape, dtype, device):
-    # Slice along dim 1 over the middle half of the dimension with step 2; this
-    # exercises the general (non-contiguous, non-inner1) kernel path.
-    dim = 1
+def _slice_params(shape, dim):
+    """Slice the middle half of ``dim`` with step 2."""
     dim_size = shape[dim]
     start = dim_size // 4
     end = dim_size - dim_size // 4
     step = 2
+    return start, end, step
+
+
+# For a 2-D input, slicing dim 1 leaves inner == 1, so only the inner1 kernel
+# runs. Slicing dim 0 gives inner == shape[1] > 1, which is the general
+# (strided, inner > 1) kernel. Benchmark both so each path is measured.
+_BENCH_DIMS = (1, 0)
+
+
+def _input_fn(shape, dtype, device):
     inp = torch.randn(shape, dtype=dtype, device=device)
-    yield inp, dim, start, end, step
+    for dim in _BENCH_DIMS:
+        start, end, step = _slice_params(shape, dim)
+        yield inp, dim, start, end, step
+
+
+def _slice_numel(inp, dim, start, end, step):
+    slice_len = max(0, (end - start + step - 1) // step)
+    numel = slice_len
+    for d, size in enumerate(inp.shape):
+        if d != dim:
+            numel *= size
+    return numel
 
 
 def _get_gbps(bench_fn_args, latency):
-    inp = bench_fn_args[0]
-    # slice_copy reads the input and writes a fresh output of the sliced size.
-    out_elems = inp.numel() // inp.size(bench_fn_args[1])
-    out_size = out_elems * inp.element_size()
-    io_amount = inp.numel() * inp.element_size() + out_size
+    # slice_copy touches output.numel() elements on each side: it gathers only
+    # the selected slice out of the input and writes an equally sized output.
+    # Counting the whole input as read overstates the traffic whenever the slice
+    # is a strict subset of the dimension.
+    inp, dim, start, end, step = bench_fn_args[:5]
+    out_elems = _slice_numel(inp, dim, start, end, step)
+    io_amount = 2 * out_elems * inp.element_size()
     return io_amount * 1e-9 / (latency * 1e-3)
 
 
@@ -72,16 +93,13 @@ def test_slice_copy_out():
         return torch.ops.aten.slice_copy.Tensor_out(inp, dim, start, end, step, out=out)
 
     def _input_fn_out(shape, dtype, device):
-        dim = 1
-        dim_size = shape[dim]
-        start = dim_size // 4
-        end = dim_size - dim_size // 4
-        step = 2
         inp = torch.randn(shape, dtype=dtype, device=device)
-        out_shape = list(shape)
-        out_shape[dim] = max(0, (end - start + step - 1) // step)
-        out = torch.empty(out_shape, dtype=dtype, device=device)
-        yield inp, dim, start, end, step, {"out": out}
+        for dim in _BENCH_DIMS:
+            start, end, step = _slice_params(shape, dim)
+            out_shape = list(shape)
+            out_shape[dim] = max(0, (end - start + step - 1) // step)
+            out = torch.empty(out_shape, dtype=dtype, device=device)
+            yield inp, dim, start, end, step, {"out": out}
 
     bench = SliceCopyBenchmark(
         op_name="slice_copy_out",
