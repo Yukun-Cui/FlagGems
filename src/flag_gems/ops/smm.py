@@ -26,130 +26,160 @@ from flag_gems.utils import triton_lang_extension as ext
 logger = logging.getLogger(__name__)
 
 
-# Tuning configs for the fused SpMM kernel. Each program processes a tile of
-# structural output rows (rows present in the sparse input) and a tile of
-# output columns, using ``tl.dot`` for the K reduction. The COO output
-# (indices + values) is written directly, avoiding a separate re-sparsify pass.
+# Tuning configs for the COO SpMM kernel. Each program owns one structural
+# output row (a row present in the sparse input) and a tile of output columns.
+# It streams that row's nonzeros straight out of the COO arrays, so the working
+# set scales with ``nnz`` rather than with the dense ``M * K``. The COO output
+# (indices + values) is written directly, avoiding a re-sparsify pass.
 SMM_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 8, "BLOCK_N": 64, "BLOCK_K": 32},
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 32},
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32},
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32},
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32},
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64},
-        num_stages=3,
-        num_warps=4,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 32},
-        num_stages=3,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64},
-        num_stages=3,
-        num_warps=8,
-    ),
+    triton.Config({"BLOCK_N": 32, "BLOCK_NNZ": 32}, num_stages=3, num_warps=2),
+    triton.Config({"BLOCK_N": 64, "BLOCK_NNZ": 32}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_N": 64, "BLOCK_NNZ": 64}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_N": 128, "BLOCK_NNZ": 32}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_N": 128, "BLOCK_NNZ": 64}, num_stages=3, num_warps=8),
+    triton.Config({"BLOCK_N": 256, "BLOCK_NNZ": 32}, num_stages=3, num_warps=8),
+    triton.Config({"BLOCK_N": 256, "BLOCK_NNZ": 64}, num_stages=4, num_warps=8),
 ]
+
+
+@libentry()
+@triton.jit
+def smm_mark_row_starts_kernel(
+    row_indices,
+    is_start,
+    nnz,
+    BLOCK: tl.constexpr,
+):
+    """Flag each COO entry that begins a new row.
+
+    A coalesced 2-D COO tensor is sorted by row (then column), so the entries of
+    one row occupy a contiguous span and a row boundary is simply an entry whose
+    row differs from its predecessor. Entry 0 is always a boundary.
+    """
+    pid = ext.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < nnz
+
+    cur = tl.load(row_indices + offs, mask=mask, other=0)
+    prev = tl.load(row_indices + offs - 1, mask=mask & (offs > 0), other=-1)
+    tl.store(is_start + offs, tl.where(cur != prev, 1, 0), mask=mask)
+
+
+@libentry()
+@triton.jit
+def smm_compact_rows_kernel(
+    row_indices,
+    is_start,
+    rank,
+    row_ids,
+    row_starts,
+    nnz,
+    nrows,
+    BLOCK: tl.constexpr,
+):
+    """Compact the flagged boundaries into per-row ids and segment offsets.
+
+    ``rank`` is the inclusive prefix sum of ``is_start``, so a boundary entry at
+    COO offset ``o`` is the ``rank[o] - 1``-th distinct row. For each boundary we
+    write its row id and its offset, giving ``row_starts[i] .. row_starts[i+1]``
+    as the half-open span of row ``i``. The terminating ``row_starts[nrows] =
+    nnz`` is written by the single program that owns the last entry.
+    """
+    pid = ext.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < nnz
+
+    flag = tl.load(is_start + offs, mask=mask, other=0)
+    sel = mask & (flag != 0)
+    r = tl.load(rank + offs, mask=sel, other=1) - 1
+    row = tl.load(row_indices + offs, mask=sel, other=0)
+
+    tl.store(row_ids + r, row, mask=sel)
+    tl.store(row_starts + r, offs.to(tl.int64), mask=sel)
+    # Terminator, so segment ``nrows - 1`` has an end. Scalar store, hence the
+    # ``pid`` guard rather than a mask (a block mask needs a block pointer).
+    if pid == 0:
+        tl.store(row_starts + nrows, nnz)
 
 
 @libentry()
 @libtuner(
     configs=SMM_CONFIGS,
-    key=["nrows", "N", "K"],
+    # Keyed on N only. ``nrows`` is data-dependent (it counts the distinct rows
+    # present in the sparse operand), so keying on it would re-tune on nearly
+    # every call with new data -- the tuning cost then dominates the kernel.
+    # BLOCK_N/BLOCK_NNZ only need N and the per-row nnz distribution, and the
+    # latter is not knowable from the launch signature anyway.
+    key=["N"],
 )
 @triton.jit
-def smm_fused_kernel(
-    A,
+def smm_coo_kernel(
+    col_indices,
+    values,
+    row_ids,
+    row_starts,
     B,
-    out_rows,
-    out_indices,
+    out_row_idx,
+    out_col_idx,
     out_values,
     nrows,
     N,
-    K,
-    stride_am,
-    stride_ak,
     stride_bk,
     stride_bn,
-    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_NNZ: tl.constexpr,
 ):
-    """Fused sparse-dense matmul kernel producing the COO output directly.
+    """Sparse(COO) x dense matmul, reading the sparse operand as COO.
 
-    Each program handles a ``BLOCK_M x BLOCK_N`` tile of the output, where the
-    ``M`` dimension indexes *structural output rows* (the rows appearing in the
-    sparse input, given by ``out_rows``), not the raw matrix row. For each
-    structural row ``r = out_rows[pid_m * BLOCK_M + i]`` it computes
-    ``C[r, n] = sum_k A[r, k] * B[k, n]`` with ``tl.dot`` and writes the result
-    and its ``(r, n)`` index directly into the COO output arrays at position
-    ``(pid_m * BLOCK_M + i) * N + n``.
+    Program ``(i, pid_n)`` computes columns ``[pid_n * BLOCK_N, +BLOCK_N)`` of
+    structural output row ``i``:
+
+        out[i, n] = sum over the COO entries (r_i, k, v) of row r_i  of
+                    v * B[k, n]
+
+    The row's entries are streamed in ``BLOCK_NNZ`` chunks from
+    ``[row_starts[i], row_starts[i + 1])``, so the memory touched is
+    proportional to that row's nonzero count -- never to ``M * K``. The
+    reduction is a masked broadcast-multiply-accumulate rather than ``tl.dot``,
+    because the contracted extent here is a row's nnz (typically small and
+    irregular), not a dense ``K``.
+
+    The COO output is written directly at flat position ``i * N + n``, which is
+    the row-major layout ``torch.smm`` produces over ascending structural rows.
     """
-    pid_m = ext.program_id(0)
+    i = ext.program_id(0)
     pid_n = ext.program_id(1)
-
-    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = m_off < nrows
-    # Gather the actual matrix rows for this tile.
-    rows = tl.load(out_rows + m_off, mask=m_mask, other=0)  # (BLOCK_M,)
 
     n_off = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = n_off < N
-    rk = tl.arange(0, BLOCK_K)
 
-    # A tile: (BLOCK_M, BLOCK_K) gathered from the selected rows.
-    a_ptrs = A + (rows[:, None] * stride_am + rk[None, :] * stride_ak)
-    # B tile: (BLOCK_K, BLOCK_N).
-    b_ptrs = B + (rk[:, None] * stride_bk + n_off[None, :] * stride_bn)
+    row = tl.load(row_ids + i)
+    seg_start = tl.load(row_starts + i)
+    seg_end = tl.load(row_starts + i + 1)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        a = tl.load(
-            a_ptrs,
-            mask=m_mask[:, None] & (rk[None, :] < K - k * BLOCK_K),
-            other=0.0,
-        )
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for base in range(seg_start, seg_end, BLOCK_NNZ):
+        e = base + tl.arange(0, BLOCK_NNZ)
+        e_mask = e < seg_end
+        k = tl.load(col_indices + e, mask=e_mask, other=0)
+        v = tl.load(values + e, mask=e_mask, other=0.0).to(tl.float32)
+
+        # (BLOCK_NNZ, BLOCK_N) tile of B, gathered on the k axis.
         b = tl.load(
-            b_ptrs,
-            mask=(rk[:, None] < K - k * BLOCK_K) & n_mask[None, :],
+            B + k[:, None] * stride_bk + n_off[None, :] * stride_bn,
+            mask=e_mask[:, None] & n_mask[None, :],
             other=0.0,
-        )
-        acc += tl.dot(a, b, allow_tf32=False)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
+        ).to(tl.float32)
+        acc += tl.sum(v[:, None] * b, axis=0)
 
-    # COO positions: for structural row i, the values for columns n_off are at
-    # (pid_m * BLOCK_M + i) * N + n_off. We flatten the (BLOCK_M, BLOCK_N) tile
-    # into the contiguous COO layout (row-major over structural rows).
-    coo_pos = (m_off[:, None] * N + n_off[None, :]).to(tl.int64)
-    pos_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(out_values + coo_pos, acc.to(out_values.dtype.element_ty), mask=pos_mask)
-    tl.store(out_indices + coo_pos, rows[:, None].to(tl.int64), mask=pos_mask)
-    tl.store(
-        out_indices + nrows * N + coo_pos, n_off[None, :].to(tl.int64), mask=pos_mask
-    )
+    # ``out_row_idx`` and ``out_col_idx`` are the two rows of the (2, nnz_out)
+    # index tensor, passed separately so the flat position needs no ``nrows``
+    # arithmetic: Triton specializes an argument equal to 1 to a Python int, and
+    # a single structural row would then break tensor-style index math here.
+    pos = i.to(tl.int64) * N + n_off
+    tl.store(out_values + pos, acc.to(out_values.dtype.element_ty), mask=n_mask)
+    tl.store(out_row_idx + pos, row.to(tl.int64), mask=n_mask)
+    tl.store(out_col_idx + pos, n_off.to(tl.int64), mask=n_mask)
 
 
 def smm(self, mat):
@@ -163,12 +193,32 @@ def smm(self, mat):
     """
     logger.debug("GEMS SMM")
 
-    assert self.is_sparse, "smm expects a sparse (COO) matrix as the first input"
-    assert not mat.is_sparse, "smm expects a dense matrix as the second input"
-    assert self.ndim == 2 and mat.ndim == 2, "smm only supports 2-D inputs"
+    if not self.is_sparse:
+        raise RuntimeError("tensor.sspaddmm(...) can only be called on sparse tensors")
+    if self.ndim != 2:
+        raise RuntimeError(
+            f"sspaddmm: Argument #2: matrices expected, got {self.ndim}D tensor"
+        )
+    if mat.is_sparse:
+        raise RuntimeError("Cannot access data pointer of Tensor that doesn't have storage")
+    if mat.ndim != 2:
+        raise RuntimeError(
+            f"sspaddmm: Argument #3: matrices expected, got {mat.ndim}D tensor"
+        )
+
     M, K = self.shape
     K2, N = mat.shape
-    assert K == K2, f"incompatible dimensions for smm: {self.shape} x {mat.shape}"
+    if K != K2:
+        raise RuntimeError(f"sspaddmm: Argument #3: Expected dim 0 size {K}, got {K2}")
+
+    # Both operands must live on the same device: the kernel is launched on
+    # ``self.device``, so a CPU or foreign-GPU ``mat`` would otherwise be handed
+    # to it as a raw pointer and fault. ATen reports this as a mat2 mismatch.
+    if mat.device != self.device:
+        raise RuntimeError(
+            "Expected all tensors to be on the same device, but got mat2 is on "
+            f"{mat.device}, different from other tensors on {self.device}"
+        )
 
     # ``torch.smm`` is only implemented for float32 on the CUDA backend, so we
     # restrict the GEMS implementation to the same dtype to stay consistent.
@@ -177,54 +227,72 @@ def smm(self, mat):
             "GEMS smm is only implemented for float32 inputs, matching torch.smm"
         )
 
-    # Coalesce the sparse input so its structure is deterministic.
+    # Coalesce the sparse input so its structure is deterministic: duplicate
+    # (row, col) entries are summed and the entries end up sorted by row, which
+    # is what makes each row a contiguous COO segment below.
     if not self.is_coalesced():
         self = self.coalesce()
 
-    if self._nnz() == 0:
+    nnz = self._nnz()
+    if nnz == 0 or N == 0 or M == 0:
+        # No structural rows (or no output columns) means an empty COO result.
         out_indices = torch.empty((2, 0), dtype=torch.int64, device=self.device)
         out_values = torch.empty((0,), dtype=torch.float32, device=self.device)
         return torch.sparse_coo_tensor(
             out_indices, out_values, size=(M, N), device=self.device
         )
 
-    # The structural output rows are the unique rows appearing in the sparse
-    # input. Since the COO input is coalesced (sorted by row, then col), the
-    # unique rows can be extracted with a single diff-based scan that is much
-    # cheaper than ``torch.unique``'s full sort.
-    row_indices = self._indices()[0]
-    row_mask = torch.ones_like(row_indices, dtype=torch.bool)
-    row_mask[1:] = row_indices[1:] != row_indices[:-1]
-    out_rows = row_indices[row_mask]  # unique rows, ascending (int64)
+    indices = self._indices()
+    row_indices = indices[0].contiguous()
+    col_indices = indices[1].contiguous()
+    values = self._values().contiguous()
 
-    # Materialize the sparse operand to dense for gathered loads.
-    a_dense = self.to_dense()
-    if not mat.is_contiguous():
-        mat = mat.contiguous()
-
-    nrows = out_rows.numel()
-    nnz_out = nrows * N
-    out_values = torch.empty((nnz_out,), device=self.device, dtype=torch.float32)
-    out_indices = torch.empty((2, nnz_out), device=self.device, dtype=torch.int64)
-
-    grid = lambda META: (
-        triton.cdiv(nrows, META["BLOCK_M"]),
-        triton.cdiv(N, META["BLOCK_N"]),
-    )
+    # Build the per-row COO segments. ``is_start`` flags row boundaries, its
+    # inclusive cumsum ranks them, and the compaction writes the row ids plus
+    # the segment offsets. Only the cumsum runs as a host-side torch call; the
+    # marking and compaction are device kernels.
+    is_start = torch.empty((nnz,), dtype=torch.int32, device=self.device)
+    grid_nnz = lambda META: (triton.cdiv(nnz, META["BLOCK"]),)
     with torch_device_fn.device(self.device):
-        smm_fused_kernel[grid](
-            a_dense,
+        smm_mark_row_starts_kernel[grid_nnz](row_indices, is_start, nnz, BLOCK=1024)
+        rank = torch.cumsum(is_start, 0, dtype=torch.int64)
+        nrows = int(rank[-1].item())
+        row_ids = torch.empty((nrows,), dtype=torch.int64, device=self.device)
+        row_starts = torch.empty((nrows + 1,), dtype=torch.int64, device=self.device)
+        smm_compact_rows_kernel[grid_nnz](
+            row_indices,
+            is_start,
+            rank,
+            row_ids,
+            row_starts,
+            nnz,
+            nrows,
+            BLOCK=1024,
+        )
+
+        # ``torch.smm`` materializes every column of each structural row.
+        nnz_out = nrows * N
+        out_values = torch.empty((nnz_out,), device=self.device, dtype=torch.float32)
+        out_indices = torch.empty((2, nnz_out), device=self.device, dtype=torch.int64)
+
+        grid = lambda META: (nrows, triton.cdiv(N, META["BLOCK_N"]))
+        smm_coo_kernel[grid](
+            col_indices,
+            values,
+            row_ids,
+            row_starts,
             mat,
-            out_rows,
-            out_indices,
+            out_indices[0],
+            out_indices[1],
             out_values,
             nrows,
             N,
-            K,
-            a_dense.stride(0),
-            a_dense.stride(1),
             mat.stride(0),
             mat.stride(1),
         )
 
-    return torch.sparse_coo_tensor(out_indices, out_values, size=(M, N))
+    # Rows are ascending and each contributes its columns in ascending order, so
+    # the output is already in coalesced order; declaring it avoids a re-sort.
+    return torch.sparse_coo_tensor(
+        out_indices, out_values, size=(M, N), is_coalesced=True
+    )

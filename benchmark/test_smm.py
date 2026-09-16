@@ -63,8 +63,11 @@ class SmmBenchmark(base.Benchmark):
 
     def get_tflops(self, op, *args, **kwargs):
         sparse, dense = args[0], args[1]
-        # 2 * M * K * N flops for the (materialized) dense matmul.
-        return 2 * sparse.shape[0] * sparse.shape[1] * dense.shape[1]
+        # Each stored nonzero contributes one multiply-add to each of the N
+        # output columns, so the useful work is 2 * nnz * N. Using 2 * M * K * N
+        # would report the flops of the *dense* matmul and overstate throughput
+        # by 1 / density (100x at 1% density).
+        return 2 * sparse._nnz() * dense.shape[1]
 
 
 @pytest.mark.smm
