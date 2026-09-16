@@ -110,10 +110,10 @@ def test_put_out():
     bench.run()
 
 
-@pytest.mark.put
+@pytest.mark.put_out
 def test_put_out_accumulate():
     bench = PutOutBenchmark(
-        op_name="put",
+        op_name="put_out",
         torch_op=torch.ops.aten.put.out,
         input_fn=put_out_input_fn(accumulate=True),
         dtypes=consts.FLOAT_DTYPES,

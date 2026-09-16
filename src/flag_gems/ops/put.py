@@ -24,6 +24,36 @@ from flag_gems.utils.shape_utils import MemOverlap, has_internal_overlapping
 
 logger = logging.getLogger(__name__)
 
+# ATen spells dtypes with its own ScalarType names in the `put_` error messages;
+# mirror them so the text raised here matches the native op.
+_SCALAR_TYPE_NAMES = {
+    torch.float16: "Half",
+    torch.float32: "Float",
+    torch.float64: "Double",
+    torch.bfloat16: "BFloat16",
+    torch.int8: "Char",
+    torch.int16: "Short",
+    torch.int32: "Int",
+    torch.int64: "Long",
+    torch.uint8: "Byte",
+    torch.bool: "Bool",
+    torch.complex32: "ComplexHalf",
+    torch.complex64: "ComplexFloat",
+    torch.complex128: "ComplexDouble",
+}
+
+# `tl.atomic_add` has no lowering for sub-32-bit types, so the accumulate path for
+# these dtypes runs the atomics on an int32 staging buffer and narrows the result
+# afterwards. ATen accumulates in the tensor's own dtype and lets it wrap
+# (measured: int8 100 + 3*100 -> -112, uint8 200 + 3*100 -> 244, int16
+# 30000 + 3*10000 -> -5536); a two's-complement int32 add truncated back to the
+# destination width reproduces that wrap exactly.
+_NARROW_ACC_DTYPES = (torch.int8, torch.uint8, torch.int16, torch.bool)
+
+
+def _scalar_type_name(dtype):
+    return _SCALAR_TYPE_NAMES.get(dtype, str(dtype))
+
 
 @libentry()
 @triton.jit(do_not_specialize=["N", "out_numel"])
@@ -31,40 +61,47 @@ def put_scatter_kernel(
     out_ptr,
     index_ptr,
     source_ptr,
+    layout_ptr,
+    oob_ptr,
     out_numel,
     N,
-    rank,
-    out_stride0,
-    out_stride1,
-    out_stride2,
-    out_stride3,
-    out_stride4,
-    out_shape0,
-    out_shape1,
-    out_shape2,
-    out_shape3,
-    out_shape4,
+    RANK: tl.constexpr,
     IS_ACCUMULATE: tl.constexpr,
     IS_CONTIGUOUS: tl.constexpr,
+    ELEMS_PER_SLOT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Scatter ``source`` into ``out`` at the flat positions given by ``index``.
 
-    When ``out`` is row-major contiguous (the ``put`` / ``put_out`` paths, which
-    allocate a fresh contiguous ``out``) the flat index is already the element
-    offset, so the multi-dimensional decode drops out -- the common case that
-    avoids five integer divisions per element. The ``put_`` path may operate
-    on a non-contiguous (e.g. transposed) tensor in place, so the full rank-5
-    decode is kept behind ``IS_CONTIGUOUS``.
+    ``index`` addresses the row-major flattening of ``out``, and negative entries
+    wrap by ``out_numel``. When ``out`` is row-major contiguous the flat index is
+    already the element offset, so the multi-dimensional decode drops out -- the
+    common case, which avoids ``RANK`` integer divisions per element. Otherwise the
+    decode loop runs for the tensor's actual rank -- so any rank is supported --
+    reading the layout from ``layout_ptr``, which holds ``RANK`` sizes followed by
+    ``RANK`` strides in one buffer so only a single host-to-device copy is needed.
+
+    ``ELEMS_PER_SLOT`` is 2 for complex tensors, which are scattered through their
+    ``view_as_real`` interleaved (real, imag) pairs because Triton has no complex
+    dtype. The shape/stride vectors then still describe the *complex* tensor, so
+    the decoded offset is simply doubled -- ``view_as_real`` multiplies every
+    stride by two and appends a unit stride, which is the same address.
+
+    An index outside ``[-out_numel, out_numel)`` sets ``oob_ptr`` so the host can
+    raise the ``IndexError`` ATen raises. Such an element is skipped rather than
+    clamped, so a bad index can never write outside ``out``.
     """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < N
 
-    cur_index = tl.load(index_ptr + offsets, mask=mask, other=0).to(tl.int64)
-    # Negative index maps to the end of the flattened tensor.
-    cur_index = tl.where(cur_index < 0, cur_index + out_numel, cur_index)
+    raw_index = tl.load(index_ptr + offsets, mask=mask, other=0).to(tl.int64)
+    # A negative index counts back from the end of the flattened tensor.
+    cur_index = tl.where(raw_index < 0, raw_index + out_numel, raw_index)
     index_valid = (cur_index >= 0) & (cur_index < out_numel)
+    # Report (rather than silently ignore) an index ATen would reject.
+    if tl.max((mask & (~index_valid)).to(tl.int32)) > 0:
+        tl.atomic_max(oob_ptr, 1, sem="relaxed")
     final_mask = mask & index_valid
 
     if IS_CONTIGUOUS:
@@ -72,59 +109,63 @@ def put_scatter_kernel(
     else:
         cur = cur_index
         out_offsets = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
-        if rank > 4:
-            out_offsets += (cur % out_shape4) * out_stride4
-            cur = cur // out_shape4
-        if rank > 3:
-            out_offsets += (cur % out_shape3) * out_stride3
-            cur = cur // out_shape3
-        if rank > 2:
-            out_offsets += (cur % out_shape2) * out_stride2
-            cur = cur // out_shape2
-        if rank > 1:
-            out_offsets += (cur % out_shape1) * out_stride1
-            cur = cur // out_shape1
-        if rank > 0:
-            out_offsets += cur * out_stride0
+        for i in tl.static_range(RANK - 1, -1, -1):
+            dim_size = tl.load(layout_ptr + i).to(tl.int64)
+            dim_stride = tl.load(layout_ptr + RANK + i).to(tl.int64)
+            out_offsets += (cur % dim_size) * dim_stride
+            cur = cur // dim_size
 
-    cur_value = tl.load(source_ptr + offsets, mask=final_mask, other=0)
-    if IS_ACCUMULATE:
-        tl.atomic_add(out_ptr + out_offsets, cur_value, mask=final_mask, sem="relaxed")
+    if ELEMS_PER_SLOT == 1:
+        value = tl.load(source_ptr + offsets, mask=final_mask, other=0)
+        if IS_ACCUMULATE:
+            tl.atomic_add(out_ptr + out_offsets, value, mask=final_mask, sem="relaxed")
+        else:
+            tl.store(out_ptr + out_offsets, value, mask=final_mask)
     else:
-        tl.store(out_ptr + out_offsets, cur_value, mask=final_mask)
+        # Complex: `out_ptr` and `source_ptr` address the real views, so complex
+        # element k occupies real slots 2k (real part) and 2k + 1 (imaginary).
+        real = tl.load(source_ptr + 2 * offsets, mask=final_mask, other=0)
+        imag = tl.load(source_ptr + 2 * offsets + 1, mask=final_mask, other=0)
+        real_off = 2 * out_offsets
+        if IS_ACCUMULATE:
+            tl.atomic_add(out_ptr + real_off, real, mask=final_mask, sem="relaxed")
+            tl.atomic_add(out_ptr + real_off + 1, imag, mask=final_mask, sem="relaxed")
+        else:
+            tl.store(out_ptr + real_off, real, mask=final_mask)
+            tl.store(out_ptr + real_off + 1, imag, mask=final_mask)
 
 
-# Dedicated contiguous scatter kernel. ``put`` / ``put_out`` always allocate a
-# fresh contiguous ``out``, so the common path never needs the rank/stride/shape
-# decode -- this minimal kernel takes only the three pointers, the two sizes and
-# the two constexpr flags, minimising both the launch argument list and the
-# per-element work (one load, one (atomic) store, no divisions). A separate kernel
-# avoids passing the dead stride/shape args at all, which cuts launch overhead.
 @libentry()
-@triton.jit(do_not_specialize=["N", "out_numel"])
-def put_scatter_contig_kernel(
-    out_ptr,
-    index_ptr,
-    source_ptr,
-    out_numel,
-    N,
-    IS_ACCUMULATE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
+@triton.jit(do_not_specialize=["N"])
+def put_flat_copy_kernel(dst_ptr, src_ptr, N, BLOCK_SIZE: tl.constexpr):
+    """Element-wise copy of ``N`` elements between two identically strided buffers."""
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < N
+    value = tl.load(src_ptr + offsets, mask=mask, other=0)
+    tl.store(dst_ptr + offsets, value, mask=mask)
 
-    cur_index = tl.load(index_ptr + offsets, mask=mask, other=0).to(tl.int64)
-    cur_index = tl.where(cur_index < 0, cur_index + out_numel, cur_index)
-    index_valid = (cur_index >= 0) & (cur_index < out_numel)
-    final_mask = mask & index_valid
 
-    cur_value = tl.load(source_ptr + offsets, mask=final_mask, other=0)
-    if IS_ACCUMULATE:
-        tl.atomic_add(out_ptr + cur_index, cur_value, mask=final_mask, sem="relaxed")
+@libentry()
+@triton.jit(do_not_specialize=["N"])
+def put_narrow_cast_kernel(
+    dst_ptr, src_ptr, N, TO_BOOL: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    """Narrow a contiguous int32 accumulator back into the destination dtype.
+
+    A truncating store reproduces ATen's two's-complement wrap for int8, uint8 and
+    int16. ``bool`` is different: ATen's accumulate saturates (``True + True`` is
+    ``True``), whereas truncating an int32 to i1 keeps only the low bit and would
+    turn a count of two into ``False``, so bool compares against zero instead.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    value = tl.load(src_ptr + offsets, mask=mask, other=0)
+    if TO_BOOL:
+        tl.store(dst_ptr + offsets, value != 0, mask=mask)
     else:
-        tl.store(out_ptr + cur_index, cur_value, mask=final_mask)
+        tl.store(dst_ptr + offsets, value, mask=mask)
 
 
 def _put_block_config(N):
@@ -136,62 +177,148 @@ def _put_block_config(N):
         return 2048, 8
 
 
-def _put_scatter(out, index, source, accumulate):
-    """Scatter ``source`` into ``out`` at ``index`` (1-D)."""
-    index = index.reshape(-1)
-    source = source.reshape(-1)
-    N = index.numel()
-    out_numel = out.numel()
+def _is_dense(tensor):
+    """True when ``tensor`` covers ``[data_ptr, data_ptr + numel)`` exactly.
 
+    A dense tensor may still be non-contiguous (a transpose, say): it permutes the
+    same element set without gaps or repeats, so a flat element-wise copy of
+    ``numel`` elements reproduces it bit-for-bit and never touches an element
+    outside the view.
+    """
+    if tensor.numel() == 0:
+        return True
+    strides = tensor.stride()
+    if any(stride <= 0 for stride in strides):
+        return False
+    span = 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, strides))
+    return span == tensor.numel()
+
+
+def _flat_copy(dst, src):
+    """Copy ``src`` into ``dst``.
+
+    When both sides are dense with identical strides -- what ``empty_like`` gives
+    back for any dense ``self`` -- a single flat Triton copy suffices. Anything
+    else (a gappy or broadcast ``self``, an ``out`` whose layout differs) goes
+    through the FlagGems ``copy_`` operator, which honours both stride sets.
+    """
+    N = dst.numel()
     if N == 0:
-        return out
+        return dst
+    if _is_dense(dst) and _is_dense(src) and dst.stride() == src.stride():
+        # Triton has no complex dtype; copying the interleaved real views moves the
+        # same bytes because both views are dense with matching strides.
+        flat_dst, flat_src = dst, src
+        if dst.is_complex():
+            flat_dst, flat_src = torch.view_as_real(dst), torch.view_as_real(src)
+            N *= 2
+        BLOCK_SIZE = 1024
+        put_flat_copy_kernel[(triton.cdiv(N, BLOCK_SIZE),)](
+            flat_dst, flat_src, N, BLOCK_SIZE=BLOCK_SIZE, num_warps=4
+        )
+        return dst
 
+    from flag_gems.ops.copy import copy_
+
+    return copy_(dst, src)
+
+
+def _launch_scatter(meta, data, index, source, accumulate, oob, elems_per_slot):
+    """Launch the scatter. ``meta`` supplies the layout, ``data`` the storage.
+
+    The two differ only for complex tensors, where ``data`` is the interleaved real
+    view of ``meta``.
+    """
+    N = index.numel()
     BLOCK_SIZE, num_warps = _put_block_config(N)
     grid = (triton.cdiv(N, BLOCK_SIZE),)
 
-    if out.is_contiguous():
-        # Common ``put`` / ``put_out`` path: contiguous out, minimal kernel.
-        put_scatter_contig_kernel[grid](
-            out,
-            index,
-            source,
-            out_numel,
-            N,
-            IS_ACCUMULATE=accumulate,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
+    contiguous = meta.is_contiguous()
+    if contiguous:
+        # The layout vector is dead on the contiguous path; pass `index` as a
+        # non-null placeholder so no host-to-device copy happens at all.
+        layout_t = index
+        rank = 0
+    else:
+        # Sizes and strides go in one buffer: two separate `torch.tensor(...,
+        # device=...)` calls cost ~28 us of host-to-device latency, one costs ~14.
+        layout_t = torch.tensor(
+            list(meta.shape) + list(meta.stride()),
+            dtype=torch.int64,
+            device=meta.device,
         )
-        return out
-
-    # ``put_`` path on a non-contiguous (e.g. transposed) tensor: full rank-5
-    # multi-dim index decode.
-    rank = out.ndim
-    assert rank <= 5, "put_ only supports tensors with rank <= 5"
-    strides = list(out.stride()) + [0] * (5 - rank)
-    shapes = list(out.shape) + [1] * (5 - rank)
+        rank = meta.ndim
 
     put_scatter_kernel[grid](
-        out,
+        data,
         index,
         source,
-        out_numel,
+        layout_t,
+        oob,
+        meta.numel(),
         N,
-        rank,
-        strides[0],
-        strides[1],
-        strides[2],
-        strides[3],
-        strides[4],
-        shapes[0],
-        shapes[1],
-        shapes[2],
-        shapes[3],
-        shapes[4],
+        RANK=rank,
         IS_ACCUMULATE=accumulate,
-        IS_CONTIGUOUS=False,
+        IS_CONTIGUOUS=contiguous,
+        ELEMS_PER_SLOT=elems_per_slot,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=num_warps,
     )
+
+
+def _put_scatter(out, index, source, accumulate):
+    """Scatter ``source`` into ``out`` at the flat positions in ``index``."""
+    N = index.numel()
+    if N == 0:
+        return out
+    if out.numel() == 0:
+        # ATen rejects a write into an empty tensor before it looks at `index`.
+        raise IndexError("put_(): Tried to put elements into an empty tensor")
+
+    # The kernel sets `oob` when an index falls outside [-numel, numel). Reading it
+    # back costs one 4-byte device-to-host sync (~15 us), which is the price of
+    # raising the same error ATen raises instead of silently dropping the element.
+    oob = torch.zeros((), dtype=torch.int32, device=out.device)
+
+    if out.is_complex():
+        # Triton has no complex dtype; scatter the interleaved real views. The
+        # complex tensor still supplies shape/stride (see `put_scatter_kernel`).
+        _launch_scatter(
+            out,
+            torch.view_as_real(out),
+            index,
+            torch.view_as_real(source),
+            accumulate,
+            oob,
+            elems_per_slot=2,
+        )
+    elif accumulate and out.dtype in _NARROW_ACC_DTYPES:
+        # `tl.atomic_add` has no sub-32-bit lowering: accumulate into a contiguous
+        # int32 staging buffer holding `out`'s row-major values, then narrow back.
+        row_major = out if out.is_contiguous() else out.contiguous()
+        staging = row_major.to(torch.int32)
+        _launch_scatter(
+            staging, staging, index, source.to(torch.int32), accumulate, oob, 1
+        )
+        narrowed = torch.empty_like(row_major)
+        BLOCK_SIZE = 1024
+        put_narrow_cast_kernel[(triton.cdiv(narrowed.numel(), BLOCK_SIZE),)](
+            narrowed,
+            staging,
+            narrowed.numel(),
+            TO_BOOL=out.dtype == torch.bool,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=4,
+        )
+        _flat_copy(out, narrowed)
+    else:
+        _launch_scatter(out, out, index, source, accumulate, oob, elems_per_slot=1)
+
+    if oob.item() != 0:
+        raise IndexError(
+            f"out of range: tried to access an index outside a tensor of "
+            f"{out.numel()} elements."
+        )
 
     return out
 
@@ -199,46 +326,62 @@ def _put_scatter(out, index, source, accumulate):
 def put_impl(out, index, source, accumulate):
     # Mirror the input validation torch performs on `put`/`put_`/`put.out` so the
     # GEMS path raises the same errors (and the same exception types) instead of
-    # silently casting / racing on bad inputs.
+    # silently casting or racing on bad inputs.
     if index.dtype != torch.int64:
         raise RuntimeError(
-            "put(): Expected a long tensor for index, but got " + str(index.dtype)
+            "put_(): Expected a long tensor for index, but got "
+            + _scalar_type_name(index.dtype)
         )
     if source.dtype != out.dtype:
         raise RuntimeError(
-            "put(): self and source expected to have the same dtype, but got "
-            f"self.dtype = {out.dtype} and source.dtype = {source.dtype}"
+            "put_(): self and source expected to have the same dtype, but got "
+            f"self.dtype = {_scalar_type_name(out.dtype)} and "
+            f"source.dtype = {_scalar_type_name(source.dtype)}"
         )
     if index.numel() != source.numel():
         raise IndexError(
-            "put(): Expected source and index to have the same number of elements, "
+            "put_(): Expected source and index to have the same number of elements, "
             f"but got source.numel() = {source.numel()}, index.numel() = {index.numel()}"
         )
 
-    # `index` and `source` are read in row-major flatten order; reshape them to
-    # 1-D (copying if they are non-contiguous) so the kernel reads them with a
-    # plain 0-based offset. Accumulate runs directly in the tensor's own dtype:
-    # fp16/bf16 `atomic_add` is non-deterministic in add order, but its per-add
-    # rounding stays well within the low-precision tolerances the put tests use
-    # (fp16 1e-2, bf16 1e-1), so the float32 upcast round-trip (an O(numel) copy
-    # that dominated the scatter for large `out`) is dropped.
-    return _put_scatter(out, index, source, accumulate)
+    # `index` and `source` are read in row-major flatten order, so flatten them to
+    # 1-D contiguous buffers (copying only when they are not already) and the
+    # kernel can address them with a plain 0-based offset. Accumulate runs in the
+    # tensor's own dtype where `atomic_add` supports it: fp16/bf16 atomics are
+    # non-deterministic in add order, but the per-add rounding stays well inside
+    # the low-precision tolerances the tests use, so the float32 upcast round-trip
+    # (an O(numel) copy that dominated the scatter for a large `out`) is dropped.
+    return _put_scatter(
+        out, index.contiguous().reshape(-1), source.contiguous().reshape(-1), accumulate
+    )
+
+
+def _check_same_device(self, index, source, out=None):
+    """ATen requires self, index and source (and ``out``) to share one device."""
+    for name, tensor in (("index", index), ("source", source)):
+        if tensor.device != self.device:
+            raise RuntimeError(
+                f"Expected all tensors to be on the same device, but got {name} is "
+                f"on {tensor.device}, different from other tensors on {self.device} "
+                f"(when checking argument in method wrapper_CUDA__put_)"
+            )
+    if out is not None and out.device != self.device:
+        raise RuntimeError(
+            f"Expected out tensor to have device {self.device}, but got "
+            f"{out.device} instead"
+        )
 
 
 def put(self, index, source, accumulate=False):
     logger.debug("GEMS PUT")
+    _check_same_device(self, index, source)
 
+    # `empty_like` mirrors `self`'s layout when `self` is dense and falls back to
+    # row-major otherwise, which is exactly what ATen's `put` returns in each case.
+    # Writing into this fresh buffer is what keeps `put` from mutating `self`.
     out = torch.empty_like(self)
-    if has_internal_overlapping(out) == MemOverlap.Yes:
-        out = out.contiguous()
-    # Copy `self` into `out` using a path that bypasses the GEMS `copy_` kernel,
-    # which carries a high per-launch overhead. `torch._foreach_copy_` is not
-    # overridden by FlagGems and dispatches straight to the optimized PyTorch
-    # memcpy, avoiding a second (slow) kernel launch before the scatter.
-    torch._foreach_copy_([out], [self])
+    _flat_copy(out, self)
 
-    index = index.to(self.device)
-    source = source.to(self.device)
     return put_impl(out, index, source, accumulate)
 
 
@@ -248,19 +391,22 @@ def put_out(self, index, source, accumulate=False, *, out=None):
     if out is None:
         return put(self, index, source, accumulate)
 
+    _check_same_device(self, index, source, out)
+    if out.dtype != self.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {_scalar_type_name(self.dtype)}, "
+            f"but got {_scalar_type_name(out.dtype)} instead"
+        )
+
     assert (
         has_internal_overlapping(out) != MemOverlap.Yes
     ), "Unsupported operation: trying to inplace write to an internally overlapping tensor."
 
     # `out` must match `self`; copy self into out first if they are different.
     if out is not self:
-        if out.shape != self.shape or out.dtype != self.dtype:
+        if out.shape != self.shape:
             out = out.resize_as_(self)
-        # Bypass the GEMS `copy_` kernel for the initial full-tensor copy (see
-        # `put` above for the rationale).
-        torch._foreach_copy_([out], [self])
+        _flat_copy(out, self)
 
-    index = index.to(self.device)
-    source = source.to(self.device)
     put_impl(out, index, source, accumulate)
     return out
