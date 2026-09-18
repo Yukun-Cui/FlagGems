@@ -41,16 +41,23 @@ def generate_imports(code: IndentedBuffer) -> IndentedBuffer:
 
 
 def generate_kernel(
-    rank: int, kernel_name: str, code: IndentedBuffer
+    rank: int, grad_ndim: int, kernel_name: str, code: IndentedBuffer
 ) -> IndentedBuffer:
+    """Emit the coordinate-unravelling kernel.
+
+    ``grad_ndim`` is the rank of ``grad`` and gives the number of extents the flat
+    coordinate is unravelled over; ``rank`` is ``self.ndim`` and bounds how many of
+    those coordinates are actually written. The native op derives its extents from
+    ``grad`` while emitting ``self.ndim`` rows, so the two can differ.
+    """
     code.newline()
     code.writeline("@libentry()")
     code.writeline("@triton.jit")
     code.writeline(f"def {kernel_name}(")
     with code.indent():
-        args = ["index_ptr, ", "out_ptr, ", "nnz, ", "dim, "]
-        args += [f"dim_size{i}, " for i in range(rank)]
-        args += ["dim_count: tl.constexpr, ", "BLOCK_SIZE: tl.constexpr, "]
+        args = ["index_ptr, ", "out_ptr, ", "nnz, ", "dim, ", "idx_stride, "]
+        args += [f"dim_size{i}, " for i in range(grad_ndim)]
+        args += ["BLOCK_SIZE: tl.constexpr, "]
         code.writelines(args)
     code.writeline("):")
 
@@ -60,36 +67,47 @@ def generate_kernel(
             "offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)"
         )
         code.writeline("mask = offs < nnz")
+        # ``idx_stride`` is 1 for a normal index and 0 when ``index`` holds a single
+        # element that broadcasts to every non-zero. That mirrors the native path,
+        # where ``index.reshape(-1)`` of length 1 is assigned to a row of length
+        # ``grad.numel()`` and therefore repeats.
         code.writeline(
-            "idx_gather = tl.load(index_ptr + offs, mask=mask, other=0).to(tl.int64)"
+            "idx_gather = tl.load(index_ptr + offs * idx_stride, mask=mask, other=0).to(tl.int64)"
         )
         code.writeline("cur = offs")
-        for d in range(rank - 1, -1, -1):
+        for d in range(grad_ndim - 1, -1, -1):
             code.writeline(f"coord{d} = cur % dim_size{d}")
             code.writeline(f"cur = cur // dim_size{d}")
-            code.writeline(f"store_val{d} = tl.where({d} == dim, idx_gather, coord{d})")
-            code.writeline(
-                f"tl.store(out_ptr + {d} * nnz + offs, store_val{d}, mask=mask)"
-            )
+            if d < rank:
+                code.writeline(
+                    f"store_val{d} = tl.where({d} == dim, idx_gather, coord{d})"
+                )
+                code.writeline(
+                    f"tl.store(out_ptr + {d} * nnz + offs, store_val{d}, mask=mask)"
+                )
     code.newline()
     code.newline()
     return code
 
 
 def generate_wrapper(
-    rank: int, wrapper_name: str, kernel_name: str, code: IndentedBuffer
+    rank: int,
+    grad_ndim: int,
+    wrapper_name: str,
+    kernel_name: str,
+    code: IndentedBuffer,
 ) -> IndentedBuffer:
     code.writeline(
-        f"def {wrapper_name}(index_flat, out, nnz, dim, dim_count, dim_sizes):"
+        f"def {wrapper_name}(index_flat, out, nnz, dim, idx_stride, dim_count, dim_sizes):"
     )
     with code.indent():
         code.writeline("BLOCK_SIZE = 1024")
         code.writeline("grid = (triton.cdiv(nnz, BLOCK_SIZE),)")
         code.writeline(f"{kernel_name}[grid](")
         with code.indent():
-            args = ["index_flat, ", "out, ", "nnz, ", "dim, "]
-            args += [f"dim_sizes[{i}], " for i in range(rank)]
-            args += ["dim_count, ", "BLOCK_SIZE, "]
+            args = ["index_flat, ", "out, ", "nnz, ", "dim, ", "idx_stride, "]
+            args += [f"dim_sizes[{i}], " for i in range(grad_ndim)]
+            args += ["BLOCK_SIZE, "]
             code.writelines(args)
         code.writeline(")")
     code.newline()
@@ -100,10 +118,10 @@ def generate_wrapper(
 def generate_code(
     inputs: Tuple[Any], wrapper_name: str, kernel_name: str, code: IndentedBuffer
 ) -> IndentedBuffer:
-    rank = inputs[0]
+    rank, grad_ndim = inputs[0], inputs[1]
     code = generate_imports(code)
-    code = generate_kernel(rank, kernel_name, code)
-    code = generate_wrapper(rank, wrapper_name, kernel_name, code)
+    code = generate_kernel(rank, grad_ndim, kernel_name, code)
+    code = generate_wrapper(rank, grad_ndim, wrapper_name, kernel_name, code)
     return code
 
 
@@ -112,15 +130,20 @@ class GatherSparseBackwardFunction:
         self.pid = os.getpid()
         self.overloads: Mapping[str, Callable] = {}
 
+    # Positional arguments of the generated wrapper.
+    _RANK_IDX = 5
+    _DIM_SIZES_IDX = 6
+
     def __call__(self, *args, **kwargs):
         key = self.arg_key(*args)
         if key in self.overloads:
             overload = self.overloads[key]
         else:
-            rank = args[4]  # dim_count is the 5th positional arg
+            rank = args[self._RANK_IDX]
+            grad_ndim = len(args[self._DIM_SIZES_IDX])
             code = IndentedBuffer()
             code = generate_code(
-                (rank,),
+                (rank, grad_ndim),
                 "_gather_sparse_backward_wrapper",
                 "_gather_sparse_backward_kernel",
                 code,
@@ -140,7 +163,7 @@ class GatherSparseBackwardFunction:
         return overload(*args, **kwargs)
 
     def arg_key(self, *args):
-        return str(args[4])
+        return f"{len(args[self._DIM_SIZES_IDX])}_{args[self._RANK_IDX]}"
 
 
 @lru_cache(maxsize=1)
@@ -156,58 +179,51 @@ def _gather_sparse_backward(self, dim, index, grad):
 
     ndim = self.ndim
 
-    # ATen has dedicated scalar paths: when either ``self`` or ``index`` is 0-dim
-    # the equal-rank requirement does not apply. Verified against the native op:
+    # ATen has two dedicated scalar paths and they are *not* symmetric. From
+    # aten/src/ATen/native/TensorAdvancedIndexing.cpp:
     #
-    #   0-dim self, 0-dim index -> nnz 1, sparse_dim 0, indices (0, 1)
-    #   1-dim self, 0-dim index -> nnz 1, sparse_dim 1, indices (1, 1)
-    #   0-dim self, 1-dim index -> nnz 1, sparse_dim 0, indices (0, 1)
+    #   if (self.ndimension() == 0)
+    #     return _sparse_coo_tensor_unsafe({0, grad.numel()}, grad, self.sizes());
+    #   if (grad.ndimension() == 0)
+    #     return _sparse_coo_tensor_unsafe(index.view({1, 1}), grad, self.sizes());
     #
-    # so a 0-dim operand yields a single non-zero and the sparse dimensionality
-    # follows ``self``, not ``index``.
-    is_scalar_case = ndim == 0 or index.ndim == 0
-    if not is_scalar_case and ndim != index.ndim:
-        raise IndexError(
-            f"self and index must have the same number of dimensions, "
-            f"got self.ndim = {ndim} and index.ndim = {index.ndim}"
-        )
-
-    # Normalize the gather dimension (matches aten's `maybe_wrap_dim`). A 0-dim
-    # self admits only dim 0/-1, which both normalize to 0.
+    # A 0-dim ``self`` is checked first. It ignores ``index`` and ``dim``
+    # completely, keeps *every* grad value and emits a ``(0, grad.numel())``
+    # index tensor, so the result has sparse_dim 0.
+    #
+    # A 0-dim ``grad`` on a non-scalar ``self`` keeps the real
+    # ``index.view(1, 1)`` coordinate -- a nonzero scalar index stays nonzero --
+    # with a single value. Both paths must run before the equal-rank check, which
+    # does not apply to them.
     if ndim == 0:
-        if dim not in (0, -1):
-            raise IndexError(
-                f"Dimension out of range (expected to be in range of [-1, 0], "
-                f"but got {dim})"
-            )
-        dim = 0
-    else:
-        dim = dim if dim >= 0 else dim + ndim
-        if not 0 <= dim < ndim:
-            raise IndexError(
-                f"Dimension out of range (expected to be in range of "
-                f"[{-ndim}, {ndim - 1}], but got {dim})"
-            )
-
-    if is_scalar_case:
-        # One non-zero at the all-zero coordinate; the sparse dimensionality comes
-        # from ``self``, so a 0-dim self gives a (0, 1) index tensor.
-        values = grad.reshape(-1)[:1] if grad.numel() else grad.reshape(-1)
-        sparse_indices = torch.zeros(
-            (ndim, values.numel()), dtype=torch.int64, device=index.device
+        sparse_indices = torch.empty(
+            (0, grad.numel()), dtype=torch.int64, device=index.device
         )
         return torch.sparse_coo_tensor(
-            sparse_indices, values, self.size(), device=self.device
+            sparse_indices, grad, self.size(), device=self.device
         )
 
-    index = index.contiguous()
-    grad = grad.contiguous()
-    nnz = index.numel()
+    if grad.ndim == 0:
+        sparse_indices = index.reshape(1, 1)
+        if sparse_indices.dtype != torch.int64:
+            sparse_indices = sparse_indices.to(torch.int64)
+        return torch.sparse_coo_tensor(
+            sparse_indices, grad, self.size(), device=self.device
+        )
+
+    # ``grad`` supplies the non-zero count and, for non-gather dimensions, the
+    # extents the flat coordinate is unravelled over. ``index`` only contributes
+    # the coordinate along ``dim``, as ``index.reshape(-1)``; when it holds a
+    # single element that value broadcasts across every non-zero, exactly like
+    # the native row assignment.
+    nnz = grad.numel()
 
     # The sparse values are simply the flattened gradient.
     values = grad.reshape(-1)
 
-    # Build the sparse COO indices tensor of shape [ndim, nnz].
+    # An empty grad gives nnz == 0. The native op allocates its index tensor
+    # before the ``grad_numel > 0`` guard, so the row count here is always
+    # ``self.ndim`` regardless of the ranks involved.
     if nnz == 0:
         sparse_indices = torch.empty((ndim, 0), dtype=torch.int64, device=index.device)
         out = torch.sparse_coo_tensor(
@@ -215,15 +231,48 @@ def _gather_sparse_backward(self, dim, index, grad):
         )
         return out
 
-    index_flat = index.reshape(-1)
+    # The native op unravells each flat coordinate over the extents of ``grad``
+    # (its ``n_above`` starts at ``grad.numel()`` even though the loop runs only
+    # ``self.ndim`` times) and writes the leading ``self.ndim`` rows, so a
+    # higher-rank ``grad`` still contributes to the coordinates. A lower-rank
+    # ``grad`` would index past its own extents, which the native op rejects --
+    # but only when there is something to unravel, hence the nnz == 0 early exit
+    # above.
+    if grad.ndim < ndim:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of "
+            f"[{-grad.ndim}, {grad.ndim - 1}], but got {grad.ndim})"
+        )
+
+    index_flat = index.reshape(-1).contiguous()
+    # A single index element broadcasts to all nnz entries (stride 0 in the
+    # kernel); otherwise it must line up one-to-one with the gradient.
+    if index_flat.numel() == 1:
+        idx_stride = 0
+    elif index_flat.numel() == nnz:
+        idx_stride = 1
+    else:
+        raise IndexError(
+            f"index must have 1 or {nnz} elements to match the gradient, "
+            f"got {index_flat.numel()}"
+        )
+
+    # The native op validates nothing about ``dim``: the row is only overwritten
+    # when some ``i`` equals ``dim``, so a dim outside ``[0, ndim)`` simply never
+    # matches and every coordinate stays at its unravelled value. Negative dims
+    # are folded first (its loop runs ``i`` in ``range(ndim)``).
+    dim = dim if dim >= 0 else dim + ndim
+
     if index_flat.dtype != torch.int64:
         index_flat = index_flat.to(torch.int64)
 
     sparse_indices = torch.empty((ndim, nnz), dtype=torch.int64, device=index.device)
 
-    dim_sizes = tuple(int(s) for s in index.shape)
+    dim_sizes = tuple(int(s) for s in grad.shape)
     with torch_device_fn.device(index.device):
-        _kernel_func()(index_flat, sparse_indices, nnz, dim, ndim, dim_sizes)
+        _kernel_func()(
+            index_flat, sparse_indices, nnz, dim, idx_stride, ndim, dim_sizes
+        )
 
     out = torch.sparse_coo_tensor(
         sparse_indices, values, self.size(), device=self.device

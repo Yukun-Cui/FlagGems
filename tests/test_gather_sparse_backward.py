@@ -51,6 +51,13 @@ def _make_gather_index(inp_shape, dim, duplicate_indices):
     return index
 
 
+def _numel(shape):
+    n = 1
+    for s in shape:
+        n *= s
+    return n
+
+
 def _assert_sparse_equal(res, ref, dtype, atol=None):
     """Compare two sparse COO tensors element-wise against the uncoalesced
     layout produced by aten::_gather_sparse_backward.
@@ -250,8 +257,54 @@ def test_gather_sparse_backward_scalar(self_shape, index_shape, dtype):
     )
     res_out = flag_gems._gather_sparse_backward(inp, 0, index, grad)
 
-    assert res_out.shape == ref_out.shape
-    assert res_out.sparse_dim() == ref_out.sparse_dim()
-    assert res_out._nnz() == ref_out._nnz()
-    assert res_out._indices().shape == ref_out._indices().shape
-    utils.gems_assert_close(res_out._values(), ref_out._values(), dtype)
+    _assert_sparse_equal(res_out, ref_out, dtype)
+
+
+@pytest.mark.gather_sparse_backward
+@pytest.mark.parametrize(
+    "self_shape,index_shape,grad_shape",
+    [
+        # 0-dim self wins over everything: every grad value is preserved, the
+        # index is ignored, and the result has sparse_dim 0.
+        ((), (), (1,)),
+        ((), (), (3,)),  # multi-element grad
+        ((), (1,), (1,)),
+        ((), (3,), (3,)),  # nonzero scalar index, multi-element grad
+        ((), (2, 2), (4,)),
+        ((), (3,), ()),  # 0-dim self still wins over a 0-dim grad
+        # 0-dim grad on a non-scalar self keeps the real index.view(1, 1).
+        ((5,), (), ()),
+        ((5,), (), (1,)),
+        ((4,), (1,), ()),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_gather_sparse_backward_scalar_paths(
+    self_shape, index_shape, grad_shape, dtype
+):
+    """The two native scalar paths are not symmetric, so exercise them apart.
+
+    A 0-dim ``self`` keeps *all* grad values and ignores the index entirely
+    (indices shape ``(0, grad.numel())``). A 0-dim ``grad`` on a non-scalar
+    ``self`` keeps the actual ``index.view(1, 1)`` -- a nonzero scalar index must
+    stay nonzero -- with a single value. Both are compared against ATen on
+    ``_indices()`` as well as values, so a hardcoded zero coordinate fails.
+    """
+    inp = torch.randn(self_shape, dtype=dtype, device=flag_gems.device)
+    # A fixed, position-varying nonzero index (values cycle through 1..3) so a
+    # hardcoded zero coordinate or a truncated index cannot pass.
+    if index_shape:
+        index = (
+            torch.arange(max(1, _numel(index_shape)), dtype=torch.long) % 3 + 1
+        ).reshape(index_shape)
+    else:
+        index = torch.tensor(2, dtype=torch.long)
+    index = index.to(flag_gems.device)
+    grad = torch.randn(grad_shape, dtype=dtype, device=flag_gems.device)
+
+    ref_out = _gather_sparse_backward(
+        utils.to_reference(inp), 0, utils.to_reference(index), utils.to_reference(grad)
+    )
+    res_out = flag_gems._gather_sparse_backward(inp, 0, index, grad)
+
+    _assert_sparse_equal(res_out, ref_out, dtype)
