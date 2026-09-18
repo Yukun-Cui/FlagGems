@@ -55,6 +55,25 @@ def _scalar_type_name(dtype):
     return _SCALAR_TYPE_NAMES.get(dtype, str(dtype))
 
 
+@triton.jit
+def _trap_if(cond):
+    """Trap the device unconditionally when ``cond`` is true.
+
+    ``tl.device_assert`` is stripped unless ``TRITON_DEBUG=1``, which would leave
+    an out-of-range index silently dropped in normal builds. Emitting the PTX
+    ``trap`` instruction directly keeps the check active in every build while
+    still reporting the failure asynchronously, the way ATen's CUDA kernel does.
+    """
+    tl.inline_asm_elementwise(
+        asm="{ .reg .pred p; setp.ne.b32 p, $1, 0; @p trap; mov.u32 $0, 0; }",
+        constraints="=r,r",
+        args=[cond.to(tl.int32)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
 @libentry()
 @triton.jit(do_not_specialize=["N", "out_numel"])
 def put_scatter_kernel(
@@ -62,7 +81,6 @@ def put_scatter_kernel(
     index_ptr,
     source_ptr,
     layout_ptr,
-    oob_ptr,
     out_numel,
     N,
     RANK: tl.constexpr,
@@ -87,9 +105,12 @@ def put_scatter_kernel(
     the decoded offset is simply doubled -- ``view_as_real`` multiplies every
     stride by two and appends a unit stride, which is the same address.
 
-    An index outside ``[-out_numel, out_numel)`` sets ``oob_ptr`` so the host can
-    raise the ``IndexError`` ATen raises. Such an element is skipped rather than
-    clamped, so a bad index can never write outside ``out``.
+    An index outside ``[-out_numel, out_numel)`` traps the device, matching the
+    ``cuda_take_put_kernel() index out of bounds`` assertion ATen's CUDA kernel
+    raises. The trap is unconditional (unlike ``tl.device_assert``, which is
+    compiled out unless ``TRITON_DEBUG=1``), and it happens on the device so the
+    success path never pays a host round trip. Such an element is skipped rather
+    than clamped, so a bad index can never write outside ``out``.
     """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -99,9 +120,11 @@ def put_scatter_kernel(
     # A negative index counts back from the end of the flattened tensor.
     cur_index = tl.where(raw_index < 0, raw_index + out_numel, raw_index)
     index_valid = (cur_index >= 0) & (cur_index < out_numel)
-    # Report (rather than silently ignore) an index ATen would reject.
-    if tl.max((mask & (~index_valid)).to(tl.int32)) > 0:
-        tl.atomic_max(oob_ptr, 1, sem="relaxed")
+    # Fail on the device (rather than silently ignoring) for an index ATen would
+    # reject, and without making the success path synchronize: a single
+    # bitmask-wide reduction decides whether any lane is out of range.
+    oob = tl.max((mask & (~index_valid)).to(tl.int32)) > 0
+    _trap_if(oob)
     final_mask = mask & index_valid
 
     if IS_CONTIGUOUS:
@@ -223,7 +246,7 @@ def _flat_copy(dst, src):
     return copy_(dst, src)
 
 
-def _launch_scatter(meta, data, index, source, accumulate, oob, elems_per_slot):
+def _launch_scatter(meta, data, index, source, accumulate, elems_per_slot):
     """Launch the scatter. ``meta`` supplies the layout, ``data`` the storage.
 
     The two differ only for complex tensors, where ``data`` is the interleaved real
@@ -254,7 +277,6 @@ def _launch_scatter(meta, data, index, source, accumulate, oob, elems_per_slot):
         index,
         source,
         layout_t,
-        oob,
         meta.numel(),
         N,
         RANK=rank,
@@ -275,10 +297,15 @@ def _put_scatter(out, index, source, accumulate):
         # ATen rejects a write into an empty tensor before it looks at `index`.
         raise IndexError("put_(): Tried to put elements into an empty tensor")
 
-    # The kernel sets `oob` when an index falls outside [-numel, numel). Reading it
-    # back costs one 4-byte device-to-host sync (~15 us), which is the price of
-    # raising the same error ATen raises instead of silently dropping the element.
-    oob = torch.zeros((), dtype=torch.int32, device=out.device)
+    if out.dtype == torch.complex32:
+        # Native CUDA `put` has no ComplexHalf kernel
+        # (`take_put_cpu`/`put_cuda` both raise NotImplementedError), and the
+        # Triton path cannot represent complex32 either. Reject it explicitly so
+        # the failure matches ATen instead of silently routing through the FP16
+        # real-view path.
+        raise NotImplementedError(
+            '"put_cuda" not implemented for ' f"'{_scalar_type_name(torch.complex32)}'"
+        )
 
     if out.is_complex():
         # Triton has no complex dtype; scatter the interleaved real views. The
@@ -289,7 +316,6 @@ def _put_scatter(out, index, source, accumulate):
             index,
             torch.view_as_real(source),
             accumulate,
-            oob,
             elems_per_slot=2,
         )
     elif accumulate and out.dtype in _NARROW_ACC_DTYPES:
@@ -297,9 +323,7 @@ def _put_scatter(out, index, source, accumulate):
         # int32 staging buffer holding `out`'s row-major values, then narrow back.
         row_major = out if out.is_contiguous() else out.contiguous()
         staging = row_major.to(torch.int32)
-        _launch_scatter(
-            staging, staging, index, source.to(torch.int32), accumulate, oob, 1
-        )
+        _launch_scatter(staging, staging, index, source.to(torch.int32), accumulate, 1)
         narrowed = torch.empty_like(row_major)
         BLOCK_SIZE = 1024
         put_narrow_cast_kernel[(triton.cdiv(narrowed.numel(), BLOCK_SIZE),)](
@@ -312,13 +336,7 @@ def _put_scatter(out, index, source, accumulate):
         )
         _flat_copy(out, narrowed)
     else:
-        _launch_scatter(out, out, index, source, accumulate, oob, elems_per_slot=1)
-
-    if oob.item() != 0:
-        raise IndexError(
-            f"out of range: tried to access an index outside a tensor of "
-            f"{out.numel()} elements."
-        )
+        _launch_scatter(out, out, index, source, accumulate, elems_per_slot=1)
 
     return out
 

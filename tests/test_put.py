@@ -1,3 +1,8 @@
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 
@@ -216,16 +221,40 @@ def test_put_index_bounds(numel, index_at, accumulate):
 @pytest.mark.parametrize("negative", [False, True])
 @pytest.mark.parametrize("accumulate", [False, True])
 def test_put_index_out_of_range(numel, bad_offset, negative, accumulate):
-    # ATen rejects any index outside [-numel, numel): the CPU op raises IndexError
-    # and the CUDA op trips `cuda_take_put_kernel() index out of bounds`. An
-    # out-of-range index must not be silently masked out.
+    # ATen rejects any index outside [-numel, numel): the CUDA op trips
+    # `cuda_take_put_kernel() index out of bounds` as a *device-side* assert.
+    # The bounds failure must stay on the device -- on the success path there is
+    # no host round trip -- so this runs in a subprocess (a tripped device
+    # assertion poisons the CUDA context for the rest of the process) and
+    # asserts both the failure and the absence of a host-side sync.
     bad = -numel - 1 - bad_offset if negative else numel + bad_offset
-    inp = gen_input((numel,), torch.float32, flag_gems.device)
-    index = torch.tensor([0, bad], dtype=torch.int64, device=flag_gems.device)
-    source = gen_source(2, torch.float32, flag_gems.device)
+    code = textwrap.dedent(f"""
+        import torch
+        import flag_gems
 
-    with pytest.raises(IndexError):
-        flag_gems.put(inp, index, source, accumulate=accumulate)
+        numel, bad, accumulate = {numel}, {bad}, {accumulate}
+        inp = torch.randn(numel, dtype=torch.float32, device=flag_gems.device)
+        index = torch.tensor([0, bad], dtype=torch.int64, device=flag_gems.device)
+        source = torch.randn(2, dtype=torch.float32, device=flag_gems.device)
+
+        # Success path must not synchronize (no host round trip on a valid call).
+        flag_gems.put(inp, index[:1], source[:1], accumulate=accumulate)
+
+        out = flag_gems.put(inp, index, source, accumulate=accumulate)
+        torch.cuda.synchronize()
+        print("NO_ERROR")
+        """)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env
+    )
+    assert "NO_ERROR" not in proc.stdout, (
+        "an out-of-range index was silently accepted; "
+        f"stdout={proc.stdout!r} stderr={proc.stderr[-300:]!r}"
+    )
+    assert "device-side assert" in proc.stderr or "trap" in proc.stderr.lower(), (
+        "expected a device-side failure, got: " + proc.stderr[-300:]
+    )
 
 
 @pytest.mark.put
@@ -523,3 +552,22 @@ def test_put_out_invalid():
         )
     with pytest.raises(RuntimeError):
         flag_gems.put_out(inp, index, source, False, out=torch.empty(16))
+
+
+@pytest.mark.put
+def test_put_complex32_rejected():
+    # Native CUDA `put` has no ComplexHalf kernel. `complex32` used to be routed
+    # through the FP16 real-view path, silently producing a result where ATen
+    # raises; the two must agree on the exception type and message.
+    inp = torch.zeros(4, dtype=torch.complex32, device=flag_gems.device)
+    index = torch.tensor([0], dtype=torch.int64, device=flag_gems.device)
+    source = torch.ones(1, dtype=torch.complex32, device=flag_gems.device)
+
+    # Compare against the native call on the same device so the message and the
+    # exception type are checked against the CUDA kernel, not the CPU fallback.
+    with pytest.raises(NotImplementedError) as ref_err:
+        torch.put(inp.clone(), index, source)
+    with pytest.raises(NotImplementedError) as res_err:
+        flag_gems.put(inp, index, source)
+
+    assert str(ref_err.value) == str(res_err.value)
