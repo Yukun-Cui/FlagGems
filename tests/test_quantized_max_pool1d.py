@@ -382,10 +382,57 @@ def test_quantized_max_pool1d_quant_params(in_dtype, scale, zero_point):
     assert torch.equal(res_out.int_repr().to("cpu"), ref_out.int_repr())
 
 
-# L=1 with C>1: the aten CPU kernel writes the right values in channels-last
-# order but tags the result with contiguous NCL strides, so its output
-# disagrees with float max_pool1d. FlagGems follows max_pool1d instead, which
-# means this case is checked against the float reference rather than aten.
+def _aten_unit_length_layout_is_broken(q_input):
+    """The documented domain of the ATen layout defect described below.
+
+    Used only to attribute an observed mismatch: if ATen and ``max_pool1d``
+    disagree outside this domain, something else changed and the test must not
+    silently repair it.
+    """
+    return q_input.dim() == 3 and q_input.shape[1] > 1 and q_input.shape[-1] == 1
+
+
+def _aten_unit_length_int_repr(out):
+    """The integer result ATen's mislabelled buffer actually holds.
+
+    See ``test_quantized_max_pool1d_unit_length`` for the full description. The
+    bytes are correct; only the strides are wrong, so reading the raw buffer as
+    (N, L, C) and permuting back to (N, C, L) recovers the intended result.
+    """
+    n, c = out.shape[0], out.shape[1]
+    out_l = out.shape[-1]
+    return out.int_repr().reshape(n, out_l, c).permute(0, 2, 1).contiguous()
+
+
+# L=1 with C>1: `quantized_max_pool1d` unsqueezes a (N, C, L) input to
+# (N, C, 1, L) and dispatches to the 2D kernel. When L == 1 that 4D tensor is
+# *trivially* channels-last-contiguous, so `q_maxpool_2d` takes its NHWC fast
+# path, writes the result in NHWC (here NLC) order, and returns a tensor whose
+# strides nonetheless claim a contiguous NCL layout. The bytes are right and the
+# strides lie, so the *logical* values are wrong. This is an ATen CPU defect, not
+# a FlagGems one: an independent window-max reference and the float
+# `max_pool1d` both agree with FlagGems, and ATen's own buffer read as NLC
+# reproduces the correct answer exactly.
+#
+# Reproduce on torch 2.11.0:
+#     q = torch.quantize_per_tensor(
+#         torch.arange(1.0, 7.0).reshape(2, 3, 1), 1.0, 0, torch.quint8
+#     )
+#     torch.quantized_max_pool1d(q, 2, stride=1, padding=1).int_repr()
+#     # -> [[[1, 2], [3, 1], [2, 3]], [[4, 5], [6, 4], [5, 6]]]   (logical, wrong)
+#     torch.nn.functional.max_pool1d(q.int_repr().float(), 2, stride=1, padding=1)
+#     # -> [[[1, 1], [2, 2], [3, 3]], [[4, 4], [5, 5], [6, 6]]]   (correct)
+#     # ATen's buffer read as NLC equals the correct result:
+#     torch.quantized_max_pool1d(q, 2, stride=1, padding=1).int_repr()
+#         .reshape(2, 2, 3).permute(0, 2, 1)
+#     # -> [[[1, 1], [2, 2], [3, 3]], [[4, 4], [5, 5], [6, 6]]]
+# Only 3D inputs with L == 1 and C > 1 are affected; 2D (N, L) inputs and 3D
+# inputs with C == 1 or L > 1 match the reference exactly.
+#
+# This case is therefore still compared against `torch.quantized_max_pool1d`;
+# the expectation is the native operator's output with its mislabelled buffer
+# re-read, which the test verifies against an independent reference. Remove the
+# repair (and this note) once the upstream kernel is fixed.
 @pytest.mark.quantized_max_pool1d
 @pytest.mark.parametrize("in_dtype", QUANT_DTYPES)
 @pytest.mark.parametrize("shape", [(2, 3, 1), (1, 3, 1), (3, 5, 1), (2, 1, 1)])
@@ -398,12 +445,32 @@ def test_quantized_max_pool1d_unit_length(in_dtype, shape):
     ref_inp = torch.quantize_per_tensor(fp, scale, 0, in_dtype)
     res_inp = ref_inp.to(flag_gems.device)
 
+    ref_out = torch.quantized_max_pool1d(ref_inp, 2, stride=1, padding=1)
+
     # Pool the integer representation directly: comparing dequantized floats
     # would trip over scale round-trip error rather than the layout.
-    ref_out = torch.nn.functional.max_pool1d(
+    expected = torch.nn.functional.max_pool1d(
         ref_inp.int_repr().to(torch.float32), 2, stride=1, padding=1
     )
+
+    if not torch.equal(ref_out.int_repr().to(torch.float32), expected):
+        # ATen hit the layout defect described above. Pin it so the repair below
+        # cannot silently become stale: re-reading the buffer as NLC *must*
+        # reproduce the independent reference exactly, otherwise this is a
+        # different failure and the test should fail rather than paper over it.
+        assert _aten_unit_length_layout_is_broken(ref_inp), (
+            "torch.quantized_max_pool1d disagrees with max_pool1d on "
+            f"{tuple(ref_inp.shape)}, which the documented ATen layout defect "
+            "does not explain"
+        )
+        ref_int_repr = _aten_unit_length_int_repr(ref_out)
+        assert torch.equal(ref_int_repr.to(torch.float32), expected)
+    else:
+        # Outside the affected domain the native op already agrees, so the
+        # comparison above needs no repair.
+        ref_int_repr = ref_out.int_repr()
+
     res_out = flag_gems.quantized_max_pool1d(res_inp, 2, stride=1, padding=1)
 
     assert tuple(res_out.shape) == tuple(ref_out.shape)
-    assert torch.equal(res_out.int_repr().to("cpu").to(torch.float32), ref_out)
+    assert torch.equal(res_out.int_repr().to("cpu"), ref_int_repr)
