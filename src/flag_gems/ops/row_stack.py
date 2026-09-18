@@ -23,6 +23,7 @@ from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils.shape_utils import MemOverlap, has_internal_overlapping
 
 logger = logging.getLogger(__name__)
 
@@ -68,32 +69,153 @@ def row_stack_kernel(
     local_row = tl.where(tensor_idx == 2, local_row2, local_row)
     local_row = tl.where(tensor_idx == 3, local_row3, local_row)
 
-    end_idx = local_row * row_stride.to(tl.int64)
+    # Widen through the tensor operands rather than through ``row_stride``:
+    # Triton specializes a scalar ``1`` (and ``0``) to a constexpr, which has no
+    # ``.to`` method, so casting the scalar itself would fail for width-1 rows.
+    end_idx = local_row.to(tl.int64) * row_stride
     idx = (pid_x * BLOCK_SIZE + col_idx).to(tl.int64)
     offset_mask = idx < end_idx
     in_offset = intensor_ptr + idx
-    row_stride_offset = (total_row_offset + base_exc_row_idx) * row_stride.to(tl.int64)
+    row_stride_offset = (total_row_offset + base_exc_row_idx).to(tl.int64) * row_stride
     out_offset = output_ptr + row_stride_offset + idx
     out = tl.load(in_offset, mask=offset_mask)
     tl.store(out_offset, out, mask=offset_mask)
 
 
-def _row_stack_run(tensors, output):
-    tensors = torch.atleast_2d(tensors)
-    num_tensors = len(tensors)
-    assert num_tensors > 0
+def _row_width(shape):
+    """Number of elements in one row = product of the trailing dimensions."""
+    width = 1
+    for size in shape[1:]:
+        width *= size
+    return width
 
-    # Ensure all tensors are on the same device and have the same dtype
+
+def _row_strides(shape):
+    """Row-major contiguous strides, matching ATen for zero-sized dimensions.
+
+    ATen skips the stride multiply for a zero-sized dimension, so ``(5, 0)``
+    gets stride ``(1, 1)`` rather than ``(0, 1)``.  Reproducing that keeps the
+    output metadata identical to the reference for empty inputs.
+    """
+    strides = [0] * len(shape)
+    step = 1
+    for dim in range(len(shape) - 1, -1, -1):
+        strides[dim] = step
+        if shape[dim] != 0:
+            step *= shape[dim]
+    return strides
+
+
+def _channels_last_strides(shape):
+    """channels_last (rank 4) / channels_last_3d (rank 5) strides."""
+    if len(shape) == 4:
+        _, c, h, w = shape
+        return [c * h * w, 1, w * c, c]
+    _, c, d, h, w = shape
+    return [c * d * h * w, 1, h * w * c, w * c, c]
+
+
+def _strides_for(shape, memory_format):
+    """Strides ATen's allocator uses for ``shape`` in ``memory_format``.
+
+    For channels-last the allocated strides are what the kernel needs: dim 0 is
+    stepped by ``row_width`` (the product of the trailing sizes) and each row is
+    a dense run of ``row_width`` elements, tiled back to back.
+    """
+    if memory_format == torch.channels_last and len(shape) == 4:
+        return _channels_last_strides(shape)
+    if memory_format == torch.channels_last_3d and len(shape) == 5:
+        return _channels_last_strides(shape)
+    return _row_strides(shape)
+
+
+def _promote_dtype(tensors):
+    dtype = tensors[0].dtype
+    for tensor in tensors[1:]:
+        if tensor.dtype != dtype:
+            dtype = torch.promote_types(dtype, tensor.dtype)
+    return dtype
+
+
+def _suggest_memory_format(tensor):
+    """Mirror ATen's ``TensorImpl::suggest_memory_format``.
+
+    Only an exact channels-last / channels-last-3d layout (rank 4 / rank 5) is
+    reported; anything else maps to the default contiguous format.
+    """
+    from torch._prims_common import suggest_memory_format
+
+    if tensor.layout != torch.strided:
+        return torch.contiguous_format
+    return suggest_memory_format(tensor)
+
+
+def _derive_memory_format(tensors):
+    """ATen's ``cat_compute_output_memory_format``: all inputs must agree."""
+    fmt = None
     for tensor in tensors:
-        assert (
-            tensor.device == tensors[0].device
-            and tensor.dtype == tensors[0].dtype
-            and tensors[0].shape[1:] == tensor.shape[1:]
-        )
+        current = _suggest_memory_format(tensor)
+        if current == torch.contiguous_format:
+            return torch.contiguous_format
+        if fmt is not None and fmt != current:
+            return torch.contiguous_format
+        fmt = current
+    return fmt if fmt is not None else torch.contiguous_format
 
-    c_tensors = [t.contiguous() for t in tensors]
-    row_stride = c_tensors[0].stride(0)
 
+def _allocate(shape, strides, dtype, device):
+    return torch.empty_strided(tuple(shape), tuple(strides), dtype=dtype, device=device)
+
+
+def _normalize_tensors(tensors):
+    """``atleast_2d`` plus ATen-compatible validation."""
+    tensors = list(torch.atleast_2d(tensors))
+    if len(tensors) == 0:
+        raise RuntimeError("vstack expects a non-empty TensorList")
+
+    device = tensors[0].device
+    ndim = tensors[0].dim()
+    for i, tensor in enumerate(tensors[1:], start=1):
+        if tensor.device != device:
+            raise RuntimeError(
+                "Expected all tensors to be on the same device, but got "
+                f"{tensor.device} and {device}"
+            )
+        if tensor.dim() != ndim:
+            raise RuntimeError(
+                "Tensors must have same number of dimensions: got "
+                f"{ndim} and {tensor.dim()}"
+            )
+        for dim, (expected, got) in enumerate(zip(tensors[0].shape, tensor.shape)):
+            if dim != 0 and expected != got:
+                raise RuntimeError(
+                    "Sizes of tensors must match except in dimension 0. "
+                    f"Expected size {expected} but got size {got} for tensor "
+                    f"number {i} in the list."
+                )
+    return tensors
+
+
+def _cast_tensors(tensors, dtype, memory_format):
+    """Bring every input to ``dtype`` with a row block dense in layout order.
+
+    The kernel copies row blocks positionally, so each input must be dense in
+    the *same* trailing layout as the output; a channels-last input that was
+    flattened to contiguous order would scatter elements to wrong positions.
+    """
+    cast = []
+    for tensor in tensors:
+        if tensor.dtype != dtype:
+            tensor = tensor.to(dtype)
+        if not tensor.is_contiguous(memory_format=memory_format):
+            tensor = tensor.contiguous(memory_format=memory_format)
+        cast.append(tensor)
+    return cast
+
+
+def _run_kernel(tensors, output, row_width, out_row_stride):
+    """Copy every input row block into ``output`` through the Triton kernel."""
+    num_tensors = len(tensors)
     outer_iters = triton.cdiv(num_tensors, 4)
     total_row_offset = 0
     for i in range(outer_iters):
@@ -107,25 +229,26 @@ def _row_stack_run(tensors, output):
             tensor_idx = i * 4 + j
             if tensor_idx < num_tensors:
                 scheduled_num_tensors += 1
-                itensors.append(c_tensors[tensor_idx])
-                local_row.append(c_tensors[tensor_idx].shape[0])
+                tensor = tensors[tensor_idx]
+                itensors.append(tensor)
+                local_row.append(tensor.shape[0])
                 exclusive_row.append(array_row_offset)
-                array_row_offset += c_tensors[tensor_idx].shape[0]
-                max_rows = max(max_rows, c_tensors[tensor_idx].shape[0])
+                array_row_offset += tensor.shape[0]
+                max_rows = max(max_rows, tensor.shape[0])
             else:
                 empty_tensor = torch.empty(
-                    0, dtype=c_tensors[0].dtype, device=c_tensors[0].device
+                    0, dtype=tensors[0].dtype, device=tensors[0].device
                 )
                 itensors.append(empty_tensor)
                 local_row.append(local_row[-1])
                 exclusive_row.append(exclusive_row[-1])
-        max_tile_elems = max_rows * row_stride
+        max_tile_elems = max_rows * row_width
         grid = lambda META: (
             triton.cdiv(max_tile_elems, META["BLOCK_SIZE"]),
             scheduled_num_tensors,
         )
         # Launch the kernel
-        with torch_device_fn.device(c_tensors[0].device):
+        with torch_device_fn.device(tensors[0].device):
             row_stack_kernel[grid](
                 itensors[0],
                 itensors[1],
@@ -141,77 +264,113 @@ def _row_stack_run(tensors, output):
                 exclusive_row[2],
                 exclusive_row[3],
                 total_row_offset,
-                row_stride,
+                out_row_stride,
                 max_tile_elems,
             )
             total_row_offset += array_row_offset
     return output
 
 
+def _output_shape(tensors):
+    total_rows = sum(tensor.shape[0] for tensor in tensors)
+    shape = list(tensors[0].shape)
+    shape[0] = total_rows
+    return shape
+
+
+def _prepare(tensors):
+    """Shared validation/shape work for both entry points."""
+    tensors = _normalize_tensors(tensors)
+    memory_format = _derive_memory_format(tensors)
+    dtype = _promote_dtype(tensors)
+    # A zero-sized trailing dimension means zero work: ``stride(0)`` can still
+    # be non-zero for such inputs (e.g. ``(3, 0)`` has stride ``(1, 1)``), so a
+    # launch based on ``rows * stride(0)`` would run out of bounds.
+    row_width = _row_width(tensors[0].shape)
+    output_shape = _output_shape(tensors)
+    return tensors, memory_format, dtype, row_width, output_shape
+
+
 def row_stack(tensors: list):
     logger.debug("GEMS ROW_STACK")
 
-    tensors = torch.atleast_2d(tensors)
-    num_tensors = len(tensors)
-    assert num_tensors > 0
-
-    # Ensure all tensors are on the same device and have the same dtype
+    tensors, memory_format, dtype, row_width, output_shape = _prepare(tensors)
     device = tensors[0].device
-    dtype = tensors[0].dtype
-    for tensor in tensors:
-        assert (
-            tensor.device == device
-            and tensor.dtype == dtype
-            and tensors[0].shape[1:] == tensor.shape[1:]
+    if row_width == 0 or output_shape[0] == 0:
+        # Nothing to copy; still hand back a correctly shaped, format-correct
+        # tensor rather than launching a kernel that would read out of bounds.
+        return _allocate(
+            output_shape, _strides_for(output_shape, memory_format), dtype, device
         )
 
-    c_tensors = [t.contiguous() for t in tensors]
-    # Calculate the output shape
-    total_rows = sum(tensor.shape[0] for tensor in c_tensors)
-    output_shape = list(c_tensors[0].shape)
-    output_shape[0] = total_rows
-    # Allocate via ``empty_strided`` with contiguous strides to bypass the
-    # GEMS ``aten::empty.memory_format`` override, which launches a Triton
-    # zero-init kernel per allocation. The kernel fully overwrites every
-    # stored element under a mask, so an uninitialized allocation is safe and
-    # removes the fixed zero-init overhead that dominates for small stacks.
-    contig_strides = []
-    stride = 1
-    for dim in reversed(output_shape):
-        contig_strides.append(stride)
-        stride *= dim
-    contig_strides.reverse()
-    output = torch.empty_strided(
-        output_shape, contig_strides, device=device, dtype=dtype
-    )
+    strides = _strides_for(output_shape, memory_format)
+    output = _allocate(output_shape, strides, dtype, device)
+    c_tensors = _cast_tensors(tensors, dtype, memory_format)
+    return _run_kernel(c_tensors, output, row_width, strides[0])
 
-    return _row_stack_run(tensors, output)
+
+def _check_out(out, output_shape, dtype, memory_format, tensors):
+    """Validate/prepare ``out`` the way ATen's ``cat_out`` meta function does.
+
+    The ordering mirrors ATen: the castability check runs before the output is
+    resized, and the overlap checks run afterwards.
+    """
+    if not torch.can_cast(dtype, out.dtype):
+        raise TypeError(
+            "torch.cat(): input types can't be cast to the desired output type "
+            f"{out.dtype}"
+        )
+
+    if list(out.shape) != list(output_shape):
+        out.resize_(output_shape)
+        # ``resize_`` always installs contiguous strides, whereas ATen's
+        # ``set_output_raw_strided`` re-imposes the derived memory format; for
+        # channels-last that changes the strides, so restore them here.
+        strides = _strides_for(list(out.shape), memory_format)
+        if tuple(out.stride()) != tuple(strides):
+            out.as_strided_(tuple(out.shape), tuple(strides))
+
+    if has_internal_overlapping(out) == MemOverlap.Yes:
+        raise RuntimeError(
+            "unsupported operation: more than one element of the written-to "
+            "tensor refers to a single memory location. Please clone() the "
+            "tensor before performing the operation."
+        )
+    for tensor in tensors:
+        if torch._C._overlaps(out, tensor):
+            raise RuntimeError(
+                "unsupported operation: some elements of the input tensor and "
+                "the written-to tensor refer to a single memory location. "
+                "Please clone() the tensor before performing the operation."
+            )
+    return out
 
 
 def row_stack_out(tensors: list, *, out: torch.Tensor):
     logger.debug("GEMS ROW_STACK_OUT")
 
-    tensors = torch.atleast_2d(tensors)
-    num_tensors = len(tensors)
-    assert num_tensors > 0
+    tensors, memory_format, dtype, row_width, output_shape = _prepare(tensors)
+    _check_out(out, output_shape, dtype, memory_format, tensors)
 
-    # Ensure all tensors are on the same device and have the same dtype
-    device = tensors[0].device
-    dtype = tensors[0].dtype
-    for tensor in tensors:
-        assert (
-            tensor.device == device
-            and tensor.dtype == dtype
-            and tensors[0].shape[1:] == tensor.shape[1:]
-        )
+    if row_width == 0 or output_shape[0] == 0:
+        return out
 
-    c_tensors = [t.contiguous() for t in tensors]
-    # Calculate the expected output shape
-    total_rows = sum(tensor.shape[0] for tensor in c_tensors)
-    output_shape = list(c_tensors[0].shape)
-    output_shape[0] = total_rows
+    c_tensors = _cast_tensors(tensors, dtype, memory_format)
 
-    if list(out.shape) != output_shape:
-        out.resize_(output_shape)
+    # Fast path: ``out`` stores rows as dense runs of ``row_width`` elements and
+    # its trailing strides match the layout the kernel assumes.  This holds for
+    # contiguous and for channels-last outputs, so only an arbitrary strided
+    # view falls through to the staging copy below.
+    fast = out.dtype == dtype and tuple(out.stride()) == tuple(
+        _strides_for(list(out.shape), memory_format)
+    )
+    if fast:
+        return _run_kernel(c_tensors, out, row_width, out.stride(0))
 
-    return _row_stack_run(tensors, out)
+    # Otherwise scatter through a dense staging buffer; ``copy_`` is
+    # stride-aware and also honours ``out``'s dtype.
+    strides = _strides_for(output_shape, memory_format)
+    staging = _allocate(output_shape, strides, dtype, out.device)
+    _run_kernel(c_tensors, staging, row_width, strides[0])
+    out.copy_(staging)
+    return out
