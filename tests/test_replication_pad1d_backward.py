@@ -21,8 +21,11 @@ from . import accuracy_utils as utils
 # 2D/3D shapes covering small to medium width; pad1d operates on last dim
 REPLICATION_PAD1D_BACKWARD_SHAPES = [(2, 3, 8), (4, 16, 64), (1, 5, 16), (32, 256)]
 # Asymmetric and symmetric padding combinations, including the negative padding
-# that crops rather than replicates. Note (-2, -2) is not testable: ATen's forward
-# rejects it for these widths ("input (W: 4) is too small. Calculated output W: 0").
+# that crops rather than replicates. Any combination is accepted as long as the
+# resulting width stays positive: ATen's forward rejects a padding only when
+# W_out <= 0, so (-2, -2) is valid for the widths used here (W >= 8 gives
+# W_out >= 4). The error message quoted elsewhere ("input (W: 4) is too small.
+# Calculated output W: 0") comes from W=4, which these shapes never use.
 REPLICATION_PAD1D_BACKWARD_PADDING = [
     (1, 1),
     (0, 2),
@@ -33,6 +36,8 @@ REPLICATION_PAD1D_BACKWARD_PADDING = [
     (-1, 0),
     (0, -1),
     (-1, -1),
+    (-2, -2),
+    (-3, 2),
 ]
 
 # ATen supports fp64 and complex64/complex128 natively on CUDA for this operator.
