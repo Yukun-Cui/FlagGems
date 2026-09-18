@@ -95,6 +95,16 @@ def _stack(
 
     inp_shapes = [list(_.shape) for _ in tensors]
     inp0_shape = inp_shapes[0]
+    # Validate ``dim`` against tensors[0] unconditionally: with a single input
+    # the per-entry loop below never runs and an out-of-range dim would be
+    # silently accepted instead of matching ATen.
+    ndim0 = tensors[0].dim()
+    if (dim < -ndim0 - 1) or (dim > ndim0):
+        raise IndexError(
+            "Dimension out of range (expected to be in range of [{}, {}], but got {})".format(
+                -ndim0 - 1, ndim0, dim
+            )
+        )
     for i, s in enumerate(inp_shapes[1:]):
         ndim = tensors[i + 1].dim()
         if (dim < -ndim - 1) or (dim > ndim):
@@ -116,10 +126,21 @@ def _stack(
     dtype = dtypes[0]
     for dt in dtypes[1:]:
         dtype = torch.promote_types(dtype, dt)
+    # Triton has no complex scalar types. aten::_stack accepts complex dtypes,
+    # so operate on the real view of each input and reinterpret the stacked
+    # result back to complex at the end, matching the native contract.
+    is_complex = dtype.is_complex
+    if is_complex:
+        complex_dtype = dtype
+        dtype = torch.view_as_real(torch.empty((), dtype=dtype, device="cpu")).dtype
+        tensors = [torch.view_as_real(t.to(complex_dtype)) for t in tensors]
     # Convert all tensors to the result dtype if needed
     tensors = [t.to(dtype) if t.dtype != dtype else t for t in tensors]
     device = tensors[0].device
-    out_shape = inp0_shape[:dim] + [len(tensors)] + inp0_shape[dim:]
+    # Every path below works on the (possibly real-view) input shapes, so the
+    # stacked axis and trailing real dimension are handled uniformly.
+    work_shape = list(tensors[0].shape)
+    out_shape = work_shape[:dim] + [len(tensors)] + work_shape[dim:]
     # Allocate via ``empty_strided`` with contiguous strides to bypass the
     # GEMS ``aten::empty.memory_format`` override, which would launch a Triton
     # zero-init kernel. The stack kernel writes every output element (each
@@ -134,8 +155,14 @@ def _stack(
     out = torch.empty_strided(out_shape, contig_strides, dtype=dtype, device=device)
 
     dim_prod_post = 1
-    for s in inp0_shape[dim:]:
+    for s in work_shape[dim:]:
         dim_prod_post *= s
+
+    # Zero-sized inputs (e.g. shape (3, 0)) give a zero-volume output; return
+    # the correctly shaped empty tensor without launching a kernel, since a
+    # zero-volume grid would be an invalid Triton launch.
+    if out.numel() == 0:
+        return torch.view_as_complex(out) if is_complex else out
 
     # One thread per output element; 1024 is a standard block size that keeps
     # the launch grid small for the typical stack buffer sizes.
@@ -199,4 +226,6 @@ def _stack(
         )
         i += num_tensors_in_batch
 
+    if is_complex:
+        out = torch.view_as_complex(out)
     return out
