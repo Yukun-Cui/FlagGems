@@ -422,3 +422,67 @@ def test_fused_adagrad__multi_tensor(shape, dtype):
         _assert_close(p, rp, dtype)
         _assert_close(s, rs, dtype)
     _assert_grads_unchanged(grads, grads_before)
+
+
+@pytest.mark.fused_adagrad_
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fused_adagrad__transposed_parity(dtype):
+    # ATen accepts strided tensors that are non-overlapping and dense, so a
+    # matching transposed layout must be supported (the kernel walks the
+    # storage order) rather than rejected by an ``is_contiguous()`` check.
+    utils.init_seed(0)
+    shape = (256, 256)
+
+    def make_tr(values=None):
+        p = (
+            torch.randn(shape, dtype=dtype, device=flag_gems.device)
+            if values is None
+            else values
+        )
+        return p.t().contiguous().t()
+
+    params = [make_tr()]
+    grads = [make_tr()]
+    # ``state_sum`` is a running sum of squared gradients, so it must be
+    # non-negative -- a negative entry would make the reference itself NaN.
+    state_sums = [make_tr(torch.rand(shape, dtype=dtype, device=flag_gems.device))]
+    steps = [torch.tensor([3], device=flag_gems.device, dtype=torch.int32)]
+    grads_before = [g.clone() for g in grads]
+
+    opts = dict(
+        lr=0.1,
+        lr_decay=0.0,
+        weight_decay=0.0,
+        eps=1e-10,
+        maximize=False,
+        grad_scale=None,
+        found_inf=None,
+    )
+
+    ref_p, ref_s = _native_reference(params, grads, state_sums, steps, **opts)
+    flag_gems._fused_adagrad_(params, grads, state_sums, steps, **opts)
+
+    _assert_close(params[0], ref_p[0], dtype)
+    _assert_close(state_sums[0], ref_s[0], dtype)
+    _assert_grads_unchanged(grads, grads_before)
+
+
+@pytest.mark.fused_adagrad_
+def test_fused_adagrad__internal_overlap_rejected():
+    # An expanded tensor has no well-defined element order; ATen's
+    # non-overlapping-and-dense requirement rejects it too.
+    base = torch.randn(4, dtype=torch.float32, device=flag_gems.device)
+    expanded = base.expand(4, 4)
+    steps = [torch.tensor([1], device=flag_gems.device, dtype=torch.int32)]
+    with pytest.raises(RuntimeError, match="internal overlap"):
+        flag_gems._fused_adagrad_(
+            [expanded],
+            [expanded.clone()],
+            [torch.zeros(4, 4, device=flag_gems.device)],
+            [steps],
+            lr=0.1,
+            lr_decay=0.0,
+            weight_decay=0.0,
+            eps=1e-10,
+            maximize=False,
+        )

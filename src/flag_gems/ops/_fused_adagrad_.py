@@ -25,6 +25,40 @@ from flag_gems.utils import triton_lang_extension as tle
 logger = logging.getLogger(__name__)
 
 
+def _has_internal_overlap(t):
+    """True when two distinct elements of ``t`` share one memory location.
+
+    Mirrors ``at::has_internal_overlap`` for the dense case: a tensor is free of
+    internal overlap when its shape/stride pair is non-overlapping and dense
+    (every element has its own address). Size-1 dimensions are ignored, since
+    their stride is irrelevant to which address an element names.
+    """
+    if t.numel() <= 1:
+        return False
+    sizes_strides = sorted((s, sz) for sz, s in zip(t.shape, t.stride()) if sz != 1)
+    expected = 1
+    for stride, size in sizes_strides:
+        if stride != expected:
+            return True
+        expected *= size
+    return False
+
+
+def _storage_view(t):
+    """Flat 1-D view of ``t`` in *storage* order.
+
+    The elementwise Adagrad step needs each logical element to line up across
+    ``param``/``grad``/``state_sum``. When all three share a shape and a
+    non-overlapping-and-dense stride set, walking them in storage order visits
+    the same logical element at the same relative position in each, so flat
+    indexing on these views is correct for any such layout -- including a
+    transposed tensor, which ``is_contiguous()`` would have rejected.
+    """
+    if t.is_contiguous():
+        return t.reshape(-1)
+    return t.as_strided((t.numel(),), (1,))
+
+
 @libentry()
 @triton.jit
 def _fused_adagrad_kernel(
@@ -166,16 +200,21 @@ def _fused_adagrad_run(
                 "_fused_adagrad_ only supports float16/bfloat16/float32/float64 "
                 f"inputs, got {param.dtype} at index {i}"
             )
-        # The kernel indexes with a flat offset, so non-dense inputs would read
-        # the wrong elements. Checked before the per-tensor stride comparison so a
-        # strided param is reported as such instead of as a stride mismatch.
+        # The kernel walks each tensor in storage order (see `_storage_view`),
+        # which is correct for any layout that is non-overlapping and dense --
+        # the same condition ATen's native CUDA kernel relies on. A layout with
+        # internal overlap (an expanded or otherwise aliasing view) has no
+        # well-defined element order, so it is rejected instead.
         for name, tensor in (
             ("param", param),
             ("grad", grad),
             ("state_sum", state_sum),
         ):
-            if not tensor.is_contiguous():
-                raise RuntimeError(f"_fused_adagrad_: {name}[{i}] must be contiguous")
+            if _has_internal_overlap(tensor):
+                raise RuntimeError(
+                    f"_fused_adagrad_: {name}[{i}] has internal overlap, which "
+                    "has no well-defined element order"
+                )
         for name, other in (("grad", grad), ("state_sum", state_sum)):
             if other.shape != param.shape:
                 raise RuntimeError(
@@ -225,10 +264,13 @@ def _fused_adagrad_run(
         # fp64 params accumulate in fp64; everything else in fp32.
         acc_dtype = tl.float64 if param.dtype == torch.float64 else tl.float32
 
+        # Walk all three operands in storage order. They were validated to be
+        # non-overlapping and dense with matching strides, so this line-up is
+        # exact for non-contiguous layouts (a transpose, say) as well.
         _fused_adagrad_kernel[grid](
-            param,
-            grad,
-            state_sum,
+            _storage_view(param),
+            _storage_view(grad),
+            _storage_view(state_sum),
             state_step,
             n,
             BLOCK_SIZE,
