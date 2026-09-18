@@ -70,10 +70,6 @@ AUTOGRAD_DISPATCH_KEY = torch._C.DispatchKey.Autograd.name
 CONJUGATE_DISPATCH_KEY = torch._C.DispatchKey.Conjugate.name
 QUANTIZED_CUDA_DISPATCH_KEY = torch._C.DispatchKey.QuantizedCUDA.name
 SPARSE_CSR_DISPATCH_KEY = "SparseCsr" + backend_info.dispatch_key
-# Sparse CSR ops that are column-compressed (CSC/BSC) tensors, which dispatch
-# under SparseCsr* rather than the dense CUDA key, so the kernel must also be
-# registered there.
-SPARSE_CSR_CUDA_DISPATCH_KEY = torch._C.DispatchKey.SparseCsrCUDA.name
 SPARSE_DISPATCH_KEY = "Sparse" + backend_info.dispatch_key
 QUANTIZED_DISPATCH_KEY = "Quantized" + backend_info.dispatch_key
 
@@ -1249,12 +1245,16 @@ _FULL_CONFIG = (
     ("round", round),
     ("round.out", round_out),
     ("round_", round_),
-    ("row_indices_copy", row_indices_copy, None, (SPARSE_CSR_CUDA_DISPATCH_KEY,)),
+    # Column-compressed (CSC/BSC) sparse tensors dispatch under the backend's
+    # SparseCsr* key rather than the dense device key, so the kernel is
+    # registered there as well. SPARSE_CSR_DISPATCH_KEY is backend-derived, so
+    # non-CUDA backends select this implementation too.
+    ("row_indices_copy", row_indices_copy, None, (SPARSE_CSR_DISPATCH_KEY,)),
     (
         "row_indices_copy.out",
         row_indices_copy_out,
         None,
-        (SPARSE_CSR_CUDA_DISPATCH_KEY,),
+        (SPARSE_CSR_DISPATCH_KEY,),
     ),
     ("rrelu_with_noise", rrelu_with_noise),
     ("rrelu_with_noise_", rrelu_with_noise_),

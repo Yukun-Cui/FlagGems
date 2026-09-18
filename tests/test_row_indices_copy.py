@@ -174,6 +174,29 @@ def test_row_indices_copy_out(shape, index_dtype):
 
 
 @pytest.mark.row_indices_copy
+@pytest.mark.row_indices_copy_out
+def test_row_indices_copy_out_non_contiguous():
+    # ATen accepts a non-contiguous out tensor and honours its stride; the
+    # kernel must scatter into the strided locations, not assume contiguity.
+    device = flag_gems.device
+    csc = _make_csc((8, 16, 20), torch.int64, device)
+    ref_csc = csc.to("cpu")
+    n = csc.row_indices().numel()
+
+    ref_buffer = torch.zeros(n * 2, dtype=torch.int64, device="cpu")
+    torch.row_indices_copy(ref_csc, out=ref_buffer[::2])
+
+    res_buffer = torch.zeros(n * 2, dtype=torch.int64, device=device)
+    res_out = flag_gems.row_indices_copy_out(csc, out=res_buffer[::2])
+
+    assert res_out.data_ptr() == res_buffer.data_ptr()
+    assert not res_out.is_contiguous()
+    assert res_out.numel() == n
+    utils.gems_assert_equal(res_buffer[::2].to("cpu"), ref_buffer[::2])
+
+
+@pytest.mark.row_indices_copy
+@pytest.mark.row_indices_copy_out
 def test_row_indices_copy_out_resize():
     # PyTorch resizes a mismatched-shape out tensor to the required shape.
     device = flag_gems.device
@@ -192,6 +215,7 @@ def test_row_indices_copy_out_resize():
 
 
 @pytest.mark.row_indices_copy
+@pytest.mark.row_indices_copy_out
 def test_row_indices_copy_out_dtype_mismatch_raises():
     device = flag_gems.device
     csc = _make_csc((4, 4, 6), torch.int32, device)

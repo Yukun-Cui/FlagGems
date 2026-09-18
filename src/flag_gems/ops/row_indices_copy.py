@@ -23,13 +23,24 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
-def _row_indices_copy_kernel(src_ptr, dst_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def _row_indices_copy_kernel(
+    src_ptr,
+    dst_ptr,
+    src_stride,
+    dst_stride,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Both buffers are 1-D, but neither is required to be contiguous: ``out``
+    # may arrive non-contiguous (ATen accepts it and honours its stride), and
+    # the source buffer is indexed with its own stride so no host-side
+    # materialization is needed. The strides are applied inside the kernel.
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
-    vals = tl.load(src_ptr + offsets, mask=mask)
-    tl.store(dst_ptr + offsets, vals, mask=mask)
+    vals = tl.load(src_ptr + offsets * src_stride, mask=mask)
+    tl.store(dst_ptr + offsets * dst_stride, vals, mask=mask)
 
 
 def _row_indices_copy_impl(self: torch.Tensor, *, out=None):
@@ -73,14 +84,27 @@ def _row_indices_copy_impl(self: torch.Tensor, *, out=None):
     if n_elements == 0:
         return dst
 
-    # Operate on contiguous views for a straightforward linear copy.
-    src_c = src if src.is_contiguous() else src.contiguous()
+    # Resolve the logical 1-D strides here (pure metadata reads, no host-side
+    # computation). The source buffer is 1-D, so ``src.stride(0)`` is the only
+    # stride that matters; ``src.contiguous()`` is deliberately avoided because
+    # host-side PyTorch computation operators are prohibited -- the kernel
+    # applies the stride instead.
+    if src.dim() == 0:
+        src_stride = 1
+    else:
+        src_stride = src.stride(0)
+    if dst.dim() == 0:
+        dst_stride = 1
+    else:
+        dst_stride = dst.stride(0)
     # A larger block keeps the launch grid small (<= a few blocks) for the
     # buffer sizes typical of sparse index arrays, reducing launch overhead
     # relative to the amount of data actually copied.
     BLOCK_SIZE = 4096
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-    _row_indices_copy_kernel[grid](src_c, dst, n_elements, BLOCK_SIZE=BLOCK_SIZE)
+    _row_indices_copy_kernel[grid](
+        src, dst, src_stride, dst_stride, n_elements, BLOCK_SIZE=BLOCK_SIZE
+    )
     return dst
 
 
