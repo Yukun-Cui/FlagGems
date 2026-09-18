@@ -435,6 +435,43 @@ def _launch_quantized_max_pool2d(input_int, out_int, params):
     return out_int
 
 
+def _output_memory_format(input):
+    """Pick the memory format the native kernel for this device allocates with.
+
+    The kernel this operator replaces is ``quantized_max_pool2d_cudnn``, not the
+    CPU one, and the two disagree. cuDNN has no strided or 3-D convolution path,
+    so its wrapper in ``QuantizedMaxPool2d.cpp`` permutes *every* 4-D input to
+    channels-last first -- NCHW, strided and already-channels-last alike -- and
+    always allocates the result with ``memory_format=ChannelsLast``. A 3-D
+    (C, H, W) input is instead viewed as a single batch and stays
+    NCHW-contiguous.
+
+    The CPU kernel only produces a channels-last result when the input already
+    has that layout, and gives an NCHW-contiguous result otherwise (including
+    for a degenerate ``C == 1`` shape, where a channels-last allocation would
+    have different strides). That rule is kept for a CPU input, so a direct call
+    with CPU tensors stays layout-identical to the CPU operator.
+
+    The rule keys on the device rather than the dtype: ``quantized_max_pool2d``
+    is registered for the QuantizedCUDA dispatch key, where a 4-D input always
+    reaches the cuDNN path, and cuDNN only handles ``qint8``. For
+    ``quint8``/``qint32`` the native CUDA op raises
+    ("TensorDescriptor does not support ..."), so there is no native layout to
+    contradict, and giving every 4-D accelerator input the same channels-last
+    layout avoids a result whose strides depend on the dtype.
+    """
+    if input.dim() != 4:
+        return torch.contiguous_format
+    if input.device.type != "cpu":
+        return torch.channels_last
+    if (
+        input.is_contiguous(memory_format=torch.channels_last)
+        and not input.is_contiguous()
+    ):
+        return torch.channels_last
+    return torch.contiguous_format
+
+
 def quantized_max_pool2d(
     input: torch.Tensor,
     kernel_size,
@@ -464,16 +501,6 @@ def quantized_max_pool2d(
     scale = float(input.q_scale())
     zero_point = int(input.q_zero_point())
 
-    # ATen has a dedicated channels-last path that keeps a channels_last input
-    # in that layout; every other layout (and every 3-D input) yields an
-    # NCHW-contiguous result.
-    memory_format = (
-        torch.channels_last
-        if input.dim() == 4
-        and input.is_contiguous(memory_format=torch.channels_last)
-        and not input.is_contiguous()
-        else torch.contiguous_format
-    )
     # Allocate the quantized result directly: ``_empty_affine_quantized``
     # honours ``memory_format``, whereas wrapping a strided integer tensor with
     # ``_make_per_tensor_quantized_tensor`` silently normalises its strides on
@@ -484,7 +511,7 @@ def quantized_max_pool2d(
         zero_point=zero_point,
         dtype=input.dtype,
         device=input.device,
-        memory_format=memory_format,
+        memory_format=_output_memory_format(input),
     )
 
     if out.numel() != 0:
@@ -529,17 +556,65 @@ def _aliases(input, out):
 
 
 def _same_quantizer(input, out):
-    """True when ``out`` already carries the input's per-tensor quantizer.
+    """True when ``out`` already carries ``input``'s per-tensor quantizer.
 
     A kernel write moves integers only, so it cannot re-point ``out``'s
     quantizer the way ``copy_`` does; pooling in place is only equivalent when
-    ``out`` is per-tensor affine with the input's ``scale`` and ``zero_point``.
+    ``out`` is per-tensor affine with the same ``scale`` and ``zero_point``.
     """
     return (
         out.qscheme() == torch.per_tensor_affine
         and out.q_scale() == input.q_scale()
         and out.q_zero_point() == input.q_zero_point()
     )
+
+
+def _adopt_quantizer(out, source):
+    """Re-point ``out`` at ``source``'s per-tensor quantizer, in place.
+
+    ``out.copy_(source)`` is the only ATen operation that moves a quantizer
+    between quantized tensors, but it moves the values too. Since the values
+    are written by the kernel (or copied separately through ``_copy_int``),
+    only the quantizer needs to move, and that can be done with ``.data``:
+    assigning an alias that shares ``out``'s storage, offset, sizes and strides
+    swaps the quantizer while leaving the tensor's storage, layout and identity
+    untouched -- the caller's ``out`` object is mutated in place, and a strided
+    or offset view keeps writing into its own slice of the buffer.
+
+    The alias is built with ``_empty_affine_quantized`` + ``set_`` because
+    ``_make_per_tensor_quantized_tensor`` (and ``Tensor.to``) silently
+    normalises the strides of a quantized tensor on CUDA, which would lose a
+    channels-last layout.
+    """
+    alias = torch._empty_affine_quantized(
+        0,
+        scale=float(source.q_scale()),
+        zero_point=int(source.q_zero_point()),
+        dtype=out.dtype,
+        device=out.device,
+    )
+    alias.set_(
+        out.untyped_storage(),
+        out.storage_offset(),
+        tuple(out.shape),
+        out.stride(),
+    )
+    out.data = alias
+    return out
+
+
+def _copy_int(dst_int, src_int):
+    """Copy integers device-side, honouring both sides' strides.
+
+    ``dst_int`` / ``src_int`` are the integer views produced by ``_int_view``,
+    so the tensors are plain integer tensors and reach FlagGems' Triton
+    ``copy_`` instead of being redispatched to ATen the way a quantized
+    ``Tensor.copy_`` is.
+    """
+    from flag_gems.ops.copy import copy_
+
+    copy_(dst_int, src_int)
+    return dst_int
 
 
 def quantized_max_pool2d_out(
@@ -563,12 +638,23 @@ def quantized_max_pool2d_out(
         resize_out_helper(out, tmp_output);   // resize_output(out, tmp.sizes())
         copy_arg(out, tmp_output);            // dtype check, device check, copy_
 
-    So the result is computed *first* (which is also what makes an ``out`` that
-    aliases the input safe), then ``out`` is resized to the result's shape, then
-    its dtype and device are checked, and finally ``copy_`` writes the values
-    through ``out``'s own strides and carries over the input's ``scale`` /
-    ``zero_point``. A mismatched-dtype ``out`` is therefore still resized before
-    the error surfaces, exactly as in ATen.
+    So the shape, dtype and device contract matches ATen's: the result is
+    computed *first* (which is also what makes an ``out`` that aliases the input
+    safe), then ``out`` is resized to the result's shape, then its dtype and
+    device are checked, and finally the values are written through ``out``'s own
+    strides and the input's ``scale`` / ``zero_point`` are carried over. A
+    mismatched-dtype ``out`` is therefore still resized before the error
+    surfaces, exactly as in ATen.
+
+    The final write differs from ATen in *how*, not in what lands where: the
+    pooling kernel is strided on both sides, so when ``out`` does not overlap
+    the input it stores the pooled integers through ``out`` directly, and only
+    the quantizer is re-pointed (:func:`_adopt_quantizer`, no ``copy_`` at
+    all). The aliasing case -- where ``out`` must keep the input's values until
+    the result is complete -- copies the integer representations device-side
+    through FlagGems' Triton ``copy_`` (:func:`_copy_int`). Neither path calls
+    the native quantized ``copy_``: ``Tensor.copy_`` on quantized tensors
+    redispatches to ATen, which would add a native O(n) pass after the kernel.
     """
     logger.debug("GEMS QUANTIZED_MAX_POOL2D_OUT")
 
@@ -601,24 +687,32 @@ def quantized_max_pool2d_out(
             f"but got {out.device} instead"
         )
 
-    if result is None and _same_quantizer(input, out):
-        # ``out`` already carries the input's quantizer and cannot overlap it, so
-        # writing the pooled integers straight into its storage is
-        # indistinguishable from ``out.copy_(functional_result)`` -- without the
-        # extra allocation and copy.
-        if out.numel() != 0:
-            _launch_quantized_max_pool2d(_int_view(input), _int_view(out), params)
-        return out
+    if out.qscheme() != torch.per_tensor_affine:
+        # ATen's quantized ``copy_`` rejects a per-channel destination with this
+        # message. It is raised by the copy, which runs after the resize and the
+        # dtype/device checks, so it comes last here too.
+        raise RuntimeError("Quantized Copy only works with same qscheme")
 
     if result is None:
-        result = quantized_max_pool2d(
-            input, kernel_size, stride, padding, dilation, ceil_mode
-        )
+        # ``out`` cannot overlap the input, so the pooled integers can be
+        # written straight through ``out``'s own strides and storage offset --
+        # the kernel is strided on both sides, so an ``out`` in any layout,
+        # including a non-contiguous view, receives exactly the elements
+        # ``out.copy_(functional_result)`` would have placed. Only the
+        # quantizer still has to move, which :func:`_adopt_quantizer` does
+        # without a copy.
+        if out.numel() != 0:
+            _launch_quantized_max_pool2d(_int_view(input), _int_view(out), params)
+        if _same_quantizer(input, out):
+            return out
+        return _adopt_quantizer(out, input)
 
-    # ``Tensor.copy_`` between two per-tensor quantized tensors moves both the
-    # integers and the quantizer, honours ``out``'s strides and storage offset
-    # (so a strided or offset ``out`` never disturbs its neighbours), and raises
-    # "Quantized Copy only works with same qscheme" for a per-channel ``out`` --
-    # the message ATen surfaces as well.
-    out.copy_(result)
-    return out
+    # ``out`` aliases the input, so pooling cannot write into it directly: the
+    # functional result was computed into ``result`` first. Moving those
+    # integers into ``out`` is the one case that genuinely needs a copy; it is
+    # done over the integer views, which lands in FlagGems' Triton ``copy_``.
+    # A quantized ``out.copy_(result)`` would redispatch to ATen and run an
+    # extra native O(n) pass after the Triton kernel had already run.
+    if out.numel() != 0:
+        _copy_int(_int_view(out), _int_view(result))
+    return _adopt_quantizer(out, result)
