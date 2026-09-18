@@ -118,3 +118,94 @@ def test_row_indices_csr_raises():
     # GEMS direct call: the kernel must reject CSR the same way.
     with pytest.raises(RuntimeError):
         flag_gems.row_indices(csr)
+
+
+@pytest.mark.row_indices
+@pytest.mark.parametrize("int_dtype", [torch.int32, torch.int64])
+def test_row_indices_alias_and_mutation(int_dtype):
+    # `aten::row_indices` is an aliasing accessor: two reads share storage, and
+    # mutating the result mutates the sparse tensor's stored indices. A copying
+    # implementation would silently break both.
+    ccol = torch.tensor([0, 2, 4], dtype=torch.int64, device=flag_gems.device)
+    row = torch.tensor([0, 1, 2, 3], dtype=int_dtype, device=flag_gems.device)
+    values = torch.tensor([1.0, 2.0, 3.0, 4.0], device=flag_gems.device)
+    csc = torch.sparse_csc_tensor(ccol, row, values, size=(4, 2))
+
+    first = flag_gems.row_indices(csc)
+    second = flag_gems.row_indices(csc)
+    assert (
+        first.data_ptr() == second.data_ptr()
+    ), "row_indices must return an aliasing view, not a fresh copy"
+
+    first[0] = 3
+    assert (
+        csc.row_indices()[0].item() == 3
+    ), "mutating the returned view must be visible in the sparse tensor"
+
+    # dtype of the stored buffer is preserved (int32 indices stay int32)
+    assert first.dtype == int_dtype
+
+
+@pytest.mark.row_indices
+@pytest.mark.parametrize(
+    "layout_name", ["csc", "bsc"], ids=["batched_csc", "batched_bsc"]
+)
+def test_row_indices_batched_shape(layout_name):
+    # Batched CSC/BSC tensors keep their full batch shape in the row-indices
+    # buffer; a flat (numel,) result would lose it.
+    ccol = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64, device=flag_gems.device)
+    row = torch.tensor([0, 0], dtype=torch.int64, device=flag_gems.device)
+    if layout_name == "csc":
+        inp = torch.sparse_csc_tensor(
+            ccol,
+            row,
+            torch.tensor([1.0, 2.0], device=flag_gems.device),
+            size=(2, 2, 2),
+        )
+    else:
+        inp = torch.sparse_bsc_tensor(
+            ccol,
+            row,
+            torch.randn(2, 2, 2, 2, device=flag_gems.device),
+            size=(2, 4, 4),
+        )
+
+    ref = utils.to_reference(inp).row_indices()
+    res = flag_gems.row_indices(inp)
+    assert res.shape == ref.shape, (
+        f"batched {layout_name}: got shape {tuple(res.shape)}, "
+        f"expected {tuple(ref.shape)}"
+    )
+    assert res.stride() == ref.stride()
+    utils.gems_assert_equal(res, utils.to_reference(ref))
+
+
+@pytest.mark.row_indices
+@pytest.mark.parametrize("layout_name", ["csr", "bsr"], ids=["csr", "bsr"])
+def test_row_indices_unsupported_layout_raises(layout_name):
+    # ATen accepts only column-compressed layouts (CSC and BSC) and raises for
+    # row-compressed ones; the messages must match.
+    indptr = torch.tensor([0, 2, 4], dtype=torch.int64, device=flag_gems.device)
+    indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=flag_gems.device)
+    if layout_name == "csr":
+        inp = torch.sparse_csr_tensor(
+            indptr,
+            indices,
+            torch.tensor([1.0, 2.0, 3.0, 4.0], device=flag_gems.device),
+            size=(2, 4),
+        )
+    else:
+        inp = torch.sparse_bsr_tensor(
+            indptr,
+            indices,
+            torch.randn(2, 2, 2, device=flag_gems.device),
+            size=(4, 4),
+        )
+
+    with pytest.raises(RuntimeError) as ref_err:
+        utils.to_reference(inp).row_indices()
+    with pytest.raises(RuntimeError) as res_err:
+        flag_gems.row_indices(inp)
+    assert str(ref_err.value) == str(
+        res_err.value
+    ), f"{layout_name}: message differs: {res_err.value!r} vs {ref_err.value!r}"
