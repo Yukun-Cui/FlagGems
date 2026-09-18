@@ -56,10 +56,41 @@ QBN_IN_PARAMS = [
     (1.0, 3),
 ]
 
+# Zero-sized shapes: ATen returns an empty clone preserving the input's
+# quantization parameters, for every degenerate dimension.
+QBN_EMPTY_SHAPES = [
+    (0, 3, 4, 4),  # N == 0
+    (2, 0, 4, 4),  # C == 0
+    (2, 3, 0, 4),  # H == 0
+    (2, 3, 4, 0),  # W == 0
+]
+
 
 def _make_quantized_input(shape, scale, zero_point, dtype, device):
     fp = torch.randn(shape, device="cpu")
     return torch.quantize_per_tensor(fp, scale, zero_point, dtype).to(device)
+
+
+def _make_channels_last_input(shape, scale, zero_point, dtype, device):
+    """Build a channels-last per-tensor quantized tensor from fixed integers.
+
+    The integer representation is drawn from a seeded generator so CPU and GPU
+    paths share identical values; the tensor is materialized in the channels-last
+    layout through ``quantize_per_tensor`` on a channels-last float tensor (which
+    ATen preserves). A CPU quantized tensor cannot simply be moved to the device:
+    ``.to()`` normalises the strides to contiguous.
+    """
+    C = shape[1]
+    spatial = shape[2] * shape[3]
+    gen = torch.Generator().manual_seed(42)
+    ints = torch.randint(0, 256, (shape[0], C, spatial), generator=gen).to(torch.uint8)
+    dequant = (ints.float() - zero_point) * scale
+    return torch.quantize_per_tensor(
+        dequant.reshape(shape).to(memory_format=torch.channels_last).to(device),
+        scale,
+        zero_point,
+        dtype,
+    )
 
 
 def _qbn_params(C, device):
@@ -145,6 +176,117 @@ def test_quantized_batch_norm(shape, in_dtype, in_params, out_params):
     _assert_quant_equal(res_out, ref_out)
 
 
+@pytest.mark.quantized_batch_norm
+@pytest.mark.parametrize("in_dtype", QBN_QUANT_DTYPES)
+@pytest.mark.parametrize("in_params", QBN_IN_PARAMS[:1])
+@pytest.mark.parametrize("out_params", QBN_OUT_PARAMS[:2])
+def test_quantized_batch_norm_channels_last(in_dtype, in_params, out_params):
+    """A channels-last input must produce the same values as ATen and keep the
+    channels-last layout on the output (the kernel must not write into a
+    detached, reallocated buffer)."""
+    out_scale, out_zero_point = out_params
+    in_scale, in_zero_point = in_params
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+
+    # ``_make_channels_last_input`` draws its integers from a fixed seed, so the
+    # CPU reference and the device input share identical values *and* the
+    # channels-last layout.
+    res_qx = _make_channels_last_input(
+        shape, in_scale, in_zero_point, in_dtype, flag_gems.device
+    )
+    assert res_qx.is_contiguous(memory_format=torch.channels_last)
+    ref_qx = _make_channels_last_input(shape, in_scale, in_zero_point, in_dtype, "cpu")
+    assert ref_qx.is_contiguous(memory_format=torch.channels_last)
+    utils.gems_assert_equal(res_qx.int_repr().cpu(), ref_qx.int_repr())
+
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    ref_weight = weight.to("cpu")
+    ref_bias = bias.to("cpu")
+    ref_mean = mean.to("cpu")
+    ref_var = var.to("cpu")
+
+    ref_out = torch.quantized_batch_norm(
+        ref_qx, ref_weight, ref_bias, ref_mean, ref_var, 1e-5, out_scale, out_zero_point
+    )
+
+    res_out = flag_gems.quantized_batch_norm(
+        res_qx, weight, bias, mean, var, 1e-5, out_scale, out_zero_point
+    )
+
+    _assert_quant_equal(res_out, ref_out)
+    # ATen keeps a channels-last input in the channels-last layout.
+    assert res_out.is_contiguous(
+        memory_format=torch.channels_last
+    ), "channels-last input should produce a channels-last output"
+    assert ref_out.is_contiguous(memory_format=torch.channels_last)
+
+
+@pytest.mark.quantized_batch_norm
+@pytest.mark.parametrize("shape", QBN_EMPTY_SHAPES)
+@pytest.mark.parametrize("in_dtype", QBN_QUANT_DTYPES)
+def test_quantized_batch_norm_empty(shape, in_dtype):
+    """numel == 0: ATen returns an empty clone preserving the input qparams."""
+    C = shape[1]
+
+    res_qx = _make_quantized_input(shape, 0.5, 10, in_dtype, flag_gems.device)
+    ref_qx = _make_quantized_input(shape, 0.5, 10, in_dtype, "cpu")
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    ref_weight = weight.to("cpu")
+    ref_bias = bias.to("cpu")
+    ref_mean = mean.to("cpu")
+    ref_var = var.to("cpu")
+
+    ref_out = torch.quantized_batch_norm(
+        ref_qx, ref_weight, ref_bias, ref_mean, ref_var, 1e-5, 0.1, 3
+    )
+    res_out = flag_gems.quantized_batch_norm(
+        res_qx, weight, bias, mean, var, 1e-5, 0.1, 3
+    )
+
+    assert res_out.numel() == 0
+    assert res_out.dtype == ref_out.dtype
+    assert tuple(res_out.shape) == tuple(ref_out.shape)
+    # The empty result must preserve the *input's* quantization parameters,
+    # not the requested output ones.
+    assert res_out.q_scale() == ref_out.q_scale()
+    assert res_out.q_zero_point() == ref_out.q_zero_point()
+
+
+@pytest.mark.quantized_batch_norm
+@pytest.mark.parametrize("param", ["weight", "bias", "mean", "var"])
+@pytest.mark.parametrize("bad_size", [1, 2, 4])
+def test_quantized_batch_norm_bad_size(bad_size, param):
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+    res_qx = _make_quantized_input(shape, 0.5, 10, torch.quint8, flag_gems.device)
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    params = {"weight": weight, "bias": bias, "mean": mean, "var": var}
+    params[param] = torch.randn(bad_size, device=flag_gems.device)
+
+    with pytest.raises(RuntimeError):
+        flag_gems.quantized_batch_norm(
+            res_qx, **params, eps=1e-5, output_scale=0.1, output_zero_point=3
+        )
+
+
+@pytest.mark.quantized_batch_norm
+@pytest.mark.parametrize("param", ["weight", "bias", "mean", "var"])
+@pytest.mark.parametrize("bad_dtype", [torch.float64, torch.int32, torch.uint8])
+def test_quantized_batch_norm_bad_dtype(bad_dtype, param):
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+    res_qx = _make_quantized_input(shape, 0.5, 10, torch.quint8, flag_gems.device)
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    params = {"weight": weight, "bias": bias, "mean": mean, "var": var}
+    params[param] = torch.randn(C, device=flag_gems.device).to(bad_dtype)
+
+    with pytest.raises(RuntimeError):
+        flag_gems.quantized_batch_norm(
+            res_qx, **params, eps=1e-5, output_scale=0.1, output_zero_point=3
+        )
+
+
 @pytest.mark.quantized_batch_norm_out
 @pytest.mark.parametrize("shape", QBN_SHAPES)
 @pytest.mark.parametrize("in_dtype", QBN_QUANT_DTYPES)
@@ -191,3 +333,248 @@ def test_quantized_batch_norm_out(shape, in_dtype, out_params):
     )
 
     _assert_quant_equal(res_out, ref_out)
+
+
+@pytest.mark.quantized_batch_norm_out
+@pytest.mark.parametrize("in_dtype", QBN_QUANT_DTYPES)
+def test_quantized_batch_norm_out_mismatched_qparams(in_dtype):
+    """The out tensor's stale scale/zero_point must be replaced by the ones the
+    call requests (ATen updates the output qparams)."""
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+    in_scale, in_zero_point = 0.5, 0
+    out_scale, out_zero_point = 0.1, 3
+
+    res_qx = _make_quantized_input(
+        shape, in_scale, in_zero_point, in_dtype, flag_gems.device
+    )
+    ref_qx = _make_quantized_from_int(
+        res_qx.int_repr().to("cpu"), in_scale, in_zero_point, in_dtype
+    )
+
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    ref_weight = weight.to("cpu")
+    ref_bias = bias.to("cpu")
+    ref_mean = mean.to("cpu")
+    ref_var = var.to("cpu")
+
+    # Stale quantization parameters (0.9 / 100) that differ from the requested
+    # output parameters (0.1 / 3).
+    res_out = torch.quantize_per_tensor(
+        torch.zeros(shape, dtype=torch.float32, device=flag_gems.device),
+        0.9,
+        100,
+        in_dtype,
+    )
+
+    ref_out = torch.quantized_batch_norm(
+        ref_qx, ref_weight, ref_bias, ref_mean, ref_var, 1e-5, out_scale, out_zero_point
+    )
+
+    flag_gems.quantized_batch_norm_out(
+        res_qx,
+        weight,
+        bias,
+        mean,
+        var,
+        1e-5,
+        out_scale,
+        out_zero_point,
+        out=res_out,
+    )
+
+    _assert_quant_equal(res_out, ref_out)
+    assert abs(res_out.q_scale() - out_scale) < 1e-9
+    assert res_out.q_zero_point() == out_zero_point
+
+
+@pytest.mark.quantized_batch_norm_out
+def test_quantized_batch_norm_out_resizes():
+    """A ``out`` tensor with a mismatched shape is resized, ATen-style."""
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+    in_scale, in_zero_point = 0.5, 0
+    out_scale, out_zero_point = 0.1, 3
+
+    res_qx = _make_quantized_input(
+        shape, in_scale, in_zero_point, torch.quint8, flag_gems.device
+    )
+    ref_qx = _make_quantized_from_int(
+        res_qx.int_repr().to("cpu"), in_scale, in_zero_point, torch.quint8
+    )
+
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    ref_weight = weight.to("cpu")
+    ref_bias = bias.to("cpu")
+    ref_mean = mean.to("cpu")
+    ref_var = var.to("cpu")
+
+    res_out = torch.quantize_per_tensor(
+        torch.zeros((2, 3, 8, 8), dtype=torch.float32, device=flag_gems.device),
+        0.9,
+        100,
+        torch.quint8,
+    )
+
+    ref_out = torch.quantized_batch_norm(
+        ref_qx, ref_weight, ref_bias, ref_mean, ref_var, 1e-5, out_scale, out_zero_point
+    )
+
+    flag_gems.quantized_batch_norm_out(
+        res_qx,
+        weight,
+        bias,
+        mean,
+        var,
+        1e-5,
+        out_scale,
+        out_zero_point,
+        out=res_out,
+    )
+
+    assert tuple(res_out.shape) == shape
+    _assert_quant_equal(res_out, ref_out)
+
+
+@pytest.mark.quantized_batch_norm_out
+@pytest.mark.parametrize("in_dtype", QBN_QUANT_DTYPES)
+def test_quantized_batch_norm_out_storage_offset(in_dtype):
+    """A sliced ``out`` (non-zero storage offset) must be written in the right
+    region of its backing storage, and leave neighbouring elements untouched."""
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+    in_scale, in_zero_point = 0.5, 0
+    out_scale, out_zero_point = 0.1, 3
+
+    res_qx = _make_quantized_input(
+        shape, in_scale, in_zero_point, in_dtype, flag_gems.device
+    )
+    ref_qx = _make_quantized_from_int(
+        res_qx.int_repr().to("cpu"), in_scale, in_zero_point, in_dtype
+    )
+
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    ref_weight = weight.to("cpu")
+    ref_bias = bias.to("cpu")
+    ref_mean = mean.to("cpu")
+    ref_var = var.to("cpu")
+
+    ref_out = torch.quantized_batch_norm(
+        ref_qx, ref_weight, ref_bias, ref_mean, ref_var, 1e-5, out_scale, out_zero_point
+    )
+
+    # Backing storage of 4 batches; the out region is batches 1..2.
+    res_backing = torch.quantize_per_tensor(
+        torch.zeros((4, 3, 4, 4), dtype=torch.float32, device=flag_gems.device),
+        0.9,
+        100,
+        in_dtype,
+    )
+    res_full = res_backing.reshape(4, 3, 4, 4)
+    # Snapshot the regions outside the slice before the call.
+    outside_before = torch.cat(
+        [res_full[0].int_repr().reshape(-1), res_full[3].int_repr().reshape(-1)]
+    ).clone()
+    res_sliced = res_full[1:3]
+    assert res_sliced.storage_offset() != 0
+
+    flag_gems.quantized_batch_norm_out(
+        res_qx,
+        weight,
+        bias,
+        mean,
+        var,
+        1e-5,
+        out_scale,
+        out_zero_point,
+        out=res_sliced,
+    )
+
+    # The slice carries the updated qparams, values land inside the slice only.
+    _assert_quant_equal(res_sliced, ref_out)
+    assert res_sliced.storage_offset() != 0
+    # Regions outside the slice are untouched (`quantize_per_tensor` of a zeros
+    # tensor stores zero_point in the integer representation, i.e. 100 here).
+    outside_after = torch.cat(
+        [res_full[0].int_repr().reshape(-1), res_full[3].int_repr().reshape(-1)]
+    )
+    utils.gems_assert_equal(outside_after, outside_before)
+
+
+@pytest.mark.quantized_batch_norm_out
+def test_quantized_batch_norm_out_empty():
+    """numel == 0 through the out overload: ATen resizes ``out`` to the input's
+    shape and copies the empty clone (which carries the input's qparams) in."""
+    shape = (0, 3, 4, 4)
+    C = shape[1]
+    in_scale, in_zero_point = 0.5, 0
+
+    res_qx = _make_quantized_input(
+        shape, in_scale, in_zero_point, torch.quint8, flag_gems.device
+    )
+    ref_qx = _make_quantized_input(shape, in_scale, in_zero_point, torch.quint8, "cpu")
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    ref_weight = weight.to("cpu")
+    ref_bias = bias.to("cpu")
+    ref_mean = mean.to("cpu")
+    ref_var = var.to("cpu")
+
+    ref_out = torch.quantized_batch_norm(
+        ref_qx, ref_weight, ref_bias, ref_mean, ref_var, 1e-5, 0.1, 3
+    )
+
+    res_out = torch.quantize_per_tensor(
+        torch.zeros((2, 3, 4, 4), dtype=torch.float32, device=flag_gems.device),
+        0.9,
+        100,
+        torch.quint8,
+    )
+    flag_gems.quantized_batch_norm_out(
+        res_qx,
+        weight,
+        bias,
+        mean,
+        var,
+        1e-5,
+        0.1,
+        3,
+        out=res_out,
+    )
+
+    assert tuple(res_out.shape) == shape
+    assert res_out.numel() == 0
+    assert abs(res_out.q_scale() - ref_out.q_scale()) < 1e-9
+    assert res_out.q_zero_point() == ref_out.q_zero_point()
+
+
+@pytest.mark.quantized_batch_norm_out
+def test_quantized_batch_norm_out_wrong_dtype():
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+    res_qx = _make_quantized_input(shape, 0.5, 0, torch.quint8, flag_gems.device)
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    res_out = torch.quantize_per_tensor(
+        torch.zeros(shape, dtype=torch.float32, device=flag_gems.device),
+        0.1,
+        3,
+        torch.qint8,
+    )
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        flag_gems.quantized_batch_norm_out(
+            res_qx, weight, bias, mean, var, 1e-5, 0.1, 3, out=res_out
+        )
+
+
+@pytest.mark.quantized_batch_norm_out
+def test_quantized_batch_norm_out_wrong_device():
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+    res_qx = _make_quantized_input(shape, 0.5, 0, torch.quint8, flag_gems.device)
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+    res_out = torch.quantize_per_tensor(
+        torch.zeros(shape, dtype=torch.float32, device="cpu"), 0.1, 3, torch.quint8
+    )
+    with pytest.raises(RuntimeError, match="Expected out tensor to have device"):
+        flag_gems.quantized_batch_norm_out(
+            res_qx, weight, bias, mean, var, 1e-5, 0.1, 3, out=res_out
+        )
