@@ -29,11 +29,52 @@ logger = logging.getLogger(__name__)
 #   quint8  -> uint8  [0, 255]
 #   qint8   -> int8   [-128, 127]
 #   qint32  -> int32  [-2147483648, 2147483647]
+# ``zero_points`` is the integer zero-point dtype each scheme stores; the float
+# scheme keeps its zero-points in float32.
 _QRANGE = {
     torch.quint8: (torch.uint8, 0, 255),
     torch.qint8: (torch.int8, -128, 127),
     torch.qint32: (torch.int32, -2147483648, 2147483647),
 }
+
+
+def _scalar_type_name(dtype):
+    """Return the C++ type name PyTorch uses in its error messages."""
+    return {
+        torch.float16: "Half",
+        torch.bfloat16: "BFloat16",
+        torch.float64: "Double",
+        torch.float32: "Float",
+        torch.int8: "Char",
+        torch.uint8: "Byte",
+        torch.int16: "Short",
+        torch.int32: "Int",
+        torch.int64: "Long",
+        torch.bool: "Bool",
+        torch.quint8: "QUInt8",
+        torch.qint8: "QInt8",
+        torch.qint32: "QInt32",
+        torch.quint4x2: "QUInt4x2",
+    }.get(dtype, str(dtype))
+
+
+@triton.jit
+def _trap_if(cond):
+    """Trap the device unconditionally when ``cond`` is true.
+
+    ``tl.device_assert`` is stripped unless ``TRITON_DEBUG=1``, so an invalid
+    zero-point would be silently accepted in a normal build. Emitting the PTX
+    ``trap`` instruction directly keeps the check active in every build, which
+    is how the native CUDA kernel reports an out-of-range zero-point.
+    """
+    tl.inline_asm_elementwise(
+        asm="{ .reg .pred p; setp.ne.b32 p, $1, 0; @p trap; mov.u32 $0, 0; }",
+        constraints="=r,r",
+        args=[cond.to(tl.int32)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @libentry()
@@ -48,6 +89,7 @@ def quantize_per_channel_kernel(
     shape_axis,
     q_min: tl.constexpr,
     q_max: tl.constexpr,
+    USE_FLOAT_ZERO_POINT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -55,10 +97,7 @@ def quantize_per_channel_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Compute the quantized value in float64 to match PyTorch's accuracy.
-    # PyTorch stores per-channel scales as float64, so doing the division in
-    # float32 loses precision and can flip a tie the other way.
-    x_val = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float64)
+    x_val = tl.load(x_ptr + offsets, mask=mask, other=0.0)
 
     # Channel index along `axis` for a contiguous (or axis-aligned) tensor:
     #   axis_coord = (flat_index // stride_axis) % shape_axis
@@ -68,32 +107,142 @@ def quantize_per_channel_kernel(
         axis_coord = offsets % shape_axis
     else:
         axis_coord = (offsets // stride_axis) % shape_axis
-    scale = tl.load(scales_ptr + axis_coord, mask=mask, other=1.0).to(tl.float64)
-    zero_point = tl.load(zero_points_ptr + axis_coord, mask=mask, other=0).to(
-        tl.float64
-    )
 
-    # q = round(x / scale) + zero_point, clamped to the quantized integer range.
-    # The rounding is applied to the division result *before* adding the
-    # zero_point, matching PyTorch's `nearbyint(raw_val / scale) + zero_point`.
+    scale = tl.load(scales_ptr + axis_coord, mask=mask, other=1.0)
+
+    if USE_FLOAT_ZERO_POINT:
+        # per_channel_affine_float_qparams: PyTorch's CUDA kernel computes
+        #   q = lrintf(raw * (1.f / scale) + zero_point)
+        # entirely in float32, adding the zero-point *before* rounding.
+        zero_point_f = tl.load(zero_points_ptr + axis_coord, mask=mask, other=0.0)
+        # check_zero_points_cuda: the float zero-point must still lie inside the
+        # integer range of the target dtype (compared as floats, as ATen does).
+        zp_valid = (zero_point_f >= q_min) & (zero_point_f <= q_max)
+        _trap_if(tl.max((mask & (~zp_valid)).to(tl.int32)) > 0)
+
+        # Reproduce the native arithmetic bit-for-bit:
+        #   * ``div_rn`` is IEEE round-to-nearest, while Triton's ``/`` lowers to
+        #     an approximate reciprocal-multiply sequence that is off by up to
+        #     ~2 ULP, which flips rounding ties.
+        #   * ``fma`` keeps the product exact so it is rounded only once, like
+        #     the compiler-contracted ``raw * inv + zero_point`` in ATen;
+        #     splitting it into a rounded multiply plus a rounded add turns exact
+        #     .5 values into the adjacent bin.
+        inv_scale = tl.math.div_rn(1.0, scale.to(tl.float32))
+        q = tl_extra_shim.nearbyint(tl.math.fma(x_val, inv_scale, zero_point_f))
+    else:
+        # per_channel_affine: the zero-point is a genuine integer, stored as
+        # int64, and must be inside the target dtype's range
+        # (check_zero_points_cuda).
+        zero_point_i64 = tl.load(zero_points_ptr + axis_coord, mask=mask, other=0)
+        zp_valid = (zero_point_i64 >= q_min) & (zero_point_i64 <= q_max)
+        _trap_if(tl.max((mask & (~zp_valid)).to(tl.int32)) > 0)
+
+        # Both the CPU and the CUDA kernel round the scaled value *first* and
+        # then add the zero-point (quantize_val's
+        # ``zero_point + nearbyint(value * inv_scale)``), so the addition sits
+        # outside ``nearbyint`` here.
+        q = tl_extra_shim.nearbyint(
+            x_val.to(tl.float64) / scale.to(tl.float64)
+        ) + zero_point_i64.to(tl.float64)
+
     # nearbyint implements round-half-to-even (PyTorch's default rounding mode).
-    q = tl_extra_shim.nearbyint(x_val / scale) + zero_point
     q = tl.clamp(q, q_min, q_max)
     q = q.to(out_ptr.dtype.element_ty)
 
     tl.store(out_ptr + offsets, q, mask=mask)
 
 
+def _is_float_qparams(scales, zero_points):
+    """Whether this qparam pair selects ``per_channel_affine_float_qparams``.
+
+    Mirrors ``make_per_channel_affine_quantizer``, which picks the float scheme
+    when (and only when) the zero-points are floating point.
+    """
+    return zero_points.dtype.is_floating_point
+
+
+def _validate_qparams(input, scales, zero_points, axis, dtype):
+    """Validate the input contract the way native ``make_per_channel_affine_quantizer`` does.
+
+    Every check mirrors an ATen assertion, and it runs before the kernel is
+    launched so a malformed qparam vector can never be read out of bounds by the
+    kernel's per-element ``tl.load``.
+    """
+    if dtype not in _QRANGE:
+        raise NotImplementedError(
+            f'"quantize_tensor_per_channel_affine" not implemented for '
+            f"'{_scalar_type_name(dtype)}'"
+        )
+
+    # checkFloatTensor: only float32 inputs reach the native per-channel kernels.
+    # The two quantizers phrase this differently -- the float-qparams quantizer
+    # checks inside its own ``quantize`` ("Quantize only works on Float Tensor"),
+    # the affine one inside the native kernel ("... expects a Float Tensor").
+    if input.dtype != torch.float32:
+        got = _scalar_type_name(input.dtype)
+        if _is_float_qparams(scales, zero_points):
+            raise RuntimeError(f"Quantize only works on Float Tensor, got {got}")
+        raise RuntimeError(
+            f"quantize_tensor_per_channel_affine expects a Float Tensor, got {got}"
+        )
+
+    # checkPerChannelParamDims: both vectors must be 1-D with equal length.
+    if scales.dim() != 1:
+        raise RuntimeError("scale tensor must have dimension 1")
+    if zero_points.dim() != 1:
+        raise RuntimeError("zero_points tensor must have dimension 1")
+    if scales.numel() != zero_points.numel():
+        raise RuntimeError("number of elements in scales and zero_points must match")
+
+    # make_per_channel_affine_quantizer: scales are always floating point, and
+    # a floating-point zero_points selects the *_float_qparams scheme.
+    if not scales.dtype.is_floating_point:
+        raise RuntimeError("scale tensor must be floating point")
+
+    # ``axis`` is a Python int in the aten schema, so ``input.size(axis)`` below
+    # is safe once the range check has run. Negative axes are rejected rather
+    # than accepted, matching ATen's ``0 <= axis && axis < dim``.
+    if not (0 <= axis < input.dim()):
+        scheme = "float qparams" if _is_float_qparams(scales, zero_points) else "affine"
+        raise RuntimeError(
+            f"Channel axis out of range in per channel {scheme} quantization. "
+            f"Got: {axis}Expected: [0, {input.dim()})"
+        )
+
+    n_channels = input.size(axis)
+    if scales.numel() != n_channels:
+        raise RuntimeError(
+            f"length of scales must equal to channel, expected {n_channels} got, "
+            f"{scales.numel()}"
+        )
+    if zero_points.numel() != n_channels:
+        raise RuntimeError(
+            f"length of zero_points must equal to channel expected {n_channels} got, "
+            f"{zero_points.numel()}"
+        )
+
+    return _is_float_qparams(scales, zero_points)
+
+
 def _quantize_per_channel_impl(input, scales, zero_points, axis, dtype):
+    use_float_zero_point = _validate_qparams(input, scales, zero_points, axis, dtype)
     int_dtype, q_min, q_max = _QRANGE[dtype]
 
     # The quantization params are 1-D vectors of length ``input.size(axis)``.
-    # Keep them contiguous and on the same device as the input. Scales are kept
-    # in float64 (PyTorch stores per-channel scales as float64) so the in-kernel
-    # division matches PyTorch's accuracy.
+    # Keep them contiguous and on the same device as the input.
+    #
+    # Integer schemes store scales as fp64 and zero-points as int64, and the
+    # float scheme keeps both in fp32 -- the dtypes the two native quantizers
+    # use internally. The kernel branches on ``USE_FLOAT_ZERO_POINT``, so the
+    # two precisions never mix.
     input = input.contiguous()
-    scales = scales.to(input.device).to(torch.float64).contiguous()
-    zero_points = zero_points.to(input.device).to(torch.int64).contiguous()
+    if use_float_zero_point:
+        scales_k = scales.to(input.device).to(torch.float32).contiguous()
+        zero_points_k = zero_points.to(input.device).to(torch.float32).contiguous()
+    else:
+        scales_k = scales.to(input.device).to(torch.float64).contiguous()
+        zero_points_k = zero_points.to(input.device).to(torch.int64).contiguous()
 
     shape_axis = input.shape[axis]
     stride_axis = input.stride(axis)
@@ -104,31 +253,36 @@ def _quantize_per_channel_impl(input, scales, zero_points, axis, dtype):
         dtype=int_dtype,
         device=input.device,
     )
+
     n_elements = input.numel()
-    if n_elements == 0:
-        return torch._make_per_channel_quantized_tensor(
-            int_out, scales, zero_points, axis
-        )
+    if n_elements > 0:
+        # Power-of-2 block size for coalesced element-wise access.
+        BLOCK_SIZE = 1024
+        grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
 
-    # Power-of-2 block size for coalesced element-wise access.
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+        with torch_device_fn.device(input.device):
+            quantize_per_channel_kernel[grid](
+                input,
+                scales_k,
+                zero_points_k,
+                int_out,
+                n_elements,
+                stride_axis,
+                shape_axis,
+                q_min,
+                q_max,
+                USE_FLOAT_ZERO_POINT=use_float_zero_point,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
 
-    with torch_device_fn.device(input.device):
-        quantize_per_channel_kernel[grid](
-            input,
-            scales,
-            zero_points,
-            int_out,
-            n_elements,
-            stride_axis,
-            shape_axis,
-            q_min,
-            q_max,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-
-    return torch._make_per_channel_quantized_tensor(int_out, scales, zero_points, axis)
+    # ``torch._make_per_channel_quantized_tensor`` copies the integer storage, so
+    # it must run *after* the kernel has written ``int_out``, and it infers the
+    # qscheme from the zero-point dtype -- exactly how the native quantizer
+    # factory picks between per_channel_affine and
+    # per_channel_affine_float_qparams.
+    return torch._make_per_channel_quantized_tensor(
+        int_out, scales_k, zero_points_k, axis
+    )
 
 
 def quantize_per_channel(input, scales, zero_points, axis, dtype):
@@ -138,10 +292,40 @@ def quantize_per_channel(input, scales, zero_points, axis, dtype):
 
 def quantize_per_channel_out(input, scales, zero_points, axis, dtype, *, out=None):
     logger.debug("GEMS QUANTIZE_PER_CHANNEL_OUT")
+    if out is None:
+        return _quantize_per_channel_impl(input, scales, zero_points, axis, dtype)
+    return _quantize_per_channel_out_impl(input, scales, zero_points, axis, dtype, out)
+
+
+def _quantize_per_channel_out_impl(input, scales, zero_points, axis, dtype, out):
+    # ``out`` must be a quantized tensor of the requested dtype: the
+    # autogenerated redispatch wrapper (``check_out_type``) rejects anything
+    # else before the operator body runs.
+    if not out.is_quantized or out.dtype != dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {dtype}, but got {out.dtype} instead"
+        )
+    # The native out= path copies the freshly-quantized tensor into ``out`` with
+    # ``copy_``, which for a pair of quantized tensors requires the same qscheme
+    # and then adopts the source quantizer. A float-qparams result therefore
+    # cannot land in an integer-qparams ``out`` (and vice versa).
+    float_result = _is_float_qparams(scales, zero_points)
+    float_out = out.qscheme() == torch.per_channel_affine_float_qparams
+    if float_result != float_out:
+        raise RuntimeError("Quantized Copy only works with same qscheme")
+
+    if tuple(out.shape) != tuple(input.shape):
+        # ATen warns and resizes a non-empty mismatched out. Resizing a
+        # per-channel quantized tensor is not implemented for this backend, so
+        # only the exact-shape contract can be served; report the mismatch
+        # rather than silently reinterpreting the destination storage.
+        raise RuntimeError(
+            f"The size of tensor a {tuple(out.shape)} must match the size of "
+            f"tensor b {tuple(input.shape)} at non-singleton dimension 0"
+        )
+
     result = _quantize_per_channel_impl(input, scales, zero_points, axis, dtype)
-    if out is not None:
-        # `out` is a quantized tensor; copy_ replaces its integer storage as
-        # well as its scale/zero-point/axis to match the freshly quantized result.
-        out.copy_(result)
-        return out
-    return result
+    # ``copy_`` replaces the destination's integer storage and adopts the
+    # source scale/zero-point/axis, which is what the native out= does.
+    out.copy_(result)
+    return out
