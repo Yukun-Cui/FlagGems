@@ -21,9 +21,53 @@ import triton.language as tl
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import libentry, tl_extra_shim
 
 logger = logging.getLogger(__name__)
+
+# Dynamic-quantization range for activations, mirroring ATen's CPU path for
+# ``quantized_rnn_relu_cell``: per-tensor quint8 with the full 0..255 range
+# (``reduce_range=False``).
+_ACT_QMIN = tl.constexpr(0)
+_ACT_QMAX = tl.constexpr(255)
+
+
+@triton.jit
+def _act_quant_range_kernel(
+    x_ptr,
+    numel,
+    stats_ptr,  # (2,) fp32: [min, max], pre-seeded with 0.0
+    BLOCK: tl.constexpr,
+):
+    """Two-field global min/max over ``numel`` elements.
+
+    The stats buffer is pre-seeded with 0.0, which reproduces ATen's fold of
+    zero into the dynamic-quant range (min(0, x), max(0, x)) for free.
+    """
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    step = nprog * BLOCK
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    for _ in range(0, tl.cdiv(numel, step)):
+        inb = offs < numel
+        x = tl.load(x_ptr + offs, mask=inb, other=0.0).to(tl.float32)
+        tl.atomic_min(stats_ptr, tl.min(x, axis=0))
+        tl.atomic_max(stats_ptr + 1, tl.max(x, axis=0))
+        offs += step
+
+
+@triton.jit
+def _act_params_kernel(
+    stats_ptr,  # (2,) fp32 [min, max]
+    qpar_ptr,  # (2,) fp32: [inv_scale, zero_point]
+):
+    """inv = 255 / range; zero_point = rint(-min * inv)."""
+    mn = tl.load(stats_ptr)
+    mx = tl.load(stats_ptr + 1)
+    rng = tl.maximum(mx - mn, 0.0)
+    inv = tl.where(rng > 0.0, 255.0 / rng, 1.0)
+    tl.store(qpar_ptr, inv)
+    tl.store(qpar_ptr + 1, tl_extra_shim.rint(-mn * inv))
 
 
 @libentry()
@@ -33,23 +77,29 @@ logger = logging.getLogger(__name__)
 )
 @triton.jit
 def quantized_rnn_relu_cell_kernel(
-    # activations (fp16/bf16/fp32)
+    # activations (fp32; aten::quantized_rnn_relu_cell is fp32-only)
     input_ptr,
     hx_ptr,
     # int8 quantized weights, row-major (out_features, in_features)
     w_ih_ptr,
     w_hh_ptr,
-    # biases (fp32-style; stored in activation dtype)
+    # biases (fp32)
     b_ih_ptr,
     b_hh_ptr,
-    # output
+    # output (fp32)
     output_ptr,
+    # activation dynamic-quant parameters, (2,) fp32 [inv_scale, zero_point]
+    qpar_ih_ptr,
+    qpar_hh_ptr,
+    # FBGEMM column offsets (int32): rowsum(w_q) - K * w_zp
+    col_ih_ptr,
+    col_hh_ptr,
     # sizes
     M,
     N,
     K_IH,
     K_HH,
-    # scales / zero points (python scalars)
+    # weight scales / zero points (python scalars)
     scale_ih,
     scale_hh,
     zero_point_ih,
@@ -64,9 +114,11 @@ def quantized_rnn_relu_cell_kernel(
     stride_w_ih_k,
     stride_w_hh_n,
     stride_w_hh_k,
-    # strides of biases and output
+    # strides of biases, column offsets and output
     stride_b_ih_n,
     stride_b_hh_n,
+    stride_col_ih_n,
+    stride_col_hh_n,
     stride_out_m,
     stride_out_n,
     # block sizes
@@ -79,17 +131,27 @@ def quantized_rnn_relu_cell_kernel(
     Grid: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N)).
     Each program computes a (BLOCK_M, BLOCK_N) output tile.
 
-    Math (per-tensor, row-wise int8 weight-only quantization)::
+    Math (reproduces ATen's FBGEMM legacy path for
+    ``quantized_rnn_relu_cell``, which dynamically quantizes the activations
+    before the integer GEMM)::
 
-        igates[m, n] = scale_ih * (sum_k input[m,k] * w_ih_int8[n,k]
-                                   - zero_point_ih * sum_k input[m,k]) + b_ih[n]
-        hgates[m, n] = scale_hh * (sum_k hx[m,k]   * w_hh_int8[n,k]
-                                   - zero_point_hh * sum_k hx[m,k])   + b_hh[n]
-        output[m, n] = relu(igates[m, n] + hgates[m, n])
+        // per-tensor dynamic activation quantization (quint8, full range)
+        range = max(0, a.max()) - min(0, a.min())
+        inv   = 255 / range
+        azp   = rint(-min(0, a.min()) * inv)
+        aq    = clamp(rint(a * inv) + azp, 0, 255)
 
-    The ``packed_*`` / ``col_offsets_*`` FBGEMM buffers are layout artifacts of
-    the x86 quantized-GEMM kernel and do not affect the numeric result, so this
-    GPU implementation computes directly from the int8 weight tensors.
+        // FBGEMM integer GEMM with zero-point corrections
+        // (col_offsets == rowsum(w_q) - K * w_zp, precomputed by ATen)
+        corr  = (aq - azp) @ (w_q - w_zp)^T
+        gates = a_scale * w_scale * corr + bias
+        hy    = relu(igates + hgates)
+
+    The int8 ``tl.dot`` computes ``(aq - 128) @ (w_q - w_zp)^T`` exactly in
+    int32; the removed constant ``128 * col_offsets`` is re-added through the
+    ``(128 - azp) * col_offsets`` correction term below, so the numerics are
+    bit-identical to the reference integer GEMM.  The ``packed_*`` buffers are
+    FBGEMM layout artifacts of the x86 kernel and do not affect the result.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -99,15 +161,21 @@ def quantized_rnn_relu_cell_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # ---- ih = W_ih (int8) @ input^T  -> (M, N) ----
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    input_rowsum = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # ---- dynamic activation quantization parameters (identical across tiles) --
+    inv_ih = tl.load(qpar_ih_ptr)
+    azp_ih = tl.load(qpar_ih_ptr + 1)
+    inv_hh = tl.load(qpar_hh_ptr)
+    azp_hh = tl.load(qpar_hh_ptr + 1)
+
+    # ---- igates = (aq_input - azp) @ (w_ih - zp_ih)^T  -> (M, N), int32 ----
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    a_rowsum = tl.zeros([BLOCK_M], dtype=tl.int32)
 
     for k_start in range(0, K_IH, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K_IH
 
-        # input tile (BLOCK_M, BLOCK_K), row-major (M, K)
+        # activation tile (BLOCK_M, BLOCK_K), row-major (M, K)
         a_in = tl.load(
             input_ptr
             + offs_m[:, None] * stride_input_m
@@ -115,31 +183,43 @@ def quantized_rnn_relu_cell_kernel(
             mask=mask_m[:, None] & mask_k[None, :],
             other=0.0,
         ).to(tl.float32)
+        # quint8 dynamic quantization, shifted to signed range: aq - 128.
+        # (aq - azp) @ w^T is reconstructed from (aq - 128) @ w^T plus
+        # col-offset / rowsum corrections below.  Out-of-range K lanes are
+        # forced back to 0 so they neither pollute the row sum nor the dot.
+        a_q = tl_extra_shim.rint(a_in * inv_ih) + azp_ih
+        a_q = tl.minimum(tl.maximum(a_q, _ACT_QMIN), _ACT_QMAX).to(tl.int32) - 128
+        a_q = tl.where(mask_k[None, :], a_q, 0)
+        a_rowsum += tl.sum(a_q, axis=1)
 
-        # w_ih tile (BLOCK_N, BLOCK_K), row-major (out=N, in=K)
-        w_ih = tl.load(
+        # w_ih tile (BLOCK_N, BLOCK_K) int8, row-major (out, in)
+        w_q = tl.load(
             w_ih_ptr
             + offs_n[:, None] * stride_w_ih_n
             + offs_k[None, :] * stride_w_ih_k,
             mask=mask_n[:, None] & mask_k[None, :],
             other=0,
-        ).to(tl.float32)
+        )
 
-        # acc[m, n] += sum_k input[m, k] * w_ih[n, k]
-        acc += tl.dot(a_in, w_ih.trans(1, 0), allow_tf32=False)
-        # row-sum of input over this k-block
-        input_rowsum += tl.sum(a_in, axis=1)
+        acc += tl.dot(a_q.to(tl.int8), w_q.trans(1, 0))
 
-    # ih_acc already in fp32. Apply scale & zero-point correction + bias.
-    acc = scale_ih * (acc - zero_point_ih * input_rowsum[:, None])
     b_ih = tl.load(b_ih_ptr + offs_n * stride_b_ih_n, mask=mask_n, other=0.0).to(
         tl.float32
     )
-    acc += b_ih[None, :]
+    col_ih = tl.load(col_ih_ptr + offs_n * stride_col_ih_n, mask=mask_n, other=0).to(
+        tl.int32
+    )
+    corr = (
+        acc.to(tl.float32)
+        + (128.0 - azp_ih) * col_ih.to(tl.float32)[None, :]
+        - zero_point_ih * a_rowsum.to(tl.float32)[:, None]
+    )
+    # a_scale = 1 / inv, so a_scale * w_scale = w_scale / inv
+    igates = (scale_ih / inv_ih) * corr + b_ih[None, :]
 
-    # ---- hh = W_hh (int8) @ hx^T  -> (M, N) ----
-    hh_acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    hx_rowsum = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # ---- hgates = (aq_hx - azp) @ (w_hh - zp_hh)^T  -> (M, N), int32 ----
+    hh_acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    h_rowsum = tl.zeros([BLOCK_M], dtype=tl.int32)
 
     for k_start in range(0, K_HH, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
@@ -150,26 +230,36 @@ def quantized_rnn_relu_cell_kernel(
             mask=mask_m[:, None] & mask_k[None, :],
             other=0.0,
         ).to(tl.float32)
+        a_qh = tl_extra_shim.rint(a_hx * inv_hh) + azp_hh
+        a_qh = tl.minimum(tl.maximum(a_qh, _ACT_QMIN), _ACT_QMAX).to(tl.int32) - 128
+        a_qh = tl.where(mask_k[None, :], a_qh, 0)
+        h_rowsum += tl.sum(a_qh, axis=1)
 
-        w_hh = tl.load(
+        w_h = tl.load(
             w_hh_ptr
             + offs_n[:, None] * stride_w_hh_n
             + offs_k[None, :] * stride_w_hh_k,
             mask=mask_n[:, None] & mask_k[None, :],
             other=0,
-        ).to(tl.float32)
+        )
 
-        hh_acc += tl.dot(a_hx, w_hh.trans(1, 0), allow_tf32=False)
-        hx_rowsum += tl.sum(a_hx, axis=1)
+        hh_acc += tl.dot(a_qh.to(tl.int8), w_h.trans(1, 0))
 
-    hh_acc = scale_hh * (hh_acc - zero_point_hh * hx_rowsum[:, None])
     b_hh = tl.load(b_hh_ptr + offs_n * stride_b_hh_n, mask=mask_n, other=0.0).to(
         tl.float32
     )
-    hh_acc += b_hh[None, :]
+    col_hh = tl.load(col_hh_ptr + offs_n * stride_col_hh_n, mask=mask_n, other=0).to(
+        tl.int32
+    )
+    corr_h = (
+        hh_acc.to(tl.float32)
+        + (128.0 - azp_hh) * col_hh.to(tl.float32)[None, :]
+        - zero_point_hh * h_rowsum.to(tl.float32)[:, None]
+    )
+    hgates = (scale_hh / inv_hh) * corr_h + b_hh[None, :]
 
-    # ---- relu(ih + hh) ----
-    out = acc + hh_acc
+    # ---- relu(igates + hgates) ----
+    out = igates + hgates
     out = tl.where(out > 0, out, 0.0)
 
     out_ptrs = (
@@ -177,6 +267,26 @@ def quantized_rnn_relu_cell_kernel(
     )
     out_mask = mask_m[:, None] & mask_n[None, :]
     tl.store(out_ptrs, out, mask=out_mask)
+
+
+def _act_quant_params(acts):
+    """Dynamic per-tensor quint8 quantization parameters for ``acts``.
+
+    Returns a (2,) fp32 CUDA tensor ``[inv_scale, zero_point]`` matching
+    ``torch.quantize_per_tensor_dynamic(acts, torch.quint8)``:
+    ``range = max(0, max) - min(0, min)``, ``inv = 255 / range``,
+    ``zp = rint(-min(0, min) * inv)``.  An all-zero tensor keeps ``inv = 1``
+    and ``zp = 0`` (ATen uses scale 1e-8/zp 0 there; the resulting integer
+    values and gates are identical because every element quantizes to the
+    zero point).
+    """
+    stats = torch.zeros(2, dtype=torch.float32, device=acts.device)
+    qpar = torch.empty(2, dtype=torch.float32, device=acts.device)
+    numel = acts.numel()
+    grid = lambda meta: (triton.cdiv(numel, meta["BLOCK"]),)
+    _act_quant_range_kernel[grid](acts, numel, stats, BLOCK=1024)
+    _act_params_kernel[(1,)](stats, qpar)
+    return qpar
 
 
 def quantized_rnn_relu_cell(
@@ -197,23 +307,85 @@ def quantized_rnn_relu_cell(
 ):
     """Applies a single step of a quantized Elman RNN cell with ReLU activation.
 
-    Computes ``hy = relu(W_ih @ x + b_ih + W_hh @ hx + b_hh)`` where ``W_ih`` and
-    ``W_hh`` are int8 weight-only quantized (per-tensor scale / zero-point) and
-    ``packed_*`` / ``col_offsets_*`` are the FBGEMM pack buffers (not needed by
-    the Triton kernel, which reads the int8 weight tensors directly).
+    Mirrors ``aten::quantized_rnn_relu_cell`` (FBGEMM legacy path): the
+    activations are dynamically quantized per tensor to quint8 before the
+    integer GEMM, and the weight zero points / column offsets participate in
+    the integer correction.  ``packed_*`` are FBGEMM layout artifacts that do
+    not affect the numeric result and are not read by this kernel.
     """
     logger.debug("GEMS QUANTIZED_RNN_RELU_CELL")
+
+    # ---- validation: shapes, dtypes, devices drive raw pointer arithmetic ----
+    if input.dim() != 2 or hx.dim() != 2:
+        raise RuntimeError(
+            "quantized_rnn_relu_cell: input and hx must be 2-D "
+            f"(got input.dim()={input.dim()}, hx.dim()={hx.dim()})"
+        )
+    if input.shape[0] != hx.shape[0]:
+        raise RuntimeError(
+            "The size of tensor a (" + str(hx.shape[0]) + ") must match the size of "
+            "tensor b (" + str(input.shape[0]) + ") at non-singleton dimension 0"
+        )
+    if w_ih.dtype != torch.int8 or w_hh.dtype != torch.int8:
+        raise RuntimeError(
+            "w_ih and w_hh must have dtype torch.int8 "
+            f"(got {w_ih.dtype} and {w_hh.dtype})"
+        )
+    if input.dtype not in (torch.float32,):
+        raise RuntimeError(
+            f"quantized_rnn_relu_cell: expected fp32 input, got {input.dtype}"
+        )
+    if hx.dtype != input.dtype:
+        raise RuntimeError(f"expected scalar type {input.dtype} but found {hx.dtype}")
+    if b_ih.dtype != input.dtype or b_hh.dtype != input.dtype:
+        raise RuntimeError("b_ih and b_hh must have the same dtype as input")
+    if input.device != hx.device:
+        raise RuntimeError("input and hx must be on the same device")
+    if w_ih.device != input.device or w_hh.device != input.device:
+        raise RuntimeError("w_ih and w_hh must be on the same device as input")
+    if b_ih.device != input.device or b_hh.device != input.device:
+        raise RuntimeError("b_ih and b_hh must be on the same device as input")
+    if col_offsets_ih.dtype != torch.int32 or col_offsets_hh.dtype != torch.int32:
+        raise RuntimeError(
+            "col_offsets must have dtype torch.int32 "
+            f"(got {col_offsets_ih.dtype} and {col_offsets_hh.dtype})"
+        )
+    if col_offsets_ih.device != input.device or col_offsets_hh.device != input.device:
+        raise RuntimeError("col_offsets must be on the same device as input")
 
     M = input.shape[0]
     K_IH = input.shape[1]
     N = w_ih.shape[0]
     K_HH = hx.shape[1]
 
+    if w_ih.dim() != 2 or w_hh.dim() != 2:
+        raise RuntimeError("w_ih and w_hh must be 2-D (out_features, in_features)")
+    if w_ih.shape[1] != K_IH:
+        raise RuntimeError(
+            f"Expected K == weight.size(1) to be true, but got false: "
+            f"K = {K_IH}, weight.size(1) = {w_ih.shape[1]}"
+        )
+    if w_hh.shape[1] != K_HH:
+        raise RuntimeError(
+            f"Expected K == weight.size(1) to be true, but got false: "
+            f"K = {K_HH}, weight.size(1) = {w_hh.shape[1]}"
+        )
+    for name, bias in (("b_ih", b_ih), ("b_hh", b_hh)):
+        if bias.dim() != 1 or bias.shape[0] != N:
+            raise RuntimeError(
+                f"Expected bias.size(0) == N ({N}) to be true for {name}"
+            )
+    for name, col in (
+        ("col_offsets_ih", col_offsets_ih),
+        ("col_offsets_hh", col_offsets_hh),
+    ):
+        if col.dim() != 1 or col.shape[0] != N:
+            raise RuntimeError(f"Expected {name}.size(0) == N ({N}) to be true")
+
     # Allocate via ``empty_strided`` to bypass the GEMS ``aten::empty`` override,
     # which launches a Triton zero-init kernel (~25us) per call. The output is
     # fully overwritten by the kernel's masked stores, so an uninitialized
-    # allocation is safe and removes that fixed overhead -- meaningful here
-    # because the cell kernel itself runs in ~27us on the bench shapes.
+    # allocation is safe and removes that fixed overhead.
     output = torch.empty_strided((M, N), (N, 1), dtype=input.dtype, device=input.device)
 
     if not input.is_contiguous():
@@ -228,6 +400,14 @@ def quantized_rnn_relu_cell(
         b_ih = b_ih.contiguous()
     if not b_hh.is_contiguous():
         b_hh = b_hh.contiguous()
+    if not col_offsets_ih.is_contiguous():
+        col_offsets_ih = col_offsets_ih.contiguous()
+    if not col_offsets_hh.is_contiguous():
+        col_offsets_hh = col_offsets_hh.contiguous()
+
+    # ---- dynamic activation-quantization parameters (fp32 device tensors) ----
+    qpar_ih = _act_quant_params(input)
+    qpar_hh = _act_quant_params(hx)
 
     grid = lambda meta: (
         triton.cdiv(M, meta["BLOCK_M"]),
@@ -243,6 +423,10 @@ def quantized_rnn_relu_cell(
             b_ih,
             b_hh,
             output,
+            qpar_ih,
+            qpar_hh,
+            col_offsets_ih,
+            col_offsets_hh,
             M,
             N,
             K_IH,
@@ -261,6 +445,8 @@ def quantized_rnn_relu_cell(
             w_hh.stride(1),
             b_ih.stride(0),
             b_hh.stride(0),
+            col_offsets_ih.stride(0),
+            col_offsets_hh.stride(0),
             output.stride(0),
             output.stride(1),
         )
