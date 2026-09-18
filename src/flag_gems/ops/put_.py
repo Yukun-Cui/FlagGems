@@ -57,12 +57,73 @@ _SCALAR_TYPE_NAMES = {
 
 
 @libentry()
+@triton.jit(do_not_specialize=["N", "src_numel"])
+def put_stage_widen_kernel(
+    dst_ptr, src_ptr, src_numel, N, TO_BOOL: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    """Widen ``src`` into an int32 staging buffer, on the device.
+
+    ``dst`` is the row-major flattening of the operand (``N`` elements);
+    ``src`` may be a strided view, so it is read through its own flat order
+    (``src_numel`` == N for every caller here). ``bool`` is normalized to 0/1
+    explicitly rather than relying on the element-wise cast.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    value = tl.load(src_ptr + offsets, mask=mask, other=0)
+    if TO_BOOL:
+        value = tl.where(value != 0, 1, 0)
+    tl.store(dst_ptr + offsets, value.to(tl.int32), mask=mask)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["N"])
+def put_stage_narrow_kernel(
+    dst_ptr, src_ptr, N, TO_BOOL: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    """Narrow a contiguous int32 accumulator back into the destination dtype.
+
+    A truncating store reproduces ATen's two's-complement wrap for int8, uint8
+    and int16. ``bool`` saturates instead (``True + True`` is ``True``), so it
+    compares against zero rather than keeping the low bit.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+    value = tl.load(src_ptr + offsets, mask=mask, other=0)
+    if TO_BOOL:
+        tl.store(dst_ptr + offsets, value != 0, mask=mask)
+    else:
+        tl.store(dst_ptr + offsets, value, mask=mask)
+
+
+@triton.jit
+def _trap_if(cond):
+    """Trap the device unconditionally when ``cond`` is true.
+
+    ``tl.device_assert`` is stripped unless ``TRITON_DEBUG=1``, which would leave
+    an out-of-range index silently dropped in normal builds. Emitting the PTX
+    ``trap`` instruction directly keeps the check active in every build while
+    still reporting the failure asynchronously, the way ATen's CUDA kernel does.
+    """
+    tl.inline_asm_elementwise(
+        asm="{ .reg .pred p; setp.ne.b32 p, $1, 0; @p trap; mov.u32 $0, 0; }",
+        constraints="=r,r",
+        args=[cond.to(tl.int32)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@libentry()
 @triton.jit(do_not_specialize=["N", "inp_numel"])
 def put_kernel(
     inp_ptr,
     index_ptr,
     source_ptr,
-    offset_ptr,
+    layout_ptr,
     inp_numel,
     N,
     inp_shape0,
@@ -85,6 +146,7 @@ def put_kernel(
     IS_ACCUMULATE: tl.constexpr,
     IS_CONTIGUOUS: tl.constexpr,
     HAS_PRECOMPUTED_OFFSETS: tl.constexpr,
+    RANK_DYN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -100,21 +162,25 @@ def put_kernel(
     # Bounds check on the *original* index, matching ATen's CUDA assertion
     # `idx < numel && idx >= -numel`: the valid range is [-inp_numel, inp_numel).
     index_valid = (wrapped >= 0) & (wrapped < inp_numel)
-    tl.device_assert(index_valid | (~mask), "put_(): index out of range")
+    _trap_if(tl.max((mask & (~index_valid)).to(tl.int32)) > 0)
 
     # Gate the write on validity as well, so an out-of-range index can never
-    # touch memory outside `self` even when the assert is compiled out (Triton
-    # only emits `device_assert` under TRITON_DEBUG=1).
+    # touch memory outside `self`.
     final_mask = mask & index_valid
     # Keep the decoded coordinate in range even for masked-off lanes.
     idx = tl.where(index_valid, wrapped, 0)
 
     if HAS_PRECOMPUTED_OFFSETS:
-        # >MAX_UNROLL_RANK collapsed dims: the physical element offsets were
-        # computed on the host, so no in-kernel decomposition is needed.
-        inp_offsets = tl.load(offset_ptr + offsets, mask=final_mask, other=0).to(
-            tl.int64
-        )
+        # More collapsed dims than the unrolled signature carries: decode the
+        # flat index against the layout vector in a `RANK_DYN`-trip loop. The
+        # loop is fully device-side, so the host never computes offsets.
+        cur = idx
+        inp_offsets = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+        for i in tl.static_range(RANK_DYN - 1, -1, -1):
+            dim_size = tl.load(layout_ptr + i).to(tl.int64)
+            dim_stride = tl.load(layout_ptr + RANK_DYN + i).to(tl.int64)
+            inp_offsets += (cur % dim_size) * dim_stride
+            cur = cur // dim_size
     elif IS_CONTIGUOUS:
         # For a row-major contiguous tensor the flat index is already the
         # element offset, so the multi-dimensional decomposition drops out.
@@ -284,21 +350,17 @@ def _launch(inp, index_flat, source_flat, accumulate):
         shape, stride = _collapse_dims(list(inp.shape), list(inp.stride()))
         rank = len(shape)
 
-    offsets_arg = inp  # unused placeholder; kernel ignores it unless enabled
     has_precomputed = rank > MAX_UNROLL_RANK
+    dyn_rank = rank if has_precomputed else 0
     if has_precomputed:
         # A >MAX_UNROLL_RANK collapsed layout (a heavily permuted high-rank
-        # view) is rare enough that decoding the flat index on the host and
-        # passing element offsets is cheaper than growing the kernel signature.
-        flat = index_flat.to(torch.int64)
-        flat = torch.where(flat < 0, flat + inp_numel, flat)
-        flat = flat.clamp_(0, max(inp_numel - 1, 0))
-        offsets_arg = torch.zeros_like(flat)
-        cur = flat
-        for d in reversed(range(rank)):
-            offsets_arg += (cur % shape[d]) * stride[d]
-            cur = cur // shape[d]
-        rank = 0  # decomposition already done
+        # view). Hand the kernel the layout vector (sizes then strides) and let
+        # it decode in a loop, so no offsets are computed on the host and no
+        # extra device launches precede the scatter.
+        layout_arg = torch.tensor(shape + stride, dtype=torch.int64, device=inp.device)
+    else:
+        # Unused on this path; pass `inp` so no allocation happens at all.
+        layout_arg = inp
 
     # Pad to exactly MAX_UNROLL_RANK. Truncation only ever applies on the
     # precomputed-offsets path, where these arguments are unused -- padding
@@ -318,18 +380,54 @@ def _launch(inp, index_flat, source_flat, accumulate):
             inp,
             index_flat,
             source_flat,
-            offsets_arg,
+            layout_arg,
             inp_numel,
             N,
             *shape,
             *stride,
-            RANK=rank,
+            RANK=rank if not has_precomputed else 0,
             IS_ACCUMULATE=accumulate,
             IS_CONTIGUOUS=(rank == 1 and stride[0] == 1),
             HAS_PRECOMPUTED_OFFSETS=has_precomputed,
+            RANK_DYN=dyn_rank,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
+
+
+def _stage_to_int32(src, bool_normalize=False):
+    """Device-side widen of ``src`` into a contiguous int32 buffer."""
+    out = torch.empty(src.numel(), dtype=torch.int32, device=src.device)
+    N = out.numel()
+    if N == 0:
+        return out
+    BLOCK_SIZE = 1024
+    put_stage_widen_kernel[(triton.cdiv(N, BLOCK_SIZE),)](
+        out,
+        src,
+        src.numel(),
+        N,
+        TO_BOOL=bool_normalize,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+    )
+    return out
+
+
+def _stage_back(dst, staged, to_bool=False):
+    """Device-side narrow of a contiguous int32 ``staged`` back into ``dst``.
+
+    ``dst`` and ``staged`` are the row-major flattenings of the same element
+    set, so a flat element-wise store reproduces ``dst``'s layout exactly.
+    """
+    N = staged.numel()
+    if N == 0:
+        return dst
+    BLOCK_SIZE = 1024
+    put_stage_narrow_kernel[(triton.cdiv(N, BLOCK_SIZE),)](
+        dst, staged, N, TO_BOOL=to_bool, BLOCK_SIZE=BLOCK_SIZE, num_warps=4
+    )
+    return dst
 
 
 def _put_impl(inp, index, source, accumulate=False):
@@ -368,25 +466,23 @@ def _put_impl(inp, index, source, accumulate=False):
 
     if accumulate and dtype in _NARROW_INT_DTYPES:
         # Triton has no atomic_add for int8/uint8/int16 (and none for bool).
-        # Accumulate into an int32 staging copy, then narrow back. The narrowing
-        # cast wraps exactly like native's integer accumulate.
-        staged = inp.to(torch.int32)
-        _launch(
-            staged,
-            index_flat,
-            source_flat.to(torch.int32),
-            True,
-        )
-        inp.copy_(staged.to(dtype).reshape(inp.shape))
+        # Accumulate into an int32 staging buffer, then narrow back. Both the
+        # widen and the narrow run as Triton kernels: the narrowing store wraps
+        # exactly like native's integer accumulate.
+        staged = _stage_to_int32(inp)
+        _launch(staged, index_flat, _stage_to_int32(source_flat), True)
+        _stage_back(inp, staged)
         return inp
 
     if accumulate and dtype is torch.bool:
         # `accumulate=True` on bool is a logical OR in native (measured: any
         # True source lands as True, an already-True slot stays True). int32
-        # atomic_add then `!= 0` reproduces it without a bool atomic.
-        staged = inp.to(torch.int32)
-        _launch(staged, index_flat, source_flat.to(torch.int32), True)
-        inp.copy_((staged != 0).reshape(inp.shape))
+        # atomic_add then a `!= 0` narrow reproduces it without a bool atomic.
+        staged = _stage_to_int32(inp, bool_normalize=True)
+        _launch(
+            staged, index_flat, _stage_to_int32(source_flat, bool_normalize=True), True
+        )
+        _stage_back(inp, staged, to_bool=True)
         return inp
 
     _launch(inp, index_flat, source_flat, accumulate)
@@ -424,6 +520,15 @@ def put_(inp, index, source, accumulate=False):
         raise IndexError(
             "put_(): Expected source and index to have the same number of elements, "
             f"but got source.numel() = {source.numel()}, index.numel() = {index.numel()}"
+        )
+    if inp.dtype == torch.complex32:
+        # Native CUDA `put_` has no ComplexHalf kernel
+        # (`put_cuda`/`take_put_cpu` both raise NotImplementedError) and Triton
+        # cannot represent complex32 either. Reject it explicitly so the failure
+        # matches ATen instead of silently routing through the FP16 real-view path.
+        raise NotImplementedError(
+            '"put_cuda" not implemented for '
+            f"'{_SCALAR_TYPE_NAMES.get(torch.complex32, 'ComplexHalf')}'"
         )
 
     _assert_no_internal_overlap(inp)

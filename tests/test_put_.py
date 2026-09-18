@@ -1,3 +1,8 @@
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 
@@ -364,16 +369,36 @@ def test_put__empty_index_is_noop(self_numel):
 @pytest.mark.put_
 @pytest.mark.parametrize("bad", [4, 5, 100, -5, -100])
 def test_put__index_out_of_range(bad):
-    # ATen's CUDA `put_` enforces `-numel <= index < numel` with a device-side
-    # assert, which our kernel mirrors via `tl.device_assert`. We cannot trip it
-    # here -- an async device assert poisons the CUDA context for the whole test
-    # process -- so confirm on CPU that torch classifies these as out of range,
-    # which is exactly the condition the kernel's assert guards.
-    inp = torch.zeros(4, dtype=torch.float32)
-    index = torch.tensor([bad], dtype=torch.int64)
-    source = torch.ones(1, dtype=torch.float32)
-    with pytest.raises(IndexError):
+    # ATen's CUDA `put_` enforces `-numel <= index < numel` with a *device-side*
+    # assert, and our kernel mirrors it with an unconditional device trap rather
+    # than `tl.device_assert` (which is compiled out unless TRITON_DEBUG=1).
+    # A tripped device assert poisons the CUDA context for the whole process, so
+    # the failure is exercised in an isolated subprocess.
+    code = textwrap.dedent(f"""
+        import torch
+        import flag_gems
+
+        inp = torch.zeros(4, dtype=torch.float32, device=flag_gems.device)
+        index = torch.tensor([{bad}], dtype=torch.int64, device=flag_gems.device)
+        source = torch.ones(1, dtype=torch.float32, device=flag_gems.device)
+
+        # A valid index must not synchronize on the success path.
+        inp.put_(index[:0].new_zeros(0), source[:0])
         inp.put_(index, source)
+        torch.cuda.synchronize()
+        print("NO_ERROR")
+        """)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env
+    )
+    assert "NO_ERROR" not in proc.stdout, (
+        "an out-of-range index was silently accepted; "
+        f"stdout={proc.stdout!r} stderr={proc.stderr[-300:]!r}"
+    )
+    assert "device-side assert" in proc.stderr or "trap" in proc.stderr.lower(), (
+        "expected a device-side failure, got: " + proc.stderr[-300:]
+    )
 
 
 @pytest.mark.put_
@@ -605,3 +630,19 @@ def test_put__view_of_larger_storage(make_view, base_numel, index_vals):
 
     # Comparing the whole base catches both a wrong offset and a stray write.
     utils.gems_assert_equal(base, ref_base)
+
+
+@pytest.mark.put_
+def test_put__complex32_rejected():
+    # Native CUDA `put_` has no ComplexHalf kernel; `complex32` used to fall
+    # through to the FP16 real-view path, silently succeeding where ATen raises.
+    inp = torch.zeros(4, dtype=torch.complex32, device=flag_gems.device)
+    index = torch.tensor([0], dtype=torch.int64, device=flag_gems.device)
+    source = torch.ones(1, dtype=torch.complex32, device=flag_gems.device)
+
+    with pytest.raises(NotImplementedError) as ref_err:
+        inp.clone().put_(index, source)
+    with pytest.raises(NotImplementedError) as res_err:
+        flag_gems.put_(inp, index, source)
+
+    assert str(ref_err.value) == str(res_err.value)
