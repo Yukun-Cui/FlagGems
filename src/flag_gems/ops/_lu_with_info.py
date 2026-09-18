@@ -45,8 +45,12 @@ def _lu_info_kernel(
     in ``[0, k)`` where ``k = min(M, N)``), or ``0`` if every U pivot is
     nonzero. This mirrors the cuSOLVER convention: a nonzero ``info`` flags a
     singular factor (the matrix could not be factored into a nonsingular U),
-    while ``info == 0`` means success. ``NaN``/``Inf`` pivots are treated as
-    singular as well, matching the reference behaviour.
+    while ``info == 0`` means success.
+
+    Only an *exact* zero counts. ``NaN`` and ``Inf`` pivots are **not** singular:
+    ``torch.linalg.lu_factor_ex`` reports ``info == 0`` for a matrix whose
+    diagonal is ``inf`` or ``nan`` (measured on both CPU and CUDA), so treating
+    them as singular would report a failure where ATen reports success.
     """
     pid_b = tl.program_id(0)
 
@@ -55,11 +59,10 @@ def _lu_info_kernel(
         # LU[b, j, j] for a row-major (..., M, N) tensor: offset = b*strd + j*N + j
         diag_off = pid_b.to(tl.int64) * stride_batch + j * N + j
         pivot = tl.load(LU + diag_off)
-        # A zero on the U diagonal marks a singular factor. cuSOLVER reports the
-        # 1-indexed position of the first such zero pivot. NaN pivots (which do
-        # not compare equal to themselves) are flagged as singular as well.
-        is_nan = pivot != pivot
-        is_singular = (pivot == 0.0) | is_nan
+        # cuSOLVER reports the 1-indexed position of the first pivot that is
+        # exactly zero. NaN compares unequal to itself, so `== 0.0` already
+        # excludes it (and any Inf) without a separate test.
+        is_singular = pivot == 0.0
         # Record the *first* singular index; once info_val is set, keep it.
         already_set = info_val != 0
         info_val = tl.where(already_set, info_val, tl.where(is_singular, j + 1, 0))

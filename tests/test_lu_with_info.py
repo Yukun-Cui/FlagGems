@@ -227,3 +227,46 @@ def test_lu_with_info_info_shape(shape, dtype):
     ref_lu, ref_pivots, ref_info = torch._lu_with_info(ref_inp, pivot=True)
     res_lu, res_pivots, res_info = flag_gems._lu_with_info(inp, pivot=True)
     assert res_info.shape == ref_info.shape
+
+
+@pytest.mark.lu_with_info
+def test_lu_info_ignores_nonfinite_pivots():
+    # `info` must only mark an *exact* zero pivot as singular. NaN/Inf pivots
+    # are not singular: `torch.linalg.lu_factor_ex` reports info == 0 for a
+    # matrix whose diagonal is inf. This asserts the rule directly on the
+    # kernel's input contract rather than through a full factorization, since
+    # FlagGems' LU produces a different (non-finite) diagonal for NaN inputs
+    # than cuSOLVER does -- see the note in the PR discussion.
+    from flag_gems.ops._lu_with_info import _lu_info_kernel
+
+    k = 4
+    LU = torch.eye(k, dtype=torch.float64)
+    LU[0, 0] = 0.0  # exact zero -> singular
+    LU[1, 1] = float("nan")  # not singular
+    LU[2, 2] = float("inf")  # not singular
+    LU = LU.to(flag_gems.device)
+
+    info = torch.zeros((), dtype=torch.int32, device=flag_gems.device)
+    _lu_info_kernel[(1,)](LU, info, k, k, k * k, K_MAX=k, BLOCK=8)
+    assert int(info.item()) == 1, (
+        "the exact zero at position 1 must be reported, and the NaN/Inf "
+        f"pivots must not be; got info={int(info.item())}"
+    )
+
+
+@pytest.mark.lu_with_info
+def test_lu_info_reports_nan_only_as_nonzero_when_zero_absent():
+    # Without an exact zero, non-finite pivots must not set info at all.
+    from flag_gems.ops._lu_with_info import _lu_info_kernel
+
+    k = 3
+    LU = torch.eye(k, dtype=torch.float64)
+    LU[1, 1] = float("nan")
+    LU[2, 2] = float("inf")
+    LU = LU.to(flag_gems.device)
+
+    info = torch.zeros((), dtype=torch.int32, device=flag_gems.device)
+    _lu_info_kernel[(1,)](LU, info, k, k, k * k, K_MAX=k, BLOCK=8)
+    assert (
+        int(info.item()) == 0
+    ), f"non-finite pivots must not be reported as singular; got info={int(info.item())}"
