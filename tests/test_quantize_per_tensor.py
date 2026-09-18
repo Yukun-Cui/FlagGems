@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import flag_gems
+from flag_gems.ops.quantize_per_tensor import _quantize_per_tensor_impl
 
 from . import accuracy_utils as utils
 
@@ -184,3 +185,54 @@ def test_quantize_per_tensor_out_shape_mismatch():
     # QuantizedCUDA kernel, so the native op fails here too.
     with pytest.raises(RuntimeError):
         flag_gems.quantize_per_tensor_out(inp, 0.1, 0, torch.quint8, out=out)
+
+
+@pytest.mark.quantize_per_tensor
+@pytest.mark.parametrize(
+    "memory_format,shape",
+    [
+        (torch.channels_last, (2, 3, 4, 5)),
+        (torch.channels_last_3d, (2, 3, 4, 5, 6)),
+    ],
+    ids=["channels_last", "channels_last_3d"],
+)
+def test_quantize_per_tensor_memory_format(memory_format, shape):
+    # ATen materializes the input with `rtensor.suggest_memory_format()` and
+    # allocates the quantized output in that same format, so a channels-last
+    # input yields a channels-last int_repr. Check both the values and the
+    # resulting strides against the native op.
+    utils.init_seed(0)
+    inp = torch.randn(shape, dtype=torch.float32, device=flag_gems.device).contiguous(
+        memory_format=memory_format
+    )
+
+    ref_int_repr = torch.quantize_per_tensor(
+        utils.to_reference(inp), 0.1, 0, torch.qint8
+    ).int_repr()
+    res_int_repr = flag_gems.quantize_per_tensor(inp, 0.1, 0, torch.qint8).int_repr()
+
+    # The kernel allocates and fills the output in the suggested memory format,
+    # which is what this asserts (see `_quantize_per_tensor_impl`).
+    impl_int_repr = _quantize_per_tensor_impl(inp, 0.1, 0, torch.qint8)
+    assert impl_int_repr.stride() == ref_int_repr.stride(), (
+        f"int_repr strides differ: got {tuple(impl_int_repr.stride())}, "
+        f"expected {tuple(ref_int_repr.stride())}"
+    )
+    utils.gems_assert_equal(impl_int_repr, utils.to_reference(ref_int_repr))
+
+    # Values must match through the public entry point regardless of layout.
+    utils.gems_assert_equal(res_int_repr, utils.to_reference(ref_int_repr))
+
+
+@pytest.mark.quantize_per_tensor
+@pytest.mark.parametrize("shape", [(2, 3, 4, 5), (2, 3, 4, 5, 6)], ids=["4d", "5d"])
+def test_quantize_per_tensor_contiguous_unchanged(shape):
+    # A default-layout input must keep producing default-layout output.
+    utils.init_seed(0)
+    inp = torch.randn(shape, dtype=torch.float32, device=flag_gems.device)
+    ref_int_repr = torch.quantize_per_tensor(
+        utils.to_reference(inp), 0.1, 0, torch.qint8
+    ).int_repr()
+    res_int_repr = flag_gems.quantize_per_tensor(inp, 0.1, 0, torch.qint8).int_repr()
+    assert res_int_repr.is_contiguous()
+    utils.gems_assert_equal(res_int_repr, utils.to_reference(ref_int_repr))

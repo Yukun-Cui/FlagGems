@@ -87,6 +87,32 @@ def quantize_per_tensor_kernel(
     tl.store(out_ptr + offsets, q.to(out_ptr.dtype.element_ty), mask=mask)
 
 
+def _suggest_memory_format(t):
+    """Mirror of ``TensorImpl::suggest_memory_format`` for the dense cases.
+
+    ATen keeps a channels-last (4-D) or channels-last-3d (5-D) input in that
+    format. The check is: the dimension is present, the channel dimension is not
+    degenerate, and the tensor is already dense in that format. Everything else
+    -- including 1-D/2-D tensors, which reject an explicit ``memory_format=`` --
+    falls back to the default contiguous format. Verified against the native op
+    on contiguous, channels-last, channels-last-3d, C=1, N=1, transposed and
+    sliced-channel-last inputs.
+    """
+    if (
+        t.dim() == 4
+        and t.shape[1] != 1
+        and t.is_contiguous(memory_format=torch.channels_last)
+    ):
+        return torch.channels_last
+    if (
+        t.dim() == 5
+        and t.shape[1] != 1
+        and t.is_contiguous(memory_format=torch.channels_last_3d)
+    ):
+        return torch.channels_last_3d
+    return torch.contiguous_format
+
+
 def _quantize_per_tensor_impl(a, scale, zero_point, dtype):
     """Shared core: compute the quantized integer representation of ``a``.
 
@@ -107,13 +133,26 @@ def _quantize_per_tensor_impl(a, scale, zero_point, dtype):
 
     storage_dtype, qmin, qmax = _QUANT_INFO[dtype]
     n_elements = a.numel()
-    out = torch.empty(a.shape, dtype=storage_dtype, device=a.device)
+
+    # ATen materializes the input with ``rtensor.suggest_memory_format()`` and
+    # allocates the quantized output in that same format, so a channels-last
+    # (or channels-last-3d) input yields a channels-last int_repr rather than
+    # being silently re-laid-out to contiguous. ``suggest_memory_format`` has no
+    # Python binding, so mirror its 4-D/5-D rules here (see
+    # ``TensorImpl::suggest_memory_format``): contiguous when the batch stride
+    # does not fit the channels-last pattern or the channel count is too small,
+    # channels-last otherwise.
+    memory_format = _suggest_memory_format(a)
+    if memory_format is torch.contiguous_format or a.dim() < 4:
+        out = torch.empty(a.shape, dtype=storage_dtype, device=a.device)
+        a = a.contiguous()
+    else:
+        out = torch.empty(
+            a.shape, dtype=storage_dtype, device=a.device, memory_format=memory_format
+        )
+        a = a.contiguous(memory_format=memory_format)
     if n_elements == 0:
         return out
-
-    # The kernel walks storage with a flat offset, so a transposed or sliced view
-    # would be read in the wrong order; materialize a dense copy first.
-    a = a.contiguous()
 
     # One thread per element; 1024 is a standard block size that keeps the
     # launch grid small for the typical quantization buffer sizes.
