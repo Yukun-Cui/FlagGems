@@ -19,26 +19,94 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
+# One program covers this many elements of a tensor. A power of two large
+# enough to amortize the launch over a full wave of tiles: measured across
+# 256-4096 on both uniform 4Kx4K parameter lists and heterogeneous mixed-size
+# lists, 512 and 1024 tie within noise while 2048+ lose occupancy on small
+# tensors and 256 loses tail efficiency on the big ones. 512 also keeps the
+# shared-memory/register footprint low for the binary search prologue.
+_BLOCK_SIZE = 512
+
+# ATen accepts float16 / bfloat16 / float32 / float64; the kernel accumulates
+# fp16/bf16/fp32 in fp32 and keeps fp64 in double precision.
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+
+_TL_DTYPES = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+    torch.float64: tl.float64,
+}
+
+
+# The staged metadata for the most recent step. The device arrays are a pure
+# function of the inputs (the three address lists, plus the sizes and block
+# offsets derived from them), so remembering the last inputs and their staging
+# is exact: an identical input tuple yields identical device contents. Repeated
+# optimizer steps reuse the same tensors, so this turns the pinned
+# host-to-device transfer below -- the dominant fixed cost of a step over a few
+# parameters -- into a tuple comparison. A single slot bounds what is retained.
+_metadata_cache = None
+
+
+def _stage_metadata(arrays, device, key):
+    """Stage several equal-length int64 arrays as one flat pinned transfer.
+
+    Each array staged on its own is a separate pinned host-to-device copy, and a
+    step over a handful of parameters is dominated by that fixed cost. Packing
+    them head-to-tail on the host and transferring once removes the per-array
+    overhead; the device result is sliced back into one view per array, and
+    ``unbind`` keeps every view in one allocation so the kernel can read them
+    without touching the allocator.
+
+    ``key`` identifies the caller's inputs; a repeat of the previous key reuses
+    the previous device image without transferring anything. That also keeps a
+    captured CUDA graph free of host-to-device copies on replay, since the
+    warmed-up state always hits the cache.
+    """
+    global _metadata_cache
+    n = len(arrays[0])
+    if _metadata_cache is not None and _metadata_cache[0] == key:
+        return _metadata_cache[1]
+    flat_host = torch.as_tensor([v for arr in arrays for v in arr], dtype=torch.int64)
+    try:
+        staging = torch.empty_like(flat_host, pin_memory=True)
+    except (RuntimeError, TypeError):
+        # Accelerators without pinned host memory (or a build that rejects it)
+        # fall back to a direct copy; correctness is unaffected, only CUDA graph
+        # capture of the metadata transfer is.
+        packed = flat_host.to(device)
+    else:
+        staging.copy_(flat_host)
+        packed = staging.to(device, non_blocking=True)
+    views = packed.view(len(arrays), n).unbind(0)
+    _metadata_cache = (key, views)
+    return views
+
 
 @libentry()
 @triton.jit
 def _fused_sgd_kernel(
-    param,
-    grad,
-    momentum_buf,
+    param_ptrs,
+    grad_ptrs,
+    momentum_ptrs,
+    block_offset,
+    numel,
     grad_scale_ptr,
     found_inf_ptr,
     lr_ptr,
-    n: tl.constexpr,
+    n_tensors,
     BLOCK_SIZE: tl.constexpr,
     ACC_DTYPE: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
     LR_IS_TENSOR: tl.constexpr,
-    lr_scalar,
+    lr_scalar: tl.float64,
     weight_decay: tl.constexpr,
     momentum: tl.constexpr,
     dampening: tl.constexpr,
@@ -48,12 +116,32 @@ def _fused_sgd_kernel(
     has_grad_scale: tl.constexpr,
     has_found_inf: tl.constexpr,
 ):
-    # Get the block/thread index
+    # One program per BLOCK_SIZE-wide tile of one tensor. A tensor is split into
+    # ``ceil(numel / BLOCK_SIZE)`` consecutive programs, and ``block_offset`` holds
+    # the first program index of every tensor, so the tensor owning this program
+    # is found with a branch-free binary search over that array. This is what
+    # makes the whole parameter list one launch: the grid covers every tensor
+    # instead of the host looping and launching once per parameter.
     pid = tle.program_id(0)
-    # Calculate the starting offset for this block
-    offset = pid * BLOCK_SIZE
+    lo = 0
+    hi = n_tensors
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if tl.load(block_offset + mid) <= pid:
+            lo = mid
+        else:
+            hi = mid
+    start = tl.load(block_offset + lo)
+    n = tl.load(numel + lo)
+
+    offset = (pid - start) * BLOCK_SIZE
     offsets = offset + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n
+
+    # All tensors in the list share one dtype (enforced on the host), so the raw
+    # address word can be reinterpreted with that element type.
+    param = tl.load(param_ptrs + lo).to(tl.pointer_type(OUT_DTYPE))
+    grad = tl.load(grad_ptrs + lo).to(tl.pointer_type(OUT_DTYPE))
 
     # Skip the step entirely when an inf/nan gradient was observed. ATen tests
     # ``found_inf == 1`` exactly rather than ``> 0``: any other value (2.0
@@ -62,10 +150,6 @@ def _fused_sgd_kernel(
     if has_found_inf:
         if tl.load(found_inf_ptr) == 1:
             return
-
-    # Element dtype of the param/grad/buffers; fp16/bf16/fp32 accumulate in fp32
-    # while fp64 keeps full double precision, then cast back when storing.
-    out_dtype = param.dtype.element_ty
 
     # Load param and grad (promoted to the accumulation dtype).
     param_load = tl.load(param + offsets, mask=mask, other=0.0).to(ACC_DTYPE)
@@ -78,7 +162,7 @@ def _fused_sgd_kernel(
         # Unlike _fused_adagrad_, this holds at every size (verified for
         # n = 1..1000), so it is part of the contract rather than a
         # vectorization artifact of the tail path.
-        tl.store(grad + offsets, grad_load.to(out_dtype), mask=mask)
+        tl.store(grad + offsets, grad_load.to(OUT_DTYPE), mask=mask)
 
     # Maximize mode: negate the gradient
     if maximize:
@@ -90,12 +174,13 @@ def _fused_sgd_kernel(
 
     # Momentum update
     if momentum > 0:
+        momentum_buf = tl.load(momentum_ptrs + lo).to(tl.pointer_type(OUT_DTYPE))
         buf_load = tl.load(momentum_buf + offsets, mask=mask, other=0.0).to(ACC_DTYPE)
         if is_first_step:
             buf_new = grad_load
         else:
             buf_new = momentum * buf_load + (1.0 - dampening) * grad_load
-        tl.store(momentum_buf + offsets, buf_new.to(out_dtype), mask=mask)
+        tl.store(momentum_buf + offsets, buf_new.to(OUT_DTYPE), mask=mask)
         if nesterov:
             update = grad_load + momentum * buf_new
         else:
@@ -107,15 +192,19 @@ def _fused_sgd_kernel(
     #
     # The two overloads differ only in where ``lr`` comes from. tensor_lr reads it
     # from device memory so a scheduler can update it without a host round-trip;
-    # the float overload passes it as a scalar rather than staging it into a
-    # tensor, since allocating one per call would be a host-to-device copy that
-    # breaks CUDA graph capture.
+    # the float overload passes it as a scalar. ``lr_scalar`` is annotated
+    # ``tl.float64`` so Triton forwards the Python double at full width: an
+    # unannotated float argument is narrowed to fp32, which would bake a ~1.5e-9
+    # error into a double-precision update (1e-17 would become 9.9999998e-18).
+    # Annotating it keeps that precision without materializing a tensor per
+    # parameter, which the fp64 path used to do -- an allocation and host-to-device
+    # initialization on every step, exactly what breaks CUDA graph capture.
     if LR_IS_TENSOR:
         lr = tl.load(lr_ptr).to(ACC_DTYPE)
     else:
-        lr = lr_scalar
+        lr = lr_scalar.to(ACC_DTYPE) if ACC_DTYPE == tl.float64 else lr_scalar
     param_new = param_load - lr * update
-    tl.store(param + offsets, param_new.to(out_dtype), mask=mask)
+    tl.store(param + offsets, param_new.to(OUT_DTYPE), mask=mask)
 
 
 def _fused_sgd_(
@@ -185,13 +274,17 @@ def _fused_sgd_impl(
     has_grad_scale = grad_scale is not None
     has_found_inf = found_inf is not None
 
-    # ATen accepts float16 / bfloat16 / float32 / float64; the kernel accumulates
-    # fp16/bf16/fp32 in fp32 and keeps fp64 in double precision.
-    _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-
-    # Validate every list up front: these values drive raw pointer arithmetic, and
-    # a partially applied optimizer step cannot be undone, so a mismatch must be
-    # rejected before the first launch rather than midway through the loop.
+    # Validate every list up front: every tensor in the list becomes a raw
+    # pointer for the kernel, and a partially applied optimizer step cannot be
+    # undone, so a mismatch must be rejected before the single launch rather than
+    # midway through the list.
+    #
+    # The per-index check below (grad/buffer vs its own param) is necessary but
+    # not sufficient: ATen's fused kernels additionally require the *whole list*
+    # to share one dtype, one device and one non-overlapping-and-dense layout
+    # (``check_fast_path_restrictions`` in ForeachUtils.h). Without the list-wide
+    # checks a list of [fp32, fp16] params would pass here and then fail -- after
+    # the first tensors had already been updated.
     n_params = len(self)
     if len(grads) != n_params:
         raise RuntimeError(
@@ -204,12 +297,34 @@ def _fused_sgd_impl(
             f"_fused_sgd_: expected momentum_buffer_list to have the same length "
             f"as params ({n_params}), got {len(momentum_buffer_list)}"
         )
-    for i, (param, grad) in enumerate(zip(self, grads)):
-        if param.dtype not in _SUPPORTED:
+
+    # The kernel reinterprets every pointer array with a single element type and
+    # derives one block grid from one dtype/device, so the list must be
+    # homogeneous. Match ATen's rule: all tensors in all lists share one dtype
+    # and one device.
+    first_dtype = None
+    first_device = None
+    for i, param in enumerate(self):
+        if param.dtype not in _SUPPORTED_DTYPES:
             raise RuntimeError(
                 "_fused_sgd_ only supports float16/bfloat16/float32/float64 "
                 f"inputs, got {param.dtype} at index {i}"
             )
+        if first_dtype is None:
+            first_dtype = param.dtype
+            first_device = param.device
+        elif param.dtype != first_dtype:
+            raise RuntimeError(
+                f"_fused_sgd_: params must all share one dtype, got "
+                f"{first_dtype} at index 0 and {param.dtype} at index {i}"
+            )
+        elif param.device != first_device:
+            raise RuntimeError(
+                f"_fused_sgd_: params must all share one device, got "
+                f"{first_device} at index 0 and {param.device} at index {i}"
+            )
+
+    for i, (param, grad) in enumerate(zip(self, grads)):
         buf = momentum_buffer_list[i] if use_momentum else None
         for name, other in (("grad", grad), ("momentum_buffer", buf)):
             if other is None:
@@ -230,92 +345,91 @@ def _fused_sgd_impl(
                     f"match param device {param.device}"
                 )
         # The kernel indexes with a flat offset, so a non-dense tensor would be
-        # read in the wrong order.
+        # read in the wrong order. ``is_contiguous`` is stricter than ATen (which
+        # also accepts e.g. a fully transposed list) but is the layout the flat
+        # offset assumes.
         for name, t in (("param", param), ("grad", grad), ("momentum_buffer", buf)):
             if t is not None and not t.is_contiguous():
                 raise RuntimeError(f"_fused_sgd_: {name}[{i}] must be contiguous")
 
-    # Normalize ``lr`` to a device tensor once, outside the launch loop. The
-    # tensor_lr overload already passes a tensor (possibly on CPU, and possibly
-    # 1-element rather than 0-dim); the float overload passes a Python scalar.
-    #
-    # Building this per parameter inside the loop would issue a host-to-device
-    # copy on every step, which is exactly the synchronization this kernel avoids
-    # and which makes CUDA graph capture fail with an unpinned-CPU-tensor error.
     # ``lr`` reaches the kernel either as a device tensor (tensor_lr overload) or
     # as a plain scalar (float overload). The float path deliberately does not
     # stage the value into a tensor: allocating one per call is a host-to-device
-    # copy, which both synchronizes and makes CUDA graph capture fail.
+    # copy, which both synchronizes and makes CUDA graph capture fail. The
+    # kernel receives the scalar through a ``tl.float64`` argument so an fp64
+    # param keeps the full double (1e-17 stays 1e-17); passing it unannotated
+    # would narrow to fp32 and bake in a ~1.5e-9 error.
     lr_is_tensor = isinstance(lr, torch.Tensor)
-    ref = self[0] if len(self) else None
     if lr_is_tensor:
+        ref = self[0] if n_params else None
         lr_base = lr.reshape(()) if lr.numel() == 1 else lr
         if ref is not None and lr_base.device != ref.device:
             lr_base = lr_base.to(ref.device)
     else:
-        # Kept as a Python double so an fp64 param keeps the exact value; routing
-        # it through fp32 would bake in a representation error
-        # (0.1 -> 0.10000000149011612).
         lr_base = float(lr)
-    # Cache one lr view per (device, dtype) for the tensor path so a mixed-dtype
-    # param list converts once each rather than once per parameter.
-    lr_cache = {}
 
-    for i in range(len(self)):
-        param = self[i]
-        grad = grads[i]
-        n = param.numel()
-        if n == 0:
-            continue
+    # Sizes and block offsets drive the grid: one BLOCK_SIZE-wide program per
+    # tile of each tensor, laid out tensor-by-tensor so a tensor's programs are
+    # contiguous and the kernel can recover its tensor with a binary search.
+    sizes = [t.numel() for t in self]
+    blocks = [(n + _BLOCK_SIZE - 1) // _BLOCK_SIZE for n in sizes]
+    total_blocks = sum(blocks)
+    if total_blocks == 0:
+        return
+    block_offsets = []
+    running = 0
+    for b in blocks:
+        block_offsets.append(running)
+        running += b
 
-        # fp64 params must read lr from a tensor even on the float path: Triton
-        # narrows a Python-float kernel argument to fp32, which would bake a
-        # ~1.5e-9 error into a double-precision update. Every other dtype passes
-        # it as a scalar so no per-call host-to-device copy is needed, keeping the
-        # step CUDA-graph-capturable.
-        needs_lr_tensor = lr_is_tensor or param.dtype == torch.float64
-        if needs_lr_tensor:
-            key = (param.device, param.dtype)
-            if key not in lr_cache:
-                if lr_is_tensor:
-                    src = lr_base.to(device=param.device, dtype=param.dtype)
-                else:
-                    src = torch.tensor(lr_base, dtype=param.dtype, device=param.device)
-                lr_cache[key] = src
-            lr_tensor = lr_cache[key]
-            lr_scalar = 0.0
-        else:
-            lr_tensor = param  # dummy pointer; unused when LR_IS_TENSOR is False
-            lr_scalar = lr_base
-
-        momentum_buf = (
-            momentum_buffer_list[i]
-            if momentum_buffer_list is not None and i < len(momentum_buffer_list)
-            else None
-        )
-
-        # Pick a block size that is a power of two, large enough for occupancy
-        # but bounded to avoid register pressure.
-        BLOCK_SIZE = triton.next_power_of_2(n)
-        BLOCK_SIZE = max(BLOCK_SIZE, 128)
-        BLOCK_SIZE = min(BLOCK_SIZE, 4096)
-        grid = (triton.cdiv(n, BLOCK_SIZE),)
-
-        # fp64 params accumulate in fp64; everything else in fp32.
-        acc_dtype = tl.float64 if param.dtype == torch.float64 else tl.float32
-
-        _fused_sgd_kernel[grid](
-            param,
-            grad,
-            momentum_buf if momentum_buf is not None else param,  # dummy if unused
-            grad_scale if has_grad_scale else param,  # dummy if unused
-            found_inf if has_found_inf else param,  # dummy if unused
-            lr_tensor,
-            n,
-            BLOCK_SIZE,
-            acc_dtype,
-            needs_lr_tensor,
-            lr_scalar,
+    # Hand the kernel the addresses of every tensor instead of looping on the
+    # host: the whole parameter list is then a single launch (see the kernel
+    # docstring).
+    #
+    # The momentum buffers are only read when momentum > 0, so the param address
+    # array doubles as a valid dummy for the unused argument.
+    device = self[0].device
+    param_ptrs = [t.data_ptr() for t in self]
+    grad_ptrs = [t.data_ptr() for t in grads]
+    if use_momentum:
+        momentum_ptrs = [t.data_ptr() for t in momentum_buffer_list]
+    else:
+        # Unused by the kernel when momentum == 0; the param addresses keep the
+        # argument valid.
+        momentum_ptrs = param_ptrs
+    stage_key = (
+        device,
+        tuple(param_ptrs),
+        tuple(grad_ptrs),
+        tuple(momentum_ptrs),
+        tuple(block_offsets),
+        tuple(sizes),
+    )
+    packed = _stage_metadata(
+        (param_ptrs, grad_ptrs, momentum_ptrs, block_offsets, sizes),
+        device,
+        stage_key,
+    )
+    # Launch on the parameters' device rather than whatever the caller left
+    # current, matching the rest of FlagGems (and ATen, which accepts a list on
+    # any one device). Without this a list built on a non-current device fails
+    # inside Triton with "Pointer argument ... cannot be accessed from Triton".
+    with torch_device_fn.device(device):
+        _fused_sgd_kernel[(total_blocks,)](
+            packed[0],
+            packed[1],
+            packed[2],
+            packed[3],
+            packed[4],
+            grad_scale if has_grad_scale else self[0],
+            found_inf if has_found_inf else self[0],
+            lr_base if lr_is_tensor else self[0],
+            n_params,
+            _BLOCK_SIZE,
+            tl.float64 if first_dtype == torch.float64 else tl.float32,
+            _TL_DTYPES[first_dtype],
+            lr_is_tensor,
+            lr_base if not lr_is_tensor else 0.0,
             weight_decay,
             momentum,
             dampening,

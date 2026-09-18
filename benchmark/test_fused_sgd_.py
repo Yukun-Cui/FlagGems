@@ -141,3 +141,81 @@ def test_fused_sgd__tensor_lr():
     )
     bench.shapes = list(SGD_SHAPES)
     bench.run()
+
+
+# A realistic optimizer step sees a *heterogeneous* parameter list -- every
+# weight in a model at its own size, not NUM_PARAMS copies of one shape. The
+# shapes below are one small transformer block's parameter set (embedding table,
+# attention projections at mixed widths, MLP layers and biases), which is
+# exactly the workload where per-parameter launches differ most from a single
+# batched launch: 10 launches vs 1 per step.
+HETEROGENEOUS_PARAMS = [
+    (512, 512),  # embedding table
+    (2048, 512),  # attn qkv weight
+    (2048,),  # attn qkv bias
+    (512, 2048),  # attn proj weight
+    (512,),  # attn proj bias
+    (4096, 512),  # mlp up weight
+    (512, 4096),  # mlp down weight
+    (512,),  # mlp bias
+    (1000,),  # 1-D head
+    (7, 7, 7),  # small odd tail
+]
+
+# How many times the parameter set above is repeated, one entry per case. These
+# are the values each case's shape tuple is built from; a real model has
+# hundreds of parameters, so the larger cases are the representative ones.
+HETERO_REPEATS = [10, 60, 120]
+
+
+class FusedSgdHeteroBenchmark(FusedSgdBenchmark):
+    """FusedSgdBenchmark whose cases are heterogeneous parameter lists.
+
+    The harness iterates over ``self.shapes`` and passes each entry to the input
+    function; here each entry is ``(repeats,)``, so ``set_shapes`` has to
+    override the base's uniform-shape list rather than the input function
+    reinterpreting one of those uniforms.
+    """
+
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = [(n,) for n in HETERO_REPEATS]
+
+
+def _hetero_input_fn(shape, dtype, device):
+    """Build a mixed-size parameter list repeated ``shape[0]`` times."""
+    repeats = shape[0]
+    shapes = [
+        HETEROGENEOUS_PARAMS[i % len(HETEROGENEOUS_PARAMS)] for i in range(repeats)
+    ]
+    params = [torch.randn(s, dtype=dtype, device=device) for s in shapes]
+    grads = [torch.randn_like(p) for p in params]
+    momentum_bufs = [torch.randn_like(p) for p in params]
+    kwargs = dict(
+        weight_decay=0.01,
+        momentum=0.9,
+        lr=0.1,
+        dampening=0.0,
+        nesterov=False,
+        maximize=False,
+        is_first_step=False,
+    )
+    yield params, grads, momentum_bufs, kwargs
+
+
+@pytest.mark.fused_sgd_
+def test_fused_sgd__heterogeneous():
+    """Batched kernel vs native on realistic mixed-size parameter lists.
+
+    The uniform-shape cases in ``test_fused_sgd_`` cannot show the batching win:
+    every parameter has the same size there, so a per-parameter launch and one
+    batched launch issue the same total work. This benchmark uses the mixed
+    sizes and the parameter counts a real optimizer step has.
+    """
+    bench = FusedSgdHeteroBenchmark(
+        input_fn=_hetero_input_fn,
+        op_name="fused_sgd__heterogeneous",
+        torch_op=_torch_op,
+        gems_op=_gems_op,
+        dtypes=consts.FLOAT_DTYPES,
+    )
+    bench.run()
