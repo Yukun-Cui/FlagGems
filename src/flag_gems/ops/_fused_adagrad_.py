@@ -25,23 +25,37 @@ from flag_gems.utils import triton_lang_extension as tle
 logger = logging.getLogger(__name__)
 
 
-def _has_internal_overlap(t):
-    """True when two distinct elements of ``t`` share one memory location.
+def _is_non_overlapping_and_dense(t):
+    """True when every element of ``t`` names exactly one storage slot.
 
-    Mirrors ``at::has_internal_overlap`` for the dense case: a tensor is free of
-    internal overlap when its shape/stride pair is non-overlapping and dense
-    (every element has its own address). Size-1 dimensions are ignored, since
-    their stride is irrelevant to which address an element names.
+    Mirrors ``at::is_non_overlapping_and_dense``: two distinct elements never
+    share a memory location (no internal overlap) and the tensor covers its
+    storage without gaps (dense). Size-1 dimensions are ignored, since their
+    stride is irrelevant to which address an element names. A stride-2 slice,
+    for example, is overlap-free but not dense, and ATen's fused-optimizer
+    fast path rejects it for exactly that reason.
     """
     if t.numel() <= 1:
-        return False
+        return True
     sizes_strides = sorted((s, sz) for sz, s in zip(t.shape, t.stride()) if sz != 1)
     expected = 1
     for stride, size in sizes_strides:
         if stride != expected:
-            return True
+            return False
         expected *= size
-    return False
+    return True
+
+
+def _strides_match(a, b):
+    """ATen's ``_check_tensors_share_sizes_and_strides``: strides of ``a`` and
+    ``b`` agree on every dimension whose size is not 1 (a size-1 dimension's
+    stride is irrelevant to which element an index names)."""
+    if a.shape != b.shape:
+        return False
+    for size, sa, sb in zip(a.shape, a.stride(), b.stride()):
+        if size != 1 and sa != sb:
+            return False
+    return True
 
 
 def _storage_view(t):
@@ -191,51 +205,95 @@ def _fused_adagrad_run(
                 f"params ({n_params}), got {len(seq)}"
             )
 
-    # ATen accepts float16 / bfloat16 / float32 / float64 parameters; the kernel
-    # accumulates in float32 and stores back to the original dtype.
-    _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-    for i, (param, grad, state_sum) in enumerate(zip(params, grads, state_sums)):
-        if param.dtype not in _SUPPORTED:
+    # Mirror ATen's fast-path restriction check
+    # (``check_fast_path_restrictions`` in ForeachUtils.h), which the native CUDA
+    # kernel runs before its first launch: params[0] fixes the expected dtype and
+    # device, and every tensor in params/grads/state_sums must match that
+    # dtype/device, be strided, and be non-overlapping and dense; corresponding
+    # entries must additionally share sizes and strides. This makes the check
+    # *global*: a params list mixing fp32 and fp64 (each entry internally
+    # consistent) is rejected exactly as ATen rejects it. All of it happens
+    # before any kernel launch, so a rejected batch leaves every buffer
+    # untouched -- no partial update.
+    if n_params > 0:
+        expected_device = params[0].device
+        expected_dtype = params[0].dtype
+        _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        if expected_dtype not in _SUPPORTED:
             raise RuntimeError(
                 "_fused_adagrad_ only supports float16/bfloat16/float32/float64 "
-                f"inputs, got {param.dtype} at index {i}"
+                f"inputs, got {expected_dtype} at index 0"
             )
-        # The kernel walks each tensor in storage order (see `_storage_view`),
-        # which is correct for any layout that is non-overlapping and dense --
-        # the same condition ATen's native CUDA kernel relies on. A layout with
-        # internal overlap (an expanded or otherwise aliasing view) has no
-        # well-defined element order, so it is rejected instead.
-        for name, tensor in (
-            ("param", param),
-            ("grad", grad),
-            ("state_sum", state_sum),
-        ):
-            if _has_internal_overlap(tensor):
-                raise RuntimeError(
-                    f"_fused_adagrad_: {name}[{i}] has internal overlap, which "
-                    "has no well-defined element order"
-                )
-        for name, other in (("grad", grad), ("state_sum", state_sum)):
-            if other.shape != param.shape:
-                raise RuntimeError(
-                    f"_fused_adagrad_: {name}[{i}] shape {tuple(other.shape)} does "
-                    f"not match param shape {tuple(param.shape)}"
-                )
-            if other.dtype != param.dtype:
-                raise RuntimeError(
-                    f"_fused_adagrad_: {name}[{i}] dtype {other.dtype} does not "
-                    f"match param dtype {param.dtype}"
-                )
-            if other.device != param.device:
-                raise RuntimeError(
-                    f"_fused_adagrad_: {name}[{i}] device {other.device} does not "
-                    f"match param device {param.device}"
-                )
-            if other.stride() != param.stride():
-                raise RuntimeError(
-                    f"_fused_adagrad_: {name}[{i}] stride {other.stride()} does "
-                    f"not match param stride {param.stride()}"
-                )
+        for i in range(n_params):
+            param, grad, state_sum = params[i], grads[i], state_sums[i]
+            for name, tensor in (
+                ("param", param),
+                ("grad", grad),
+                ("state_sum", state_sum),
+            ):
+                if tensor.dtype != expected_dtype:
+                    raise RuntimeError(
+                        "params, grads, and state_sums must have same dtype, "
+                        f"device, and layout: {name}[{i}] dtype {tensor.dtype} "
+                        f"differs from params[0] dtype {expected_dtype}"
+                    )
+                if tensor.device != expected_device:
+                    raise RuntimeError(
+                        "params, grads, and state_sums must have same dtype, "
+                        f"device, and layout: {name}[{i}] device {tensor.device} "
+                        f"differs from params[0] device {expected_device}"
+                    )
+                if tensor.layout != torch.strided:
+                    raise RuntimeError(
+                        f"{name}[{i}] must be a strided tensor, got layout "
+                        f"{tensor.layout}"
+                    )
+                if not _is_non_overlapping_and_dense(tensor):
+                    raise RuntimeError(
+                        f"_fused_adagrad_: {name}[{i}] is not "
+                        "non-overlapping-and-dense (internal overlap or gappy "
+                        "strides), so it has no well-defined element order"
+                    )
+            for name, other in (("grad", grad), ("state_sum", state_sum)):
+                if other.shape != param.shape:
+                    raise RuntimeError(
+                        f"_fused_adagrad_: {name}[{i}] shape {tuple(other.shape)} "
+                        f"does not match param shape {tuple(param.shape)}"
+                    )
+                if not _strides_match(param, other):
+                    raise RuntimeError(
+                        f"_fused_adagrad_: {name}[{i}] strides {other.stride()} "
+                        f"do not match param strides {param.stride()}"
+                    )
+
+    # ``state_steps``: ATen passes each step tensor's raw data pointer to the
+    # kernel, which blindly reinterprets it as ``float``. That makes float32 the
+    # only honest contract; other dtypes happen to work in ATen only when their
+    # bit pattern reinterprets to the right value (int64 1 reads as a denormal ~0
+    # and still "works" for step==1, but int32 3 gives corrected_lr ~= lr instead
+    # of lr/3). We read the step in its true dtype, so any dtype whose values are
+    # integral would work here -- but to keep this operator's contract aligned
+    # with the optimizer API (``torch.optim.Adagrad(fused=True)`` stores
+    # ``state["step"]`` as a float32 scalar tensor) we accept only float32 and
+    # reject everything else up front, before the first launch.
+    for i, state_step in enumerate(state_steps):
+        if state_step.dtype != torch.float32:
+            raise RuntimeError(
+                "state_steps must contain float32 scalar tensors (one element "
+                f"holding the optimizer step), got dtype {state_step.dtype} at "
+                f"index {i}"
+            )
+        if state_step.numel() != 1:
+            raise RuntimeError(
+                "state_steps must contain 1-element tensors, got numel "
+                f"{state_step.numel()} at index {i}"
+            )
+        if state_step.device != params[0].device:
+            raise RuntimeError(
+                "Expected all tensors to be on the same device, but got "
+                f"state_steps is on {state_step.device}, different from other "
+                f"tensors on {params[0].device}"
+            )
 
     # ``found_inf`` is read on-device inside the kernel; deliberately no
     # ``.item()`` here, which would synchronize on every AMP step and break
