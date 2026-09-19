@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import pytest
+import zlib
+
 import torch
 
 import flag_gems
@@ -77,12 +79,19 @@ def _make_inputs(shape, device, zero_point=None):
     returned on CPU; callers move the CUDA arguments to device.
     """
     batch, input_size, hidden_size = shape
-    input = torch.randn(batch, input_size, dtype=torch.float32)
-    hx = torch.randn(batch, hidden_size, dtype=torch.float32)
-    w_ih_fp = torch.randn(hidden_size, input_size, dtype=torch.float32) * 0.5
-    w_hh_fp = torch.randn(hidden_size, hidden_size, dtype=torch.float32) * 0.5
-    b_ih = torch.randn(hidden_size, dtype=torch.float32) * 0.2
-    b_hh = torch.randn(hidden_size, dtype=torch.float32) * 0.2
+    # Draw from a local generator seeded off the case, not the global RNG: the
+    # global stream depends on how many tests ran (and in what order) before
+    # this one, so a failure on CI could not be reproduced locally even with
+    # torch.manual_seed() in the test body.
+    gen = torch.Generator().manual_seed(
+        abs(zlib.crc32(repr((shape, str(zero_point))).encode())) % (2**31)
+    )
+    input = torch.randn(batch, input_size, dtype=torch.float32, generator=gen)
+    hx = torch.randn(batch, hidden_size, dtype=torch.float32, generator=gen)
+    w_ih_fp = torch.randn(hidden_size, input_size, dtype=torch.float32, generator=gen) * 0.5
+    w_hh_fp = torch.randn(hidden_size, hidden_size, dtype=torch.float32, generator=gen) * 0.5
+    b_ih = torch.randn(hidden_size, dtype=torch.float32, generator=gen) * 0.2
+    b_hh = torch.randn(hidden_size, dtype=torch.float32, generator=gen) * 0.2
     if zero_point is None:
         w_ih_int8, col_ih, scale_ih, zp_ih = _quantize_weight(w_ih_fp)
         w_hh_int8, col_hh, scale_hh, zp_hh = _quantize_weight(w_hh_fp)
@@ -189,7 +198,6 @@ def test_quantized_rnn_relu_cell_aten_parity(shape, dtype):
     failure cannot be reproduced locally (CI reported a 1.851 gap -- ~66
     quantization bins, a real divergence -- that no local run reproduced).
     """
-    torch.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     args = _make_inputs(shape, flag_gems.device, zero_point=None)
     (
