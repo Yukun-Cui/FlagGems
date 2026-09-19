@@ -135,35 +135,13 @@ def _to_device(args, device):
 # raise "expected scalar type Float but found Half/BFloat16"), so the FlagGems
 # kernel matches ATen by accepting float32 only.
 RNN_CELL_DTYPES = [torch.float32]
-# Cross-build tolerance, sized from measurement rather than guessed.
-#
-# Against a local torch wheel this comparison is bit-exact (worst gap 0.0233
-# over 200 random inputs, under one quantization bin). CI's custom
-# /opt/pytorch build diverges instead: observed gaps were 0.439, 1.851 and
-# 2.130 on the same deterministic inputs, i.e. thousands of integer units
-# after dequantization (a_scale * w_scale ~ 8e-5), which is a different
-# activation quantization result rather than floating-point noise.
-#
-# The mechanism is visible in ATen's source: quantized_rnn_relu_cell routes
-# through fbgemm_linear_int8_weight_fp32_activation, which derives the
-# activation scale/zero-point from a whole-tensor FindMinMax and then calls
-# ChooseQuantizationParams. Reimplementing that documented path reproduces
-# *this kernel's* output bit-for-bit on CI's own reported inputs, so the
-# divergence is on the reference side of CI's build, not a kernel error.
-#
-# A perturbation study bounds what a bin-level difference in those activation
-# parameters can produce: 0.079 at K=8 growing to 0.356 at K=128, so the
-# largest shapes (which CI's fail-fast run never reached) carry the biggest
-# budget. 2.5 covers the observed maximum with headroom.
-#
-# Consequence, stated plainly: at this width the three parity tests no longer
-# detect small arithmetic errors -- they catch gross breakage only. What still
-# pins the kernel down independently of the tolerance is:
-#   * test_..._validation  -- malformed inputs must raise
-#   * test_..._all_negative -- an all-negative pre-activation must yield exact
-#     zeros (asserted with gems_assert_equal, not this tolerance)
-#   * a local run against an official torch wheel, which matches bit-for-bit.
-_ATOL = {torch.float32: 2.5}
+# The kernel reproduces ATen's integer path, so a local wheel matches
+# bit-exactly; across 200 random inputs the worst local gap is 0.0233, under
+# one quantization bin (scale ~0.025). The tolerance stays tight on purpose:
+# CI has reported gaps up to 1.851 -- ~66 bins -- which is a real arithmetic
+# divergence, not cross-build rounding, and must not be hidden behind a loose
+# budget.
+_ATOL = {torch.float32: 1e-4}
 
 pytestmark = pytest.mark.quantized_rnn_relu_cell
 
@@ -366,9 +344,9 @@ def test_quantized_rnn_relu_cell_large_aten_parity(shape, dtype):
 
     res = _run_cell(args, flag_gems.device).cpu()
 
-    # _ATOL already carries the cross-build budget for the largest shapes, so
-    # this path (large reductions) uses it directly rather than doubling it.
-    utils.gems_assert_close(res, ref.to(dtype), dtype, atol=_ATOL[dtype])
+    # Allow slightly looser tolerance for large reductions.
+    atol = _ATOL[dtype] * 2  # keep the same relative headroom
+    utils.gems_assert_close(res, ref.to(dtype), dtype, atol=atol)
 
 
 @pytest.mark.skipif(
