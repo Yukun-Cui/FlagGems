@@ -256,6 +256,70 @@ def test_quantized_max_pool1d_out_resizes_and_adopts_quant_params(in_dtype):
     assert torch.equal(got.int_repr().to("cpu"), ref_out.int_repr())
 
 
+# ``out is input`` is a legal call (aten tolerates an aliasing out). The pool
+# changes the input's shape, so this exercises the ordering inside the .out
+# path: if the input's integer representation is captured after ``out`` has
+# been resized, the kernel pools the resized tensor instead of the original.
+#
+# The failure is silent rather than loud, and shows up differently depending on
+# which way the resize goes. Shrinking (8 -> 4) leaves the first half intact and
+# pads the tail with the previous buffer contents, so the trailing outputs come
+# back wrong; growing (8 -> 9) makes ``_resize_out`` reallocate the storage, so
+# the input bytes are gone entirely and every output reads back zero.
+#
+# The reviewer asked specifically for L=8, kernel_size=2, stride=2 (shrink), so
+# that case leads; the 3D and growing variants guard the other two directions.
+@pytest.mark.quantized_max_pool1d_out
+@pytest.mark.parametrize("in_dtype", QUANT_DTYPES)
+@pytest.mark.parametrize(
+    "shape, kernel_size, stride, padding, dilation",
+    [
+        ((1, 8), 2, 2, 0, 1),  # the reviewer's case: 8 -> 4, shrinks
+        ((2, 3, 8), 2, 2, 0, 1),  # 3D shrink
+        ((1, 8), 2, 1, 1, 1),  # 8 -> 9, grows and reallocates
+    ],
+)
+def test_quantized_max_pool1d_out_is_input(
+    in_dtype, shape, kernel_size, stride, padding, dilation
+):
+    """``out=input`` must pool the *original* input, not the resized one."""
+    # Deterministic data derived from the case, not from a global RNG, so the
+    # values a failure prints are reproducible.
+    seed = sum(shape) * 1000 + kernel_size * 100 + stride * 10 + padding
+    gen = torch.Generator().manual_seed(seed)
+    fp = torch.randint(0, 100, shape, generator=gen).to(torch.float32)
+    ref_inp = torch.quantize_per_tensor(fp, 1.0, 0, in_dtype)
+    res_inp = ref_inp.to(flag_gems.device)
+
+    ref_out = torch.quantized_max_pool1d(
+        ref_inp,
+        kernel_size,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+    )
+    # Guard the test itself: the resize must actually change the shape, or the
+    # ordering this covers would never be exercised.
+    assert tuple(ref_out.shape) != tuple(ref_inp.shape)
+
+    got = flag_gems.quantized_max_pool1d_out(
+        res_inp,
+        kernel_size,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        out=res_inp,
+    )
+
+    # The result is written through the tensor that was passed in.
+    assert got.data_ptr() == res_inp.data_ptr()
+    assert tuple(got.shape) == tuple(ref_out.shape)
+    assert got.q_scale() == ref_out.q_scale()
+    assert got.q_zero_point() == ref_out.q_zero_point()
+    # Integer equality: a truncated or zeroed input cannot pass this.
+    assert torch.equal(got.int_repr().to("cpu"), ref_out.int_repr())
+
+
 @pytest.mark.quantized_max_pool1d_out
 def test_quantized_max_pool1d_out_rejects_mismatched_out():
     res_inp = _make_quantized((2, 3, 16), 0.1, 0, torch.quint8, flag_gems.device)
