@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import flag_gems
 from flag_gems.ops.quantize_per_tensor import _quantize_per_tensor_impl
@@ -236,3 +239,267 @@ def test_quantize_per_tensor_contiguous_unchanged(shape):
     res_int_repr = flag_gems.quantize_per_tensor(inp, 0.1, 0, torch.qint8).int_repr()
     assert res_int_repr.is_contiguous()
     utils.gems_assert_equal(res_int_repr, utils.to_reference(ref_int_repr))
+
+
+def _cuda_input(shape, dtype=torch.float32):
+    """Deterministic CUDA input, independent of the global RNG.
+
+    A local generator with a fixed seed keeps the tests reproducible regardless
+    of execution order (``torch.manual_seed`` would still leave an implicit
+    dependence on how many draws happened earlier), and no value derived from
+    ``hash()`` is used, since Python randomises that per process.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(20250918)
+    return torch.randn(shape, dtype=dtype, device="cuda", generator=gen) * 3.0
+
+
+def _qbuf(shape, scale=0.5, zero_point=100, dtype=torch.quint8, **kwargs):
+    return torch._empty_affine_quantized(
+        shape, scale=scale, zero_point=zero_point, dtype=dtype, device="cuda", **kwargs
+    )
+
+
+def _sentinel_buffer(shape, dtype=torch.quint8, value=100, ref=(0.5, 100)):
+    """A quantized buffer filled with a known integer, for neighbour checks."""
+    buf = _qbuf(shape, scale=ref[0], zero_point=ref[1], dtype=dtype)
+    storage_dtype = {
+        torch.quint8: torch.uint8,
+        torch.qint8: torch.int8,
+        torch.qint32: torch.int32,
+    }[dtype]
+    buf.copy_(
+        torch._make_per_tensor_quantized_tensor(
+            torch.full(shape, value, dtype=storage_dtype, device="cuda"),
+            scale=ref[0],
+            zero_point=ref[1],
+        )
+    )
+    return buf
+
+
+def _native_out(inp, scale, zero_point, dtype, out):
+    """Reference call, returning None when this build's native op rejects it."""
+    try:
+        return torch.ops.aten.quantize_per_tensor.out(
+            utils.to_reference(inp), scale, zero_point, dtype, out=out
+        )
+    except (RuntimeError, NotImplementedError):
+        return None
+
+
+@pytest.mark.quantize_per_tensor_out
+@pytest.mark.parametrize(
+    "layout",
+    ["contiguous", "strided", "transposed", "offset", "narrowed", "channels_last"],
+)
+@pytest.mark.parametrize("in_dtype", QUANT_DTYPES)
+def test_quantize_per_tensor_out_matches_native_layout(in_dtype, layout):
+    """``out`` is written through its own strides, matching the native op.
+
+    The kernel stores into ``out``'s storage directly, so a non-contiguous
+    ``out`` must receive exactly the values ``out.copy_(result)`` would have
+    placed: same integers, same resulting strides, and the surrounding elements
+    of the buffer left alone. The native op is the reference for all three.
+    """
+    inp = _cuda_input((64, 64))
+    ref_scale, ref_zp = 0.5, 100
+
+    def make_out():
+        if layout == "contiguous":
+            return _qbuf((64, 64), ref_scale, ref_zp, in_dtype)
+        if layout == "strided":
+            return _sentinel_buffer((64, 128), in_dtype, ref=(ref_scale, ref_zp))[
+                :, ::2
+            ]
+        if layout == "transposed":
+            return _qbuf((64, 64), ref_scale, ref_zp, in_dtype).t()
+        if layout == "offset":
+            return _sentinel_buffer((2, 64, 64), in_dtype, ref=(ref_scale, ref_zp))[1]
+        if layout == "narrowed":
+            return _sentinel_buffer((64, 128), in_dtype, ref=(ref_scale, ref_zp))[
+                :, 32:96
+            ]
+        return _qbuf(
+            (2, 3, 4, 5), ref_scale, ref_zp, in_dtype, memory_format=torch.channels_last
+        )
+
+    ref_out = make_out()
+    res_out = make_out()
+    if layout == "channels_last":
+        a4 = _cuda_input((2, 3, 4, 5))
+        ref_r = _native_out(a4, 0.1, 7, in_dtype, ref_out)
+        if ref_r is None:
+            pytest.skip("native op does not support this case in this build")
+        res_r = flag_gems.quantize_per_tensor_out(a4, 0.1, 7, in_dtype, out=res_out)
+    else:
+        ref_r = _native_out(inp, 0.1, 7, in_dtype, ref_out)
+        if ref_r is None:
+            pytest.skip("native op does not support this case in this build")
+        res_r = flag_gems.quantize_per_tensor_out(inp, 0.1, 7, in_dtype, out=res_out)
+
+    assert res_r is res_out
+    utils.gems_assert_equal(res_r.int_repr(), utils.to_reference(ref_r.int_repr()))
+    assert tuple(res_r.stride()) == tuple(ref_r.stride())
+    assert res_r.q_scale() == ref_r.q_scale()
+    assert res_r.q_zero_point() == ref_r.q_zero_point()
+
+
+@pytest.mark.quantize_per_tensor_out
+def test_quantize_per_tensor_out_preserves_offset_and_strides():
+    """A strided or offset ``out`` is filled without touching its neighbours.
+
+    ``out`` is a view into a larger sentinel-filled buffer. The operator must
+    write exactly that view: the interleaved/allocation-adjacent elements that
+    are not part of ``out`` keep their sentinel, and the *base* tensor's
+    quantizer stays as it was (only the view's quantizer may move).
+    """
+    inp = _cuda_input((64, 64))
+
+    # Strided view: every other column of a wider buffer.
+    buf = _sentinel_buffer((64, 128))
+    view = buf[:, ::2]
+    res_r = flag_gems.quantize_per_tensor_out(inp, 0.1, 7, torch.quint8, out=view)
+    assert res_r is view
+    assert bool((buf[:, 1::2].int_repr() == 100).all().item())
+    assert buf.q_scale() == 0.5 and buf.q_zero_point() == 100
+    ref = torch.quantize_per_tensor(utils.to_reference(inp), 0.1, 7, torch.quint8)
+    utils.gems_assert_equal(res_r.int_repr(), utils.to_reference(ref.int_repr()))
+    assert res_r.q_scale() == 0.1 and res_r.q_zero_point() == 7
+
+    # Offset view: the second slice of a batched buffer.
+    big = _sentinel_buffer((2, 64, 64))
+    offset_view = big[1]
+    assert offset_view.storage_offset() != 0
+    res_r2 = flag_gems.quantize_per_tensor_out(
+        inp, 0.1, 7, torch.quint8, out=offset_view
+    )
+    assert res_r2 is offset_view
+    assert bool((big[0].int_repr() == 100).all().item())
+    utils.gems_assert_equal(res_r2.int_repr(), utils.to_reference(ref.int_repr()))
+
+
+@pytest.mark.quantize_per_tensor_out
+@pytest.mark.parametrize("in_dtype", QUANT_DTYPES)
+def test_quantize_per_tensor_out_mismatched_qparams(in_dtype):
+    """A per-tensor ``out`` carrying different qparams adopts the requested ones.
+
+    ``out.copy_`` is what moves the quantizer in ATen; the operator must
+    reproduce that observable result (same object, requested scale /
+    zero_point) without the extra native O(n) pass over the values.
+    """
+    zero_point = 0 if in_dtype is not torch.quint8 else 10
+    inp = _cuda_input((16, 32))
+    ref = torch.quantize_per_tensor(utils.to_reference(inp), 0.25, zero_point, in_dtype)
+
+    out = _qbuf((16, 32), 9.0, 1, in_dtype)
+    ref_out = _qbuf((16, 32), 9.0, 1, in_dtype)
+    ref_r = _native_out(inp, 0.25, zero_point, in_dtype, ref_out)
+    if ref_r is None:
+        pytest.skip("native op does not support this case in this build")
+    res_r = flag_gems.quantize_per_tensor_out(inp, 0.25, zero_point, in_dtype, out=out)
+
+    assert res_r is out
+    assert res_r.q_scale() == ref_r.q_scale() == 0.25
+    assert res_r.q_zero_point() == ref_r.q_zero_point() == zero_point
+    utils.gems_assert_equal(res_r.int_repr(), utils.to_reference(ref.int_repr()))
+
+
+@pytest.mark.quantize_per_tensor_out
+def test_quantize_per_tensor_out_rejects_per_channel_out():
+    """A per-channel ``out`` raises ATen's "same qscheme" message.
+
+    The kernel stores integers and has no way to install a per-tensor quantizer
+    over a per-channel tensor, so the rejection that native ``copy_`` supplied
+    is raised directly.
+    """
+    inp = _cuda_input((8, 8))
+    per_channel = torch.quantize_per_channel(
+        torch.randn(8, 8, device="cuda"),
+        torch.rand(8, device="cuda") + 0.1,
+        torch.zeros(8, dtype=torch.long, device="cuda"),
+        0,
+        torch.quint8,
+    )
+    with pytest.raises(RuntimeError, match="same qscheme"):
+        flag_gems.quantize_per_tensor_out(inp, 0.1, 7, torch.quint8, out=per_channel)
+
+
+@pytest.mark.quantize_per_tensor_out
+def test_quantize_per_tensor_out_aliasing_input():
+    """An ``out`` that shares storage with the float input still matches native.
+
+    ``out`` is a quantized alias of the input's storage, so the kernel cannot
+    read and write it at once; the integers are moved device-side afterwards.
+    """
+    inp = _cuda_input((64,))
+    ref_out = _qbuf((64,))
+    ref_r = _native_out(inp, 0.1, 7, torch.quint8, ref_out)
+    if ref_r is None:
+        pytest.skip("native op does not support this case in this build")
+
+    res_out = torch._empty_affine_quantized(
+        0, scale=0.5, zero_point=100, dtype=torch.quint8, device="cuda"
+    )
+    res_out.set_(inp.untyped_storage(), 0, (64,), (1,))
+    res_r = flag_gems.quantize_per_tensor_out(inp, 0.1, 7, torch.quint8, out=res_out)
+
+    assert res_r is res_out
+    utils.gems_assert_equal(res_r.int_repr(), utils.to_reference(ref_r.int_repr()))
+    assert res_r.q_scale() == 0.1 and res_r.q_zero_point() == 7
+
+
+@pytest.mark.quantize_per_tensor_out
+def test_quantize_per_tensor_out_uses_triton_not_native_copy(monkeypatch):
+    """Guard: the ``out=`` path launches the Triton kernel and no native copy_.
+
+    The reviewed concern was that ``out.copy_(result)`` redispatches a
+    quantized tensor to ATen, leaving a native O(n) pass after the Triton
+    kernel. This counts the Triton launches and asserts no ``aten::copy_`` is
+    dispatched, so the guard fails if a ``copy_`` is reintroduced.
+    """
+    gems_impl = importlib.import_module("flag_gems.ops.quantize_per_tensor")
+
+    calls = []
+
+    def _counting(name, original):
+        # A separate class per kernel: ``original`` must be bound now, not read
+        # from the loop variable later (closures capture by reference).
+        class _Counting:
+            def __getitem__(self, grid):
+                calls.append(name)
+                return original[grid]
+
+        return _Counting()
+
+    for name in ("quantize_per_tensor_kernel", "quantize_per_tensor_strided_kernel"):
+        monkeypatch.setattr(gems_impl, name, _counting(name, getattr(gems_impl, name)))
+
+    dispatched = []
+
+    class _Recorder(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            dispatched.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    inp = _cuda_input((32, 32))
+    out = _qbuf((32, 32), 9.0, 1)
+    with _Recorder():
+        flag_gems.quantize_per_tensor_out(inp, 0.1, 7, torch.quint8, out=out)
+
+    assert calls, "quantize_per_tensor_out did not launch a Triton kernel"
+    native_copies = [op for op in dispatched if "copy_" in op]
+    assert not native_copies, f"native copy_ still dispatched: {native_copies}"
+
+
+@pytest.mark.quantize_per_tensor_out
+def test_quantize_per_tensor_out_rejects_internally_overlapping_out():
+    """A stride-0 (broadcast) ``out`` raises native's overlap message.
+
+    Such an ``out`` has no single value to hold, so writing it would leave
+    whichever element was written last; the native op rejects it in the copy it
+    would otherwise perform.
+    """
+    inp = _cuda_input((4, 8))
+    out = _qbuf((4, 8))[0:1].expand(4, 8)
+    with pytest.raises(RuntimeError, match="more than one element"):
+        flag_gems.quantize_per_tensor_out(inp, 0.1, 7, torch.quint8, out=out)
