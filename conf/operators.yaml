@@ -11994,7 +11994,7 @@ ops:
   kind:
   - NeuralNetwork
   stages:
-  - alpha: '5.4'
+  - alpha: '5.5'
 - id: quantized_rnn_relu_cell
   description: Triton kernel implementation for quantized_rnn_relu_cell.
   for:
