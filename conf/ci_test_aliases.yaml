@@ -30,7 +30,6 @@ alias_copy_out: test_alias_copy
 as_strided_copy_out: test_as_strided_copy
 baddbmm_out: test_baddbmm
 nanmedian_out: test_nanmedian
-quantize_per_channel_out: test_quantize_per_channel
 scaled_mm_out: test_scaled_mm
 searchsorted_out: test_searchsorted
 searchsorted_scalar_out: test_searchsorted
