@@ -415,20 +415,33 @@ def quantized_max_pool1d_out(
     scale = float(input.q_scale())
     zero_point = int(input.q_zero_point())
 
+    # Snapshot the input's integer representation *before* anything touches
+    # ``out``. When ``out is input`` (a legal call that aten tolerates) the
+    # pool changes the input's shape, and ``_resize_out`` rewrites the size and
+    # strides in place -- reallocating the storage outright when the result is
+    # larger. Reading ``int_repr()`` afterwards would then pool the resized
+    # tensor: truncated (and stale at the tail) when it shrinks, all zeros when
+    # it grows. ``int_repr()`` returns a fresh contiguous copy, so this snapshot
+    # is unaffected by the resize and by the kernel's own output, which may
+    # alias the input.
+    int_repr = input.int_repr().contiguous()
+
     _resize_out(out, out_shape)
     _sync_out_quantizer(out, scale, zero_point)
 
     if out.numel() == 0:
         return out
 
-    int_repr = input.int_repr().contiguous()
     # A view over out's own storage, honouring its strides and storage offset,
     # so writing the result cannot clobber the neighbours of a strided out.
     out_int_view = _int_view_of(out)
 
     if _may_overlap(input, out):
-        # aten tolerates an out that aliases the input; a kernel writing and
-        # reading the same bytes concurrently would not, so stage the result.
+        # aten tolerates an out that aliases the input. The snapshot above
+        # already makes the read and the write independent -- the kernel reads
+        # the copy, never ``out``'s bytes -- so this staging is belt-and-braces
+        # rather than load bearing. It is kept so that the aliasing case is
+        # handled explicitly instead of by relying on that indirect property.
         staged = torch.empty(
             out_shape, dtype=out_int_view.dtype, device=out_int_view.device
         )
