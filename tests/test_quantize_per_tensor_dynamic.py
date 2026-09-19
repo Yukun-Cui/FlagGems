@@ -187,15 +187,20 @@ def test_quantize_per_tensor_dynamic_small_scale(values, dtype, reduce_range):
 def test_quantize_per_tensor_dynamic_non_finite(dtype, reduce_range):
     # -inf as the minimum (or all -inf) keeps the range finite on the upper side
     # and must reproduce ATen's scale=inf / clamped zero_point and bins.
+    #
+    # The reference must stay on the *same device* as the result for these
+    # inputs: ATen's CPU and CUDA kernels disagree on how -inf clamps when
+    # scale is inf (measured: CPU maps it to 127, CUDA to -128, a 255-bin
+    # gap), and the GEMS kernel implements the CUDA side. Comparing against a
+    # --ref=cpu reference here would assert the CPU behaviour instead.
     for values in (
         [float("-inf"), 1.0],
         [-1.0, float("-inf")],
         [float("-inf")] * 4,
     ):
         res_inp = torch.tensor(values, dtype=torch.float32, device=flag_gems.device)
-        ref_inp = utils.to_reference(res_inp)
 
-        ref_out = _torch_ref(ref_inp, dtype, reduce_range)
+        ref_out = _torch_ref(res_inp, dtype, reduce_range)
         res_out = quantize_per_tensor_dynamic(res_inp, dtype, reduce_range)
 
         _assert_quantized_equal(res_out, ref_out)
