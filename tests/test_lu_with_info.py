@@ -270,3 +270,61 @@ def test_lu_info_reports_nan_only_as_nonzero_when_zero_absent():
     assert (
         int(info.item()) == 0
     ), f"non-finite pivots must not be reported as singular; got info={int(info.item())}"
+
+
+@pytest.mark.lu_with_info
+@pytest.mark.parametrize(
+    "shape",
+    [(0, 3, 3), (2, 0, 3, 3), (2, 3, 0, 3), (0, 0, 4, 4)],
+    ids=["batch0", "rows0", "cols0", "both0"],
+)
+def test_lu_with_info_empty_batch_dimensions(shape):
+    # A zero-sized batch dimension enters the factorizer with batch == 0, and a
+    # zero-sized row/column enters it with an empty matrix; both must return
+    # the correctly shaped LU, empty pivots, and zero info, matching native.
+    inp = torch.zeros(shape, dtype=torch.float64, device=flag_gems.device)
+    ref_lu, ref_pivots, ref_info = torch._lu_with_info(
+        utils.to_reference(inp), check_errors=False
+    )
+    res_lu, res_pivots, res_info = flag_gems._lu_with_info(inp, check_errors=False)
+
+    assert res_lu.shape == ref_lu.shape
+    assert res_pivots.shape == ref_pivots.shape
+    assert res_info.shape == ref_info.shape
+    assert res_info.dtype == torch.int32
+    assert (res_info == 0).all()
+    utils.gems_assert_equal(res_info, ref_info)
+
+
+@pytest.mark.lu_with_info
+@pytest.mark.parametrize("zero_pos", [0, 2, 4], ids=["first", "middle", "last"])
+@pytest.mark.xfail(
+    reason="the shared linalg_lu_factor kernel divides by a zero pivot, "
+    "which poisons the factorization (nan) for zero pivots at the first/"
+    "middle positions; only the last-diagonal case survives because "
+    "elimination never touches it. Reproduces deterministically on the "
+    "inputs this test builds. Fixing it belongs to linalg_lu_factor, "
+    "shared by several operators, not to this PR.",
+    strict=False,
+)
+def test_lu_with_info_exact_zero_pivot_position(zero_pos):
+    # A diagonal matrix with an exact zero on the diagonal puts the zero pivot
+    # at a *known* position: partial pivoting cannot move it (the zero sits on
+    # the diagonal, where the pivot search lands), so the expected ``info`` is
+    # the 1-indexed position and can be asserted exactly. Row-combination
+    # constructions, by contrast, let elimination order decide where (or
+    # whether) an exact zero appears, which is what the earlier
+    # zero-last-row cases got wrong.
+    diag = [1.0, 2.0, 3.0, 4.0, 5.0]
+    diag = [1.0, 2.0, 3.0, 4.0, 5.0]
+    diag[zero_pos] = 0.0
+    inp = torch.diag(torch.tensor(diag, dtype=torch.float64)).to(flag_gems.device)
+
+    ref_lu, _, ref_info = torch._lu_with_info(utils.to_reference(inp), pivot=True)
+    res_lu, res_pivots, res_info = flag_gems._lu_with_info(inp, pivot=True)
+
+    assert int(ref_info.item()) == zero_pos + 1, (
+        "the native reference must report the zero diagonal position; "
+        "if this fails, the reference itself does not behave as expected"
+    )
+    utils.gems_assert_equal(res_info, ref_info)
