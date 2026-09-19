@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import pytest
+import zlib
+
 import torch
 
 import flag_gems
@@ -55,8 +57,12 @@ def _quantize_weight(w, zero_point):
 def _make_inputs(shape, dtype, device, zero_points):
     """Build one (input, hx, weights, biases, quantization metadata) case."""
     batch, input_size, hidden_size = shape
+    # Deterministic per-case seed. ``hash()`` is not usable here: Python
+    # randomizes str hashing per process (PYTHONHASHSEED), so seeding from it
+    # made the inputs differ on every run and a CI failure unreproducible.
+    # Derive the seed from the case instead.
     gen = torch.Generator().manual_seed(
-        hash((shape, str(dtype), zero_points)) % (2**31)
+        abs(zlib.crc32(repr((shape, str(dtype), zero_points)).encode())) % (2**31)
     )
     input = torch.randn(batch, input_size, dtype=torch.float32, generator=gen).to(
         device=device, dtype=dtype
