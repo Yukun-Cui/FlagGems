@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import zlib
 
+import pytest
 import torch
 
 import flag_gems
@@ -88,8 +88,12 @@ def _make_inputs(shape, device, zero_point=None):
     )
     input = torch.randn(batch, input_size, dtype=torch.float32, generator=gen)
     hx = torch.randn(batch, hidden_size, dtype=torch.float32, generator=gen)
-    w_ih_fp = torch.randn(hidden_size, input_size, dtype=torch.float32, generator=gen) * 0.5
-    w_hh_fp = torch.randn(hidden_size, hidden_size, dtype=torch.float32, generator=gen) * 0.5
+    w_ih_fp = (
+        torch.randn(hidden_size, input_size, dtype=torch.float32, generator=gen) * 0.5
+    )
+    w_hh_fp = (
+        torch.randn(hidden_size, hidden_size, dtype=torch.float32, generator=gen) * 0.5
+    )
     b_ih = torch.randn(hidden_size, dtype=torch.float32, generator=gen) * 0.2
     b_hh = torch.randn(hidden_size, dtype=torch.float32, generator=gen) * 0.2
     if zero_point is None:
