@@ -122,13 +122,13 @@ def _to_device(args, device):
 # raise "expected scalar type Float but found Half/BFloat16"), so the FlagGems
 # kernel matches ATen by accepting float32 only.
 RNN_CELL_DTYPES = [torch.float32]
-# The reference is ATen's FBGEMM CPU kernel. Locally the kernel matches it
-# bit-exactly for every shape, but CI's custom torch build rounds the FBGEMM
-# quantization differently: measured on CI, one parity case showed 2-of-8
-# elements differing with a max gap of 0.867 (multi-bin, not fp32 noise).
-# 1.0 absorbs that cross-build variance; do not tighten without re-measuring
-# on CI.
-_ATOL = {torch.float32: 1.0}
+# The kernel reproduces ATen's integer path, so a local wheel matches
+# bit-exactly; across 200 random inputs the worst local gap is 0.0233, under
+# one quantization bin (scale ~0.025). The tolerance stays tight on purpose:
+# CI has reported gaps up to 1.851 -- ~66 bins -- which is a real arithmetic
+# divergence, not cross-build rounding, and must not be hidden behind a loose
+# budget.
+_ATOL = {torch.float32: 1e-4}
 
 pytestmark = pytest.mark.quantized_rnn_relu_cell
 
@@ -184,7 +184,12 @@ def test_quantized_rnn_relu_cell_aten_parity(shape, dtype):
     so the comparison exercises the full native quantization/correction path
     (dynamic per-tensor quint8 activation quantization + integer GEMM
     correction), not a mirrored kernel formula.
+
+    Seeded: without a fixed seed the inputs differ on every run, so a CI
+    failure cannot be reproduced locally (CI reported a 1.851 gap -- ~66
+    quantization bins, a real divergence -- that no local run reproduced).
     """
+    torch.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     args = _make_inputs(shape, flag_gems.device, zero_point=None)
     (
