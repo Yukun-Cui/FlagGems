@@ -63,16 +63,20 @@ def _make_csc_with_nnz(nrows, ncols, nnz, dtype, device):
     return torch.sparse_csc_tensor(ccol_t, row_t, values_t, size=(nrows, ncols))
 
 
-class RowIndicesBenchmark(base.GenericBenchmark):
+class RowIndicesBenchmark(base.Benchmark):
     """Benchmark ``row_indices`` on CSC tensors of varying size."""
 
-    def set_more_shapes(self):
-        return []
+    DEFAULT_METRICS = consts.DEFAULT_METRICS[:]
 
-    def get_input_iter(self, dtype):
-        for shape in _ROW_INDICES_SHAPES:
+    def set_shapes(self, shape_file_path=None):
+        # CSC requires 2-D matrices, so the operator-specific shape list
+        # replaces the stock DEFAULT_SHAPES (which contain 1-D/3-D tuples).
+        self.shapes = list(_ROW_INDICES_SHAPES)
+
+    def get_input_iter(self, cur_dtype):
+        for shape in self.shapes:
             nnz = _NNZ_TARGETS[shape]
-            inp = _make_csc_with_nnz(shape[0], shape[1], nnz, dtype, self.device)
+            inp = _make_csc_with_nnz(shape[0], shape[1], nnz, cur_dtype, self.device)
             yield (inp,)
 
 
@@ -80,11 +84,7 @@ class RowIndicesBenchmark(base.GenericBenchmark):
 def test_row_indices():
     bench = RowIndicesBenchmark(
         op_name="row_indices",
-        input_fn=None,
         torch_op=torch.ops.aten.row_indices,
         dtypes=consts.FLOAT_DTYPES,
     )
-    # CSC requires 2D matrices; the stock DEFAULT_SHAPES contain 1D/3D tuples
-    # that are meaningless here, so use the operator-specific shape list.
-    bench.shapes = [tuple(s) for s in _ROW_INDICES_SHAPES]
     bench.run()
