@@ -86,11 +86,13 @@ def _lu_with_info_impl(input, pivot=True, check_errors=True):
     m, n = input.shape[-2], input.shape[-1]
     batch_shape = input.shape[:-2]
     k = min(m, n)
-    if m == 0 or n == 0:
-        # Degenerate matrices have no pivots to scan, so there is nothing for the
-        # factorization or the info kernel to do: LU keeps the input shape, pivots
-        # are empty along the k axis, and info is 0 (success) for every batch
-        # element. This matches ``torch._lu_with_info`` on empty inputs.
+    if input.numel() == 0:
+        # Any zero dimension -- an empty matrix like (0, 3), a zero-sized row or
+        # column like (3, 0), or a zero-sized batch dimension like (0, 3, 3) /
+        # (2, 0, 3, 3) -- gives an empty factorization: LU keeps the input
+        # shape, pivots are empty along the k axis, and info is 0 (success) for
+        # every batch element. This matches ``torch._lu_with_info`` on empty
+        # inputs, including the batch==0 forms that never reach the factorizer.
         lu = input.clone()
         pivots = torch.empty(batch_shape + (k,), device=input.device, dtype=torch.int32)
         info = torch.zeros(batch_shape, device=input.device, dtype=torch.int32)
