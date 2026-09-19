@@ -59,7 +59,11 @@ def _assert_quantized_equal(res, ref):
     assert (
         res.q_zero_point() == ref.q_zero_point()
     ), f"zero_point mismatch: {res.q_zero_point()} vs {ref.q_zero_point()}"
-    diff = (res.int_repr().int() - ref.int_repr().int()).abs()
+    # Compare on one device: under --ref=cpu the reference is materialized on
+    # the host while the result stays on the device.
+    ref_int = ref.int_repr()
+    res_int = res.int_repr()
+    diff = (res_int.int() - ref_int.int().to(res_int.device)).abs()
     max_diff = int(diff.max()) if diff.numel() else 0
     assert max_diff <= 1, (
         "int_repr differs by more than one quantization bin "
