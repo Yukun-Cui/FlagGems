@@ -205,7 +205,11 @@ def test__logcumsumexp_fp64_precision(shape, dim):
     assert res_out.dtype == torch.float64
     utils.gems_assert_close(res_out, ref_out, dtype, reduce_dim=1)
     # RESOLUTION[float64] is 1e-7; a fp32 accumulation loses ~1e-6 and fails.
-    max_err = (res_out.double() - ref_out.double()).abs().max().item()
+    # Both sides are normalized to the reference device first: under --ref=cpu
+    # the reference lives on the host while the result stays on the device.
+    max_err = (
+        (res_out.double() - ref_out.double().to(res_out.device)).abs().max().item()
+    )
     assert max_err < 1e-9, f"fp32 accumulation leaked into fp64 path: {max_err}"
 
 
@@ -249,14 +253,18 @@ def test__logcumsumexp_complex_special_values(data):
     tolerance.
     """
     inp = torch.tensor(data, dtype=torch.complex64, device=flag_gems.device)
+    ref_inp = utils.to_reference(inp)
 
-    ref_out = torch.ops.aten._logcumsumexp(inp, 0)
+    ref_out = torch.ops.aten._logcumsumexp(ref_inp, 0)
     res_out = flag_gems._logcumsumexp(inp, 0)
 
     utils.gems_assert_close(res_out, ref_out, torch.complex64, equal_nan=True)
-    assert torch.isnan(res_out).equal(torch.isnan(ref_out))
-    assert torch.isinf(res_out.real).equal(torch.isinf(ref_out.real))
-    assert torch.isinf(res_out.imag).equal(torch.isinf(ref_out.imag))
+    # Compare the branch structure on one device: under --ref=cpu the reference
+    # is materialized on the host, and Tensor.equal requires matching devices.
+    ref_on_dev = ref_out.to(res_out.device)
+    assert torch.isnan(res_out).equal(torch.isnan(ref_on_dev))
+    assert torch.isinf(res_out.real).equal(torch.isinf(ref_on_dev.real))
+    assert torch.isinf(res_out.imag).equal(torch.isinf(ref_on_dev.imag))
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +382,11 @@ def test__logcumsumexp_out_rejects_mismatched_dtype():
     inp = torch.randn(3, 4, device=flag_gems.device)
     out = torch.empty(3, 4, dtype=torch.float64, device=flag_gems.device)
 
+    # The reference must stay on the input's device: ATen's CUDA kernel rejects
+    # a mismatched dtype, while the CPU kernel silently accepts it (measured),
+    # so normalizing the reference to CPU would assert the wrong contract.
     with pytest.raises(RuntimeError):
-        torch.ops.aten._logcumsumexp.out(utils.to_reference(inp), 1, out=out.cpu())
+        torch.ops.aten._logcumsumexp.out(inp, 1, out=out)
     with pytest.raises(RuntimeError):
         flag_gems._logcumsumexp_out(inp, 1, out=out)
 
