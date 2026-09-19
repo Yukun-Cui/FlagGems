@@ -242,7 +242,24 @@ def test_quantized_rnn_relu_cell_aten_parity(shape, dtype):
 
     assert res.shape == ref.shape
     assert res.dtype == ref.dtype
-    utils.gems_assert_close(res, ref.to(dtype), dtype, atol=_ATOL[dtype])
+    try:
+        utils.gems_assert_close(res, ref.to(dtype), dtype, atol=_ATOL[dtype])
+    except AssertionError as exc:
+        # Cross-build debugging aid: this comparison is bit-exact against a
+        # local torch wheel, but CI's custom build has produced a multi-bin
+        # gap here that no local run reproduces. Emit the operands and
+        # quantization metadata so a CI failure identifies which step diverges
+        # instead of only reporting a max difference.
+        raise AssertionError(
+            f"{exc}\n"
+            f"  shape={shape} dtype={dtype}\n"
+            f"  scale_ih={float(scale_ih)!r} scale_hh={float(scale_hh)!r}\n"
+            f"  zp_ih={int(zp_ih)} zp_hh={int(zp_hh)}\n"
+            f"  input={input.reshape(-1).tolist()}\n"
+            f"  hx={hx.reshape(-1).tolist()}\n"
+            f"  gems={res.reshape(-1).tolist()}\n"
+            f"  aten={ref.reshape(-1).tolist()}"
+        ) from exc
 
 
 @pytest.mark.skipif(
@@ -294,7 +311,24 @@ def test_quantized_rnn_relu_cell_nonzero_zero_point_aten_parity(shape, dtype):
 
     assert res.shape == ref.shape
     assert res.dtype == ref.dtype
-    utils.gems_assert_close(res, ref.to(dtype), dtype, atol=_ATOL[dtype])
+    try:
+        utils.gems_assert_close(res, ref.to(dtype), dtype, atol=_ATOL[dtype])
+    except AssertionError as exc:
+        # Cross-build debugging aid: this comparison is bit-exact against a
+        # local torch wheel, but CI's custom build has produced a multi-bin
+        # gap here that no local run reproduces. Emit the operands and
+        # quantization metadata so a CI failure identifies which step diverges
+        # instead of only reporting a max difference.
+        raise AssertionError(
+            f"{exc}\n"
+            f"  shape={shape} dtype={dtype}\n"
+            f"  scale_ih={float(scale_ih)!r} scale_hh={float(scale_hh)!r}\n"
+            f"  zp_ih={int(zp_ih)} zp_hh={int(zp_hh)}\n"
+            f"  input={input.reshape(-1).tolist()}\n"
+            f"  hx={hx.reshape(-1).tolist()}\n"
+            f"  gems={res.reshape(-1).tolist()}\n"
+            f"  aten={ref.reshape(-1).tolist()}"
+        ) from exc
 
 
 @pytest.mark.skipif(
