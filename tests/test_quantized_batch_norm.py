@@ -498,7 +498,13 @@ def test_quantized_batch_norm_out_storage_offset(in_dtype):
     outside_after = torch.cat(
         [res_full[0].int_repr().reshape(-1), res_full[3].int_repr().reshape(-1)]
     )
-    utils.gems_assert_equal(outside_after, outside_before)
+    # Both sides are device tensors produced by this test (no CPU reference is
+    # involved), so compare them directly: utils.gems_assert_equal routes
+    # through to_cpu(), which under --ref=cpu asserts that the *reference*
+    # lives on the host and would fail here for the wrong reason.
+    torch.testing.assert_close(
+        outside_after, outside_before, atol=0, rtol=0
+    )
 
 
 @pytest.mark.quantized_batch_norm_out
