@@ -594,11 +594,12 @@ def test_quantize_per_channel_rejects_out_of_range_zero_point(qtype, zp, dtype):
     context, so the call runs in a subprocess and only its failure is asserted.
     """
     code = _DEVICE_TRAP_CASE.format(zp=zp, dtype=dtype, qtype=qtype)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
     proc = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
-        env=dict(os.environ),
+        env=env,
         timeout=600,
     )
     assert (
@@ -630,11 +631,12 @@ def test_quantize_per_channel_accepts_valid_zero_points_in_subprocess():
         torch.cuda.synchronize()
         print("no error")
         """)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
     proc = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
-        env=dict(os.environ),
+        env=env,
         timeout=600,
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
