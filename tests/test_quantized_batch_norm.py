@@ -502,9 +502,7 @@ def test_quantized_batch_norm_out_storage_offset(in_dtype):
     # involved), so compare them directly: utils.gems_assert_equal routes
     # through to_cpu(), which under --ref=cpu asserts that the *reference*
     # lives on the host and would fail here for the wrong reason.
-    torch.testing.assert_close(
-        outside_after, outside_before, atol=0, rtol=0
-    )
+    torch.testing.assert_close(outside_after, outside_before, atol=0, rtol=0)
 
 
 @pytest.mark.quantized_batch_norm_out
