@@ -42,6 +42,26 @@ _SCALAR_TYPE_NAMES = {
     torch.complex128: "ComplexDouble",
 }
 
+# ATen's ``TypeName`` spelling, which is what the ``out=`` dtype check prints
+# ("Expected out tensor to have dtype float, but got double instead"). It is a
+# different table from ``ScalarType``'s ("Float"/"Double"), and the two really
+# do appear in different messages, so both are needed to match native exactly.
+_TYPE_NAME_NAMES = {
+    torch.float16: "c10::Half",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.bfloat16: "c10::BFloat16",
+    torch.int8: "signed char",
+    torch.int16: "short",
+    torch.int32: "int",
+    torch.int64: "long int",
+    torch.uint8: "unsigned char",
+    torch.bool: "bool",
+    torch.complex32: "c10::complex<c10::Half>",
+    torch.complex64: "c10::complex<float>",
+    torch.complex128: "c10::complex<double>",
+}
+
 # `tl.atomic_add` has no lowering for sub-32-bit types, so the accumulate path for
 # these dtypes runs the atomics on an int32 staging buffer and narrows the result
 # afterwards. ATen accumulates in the tensor's own dtype and lets it wrap
@@ -53,6 +73,10 @@ _NARROW_ACC_DTYPES = (torch.int8, torch.uint8, torch.int16, torch.bool)
 
 def _scalar_type_name(dtype):
     return _SCALAR_TYPE_NAMES.get(dtype, str(dtype))
+
+
+def _type_name(dtype):
+    return _TYPE_NAME_NAMES.get(dtype, str(dtype))
 
 
 @triton.jit
@@ -341,10 +365,14 @@ def _put_scatter(out, index, source, accumulate):
     return out
 
 
-def put_impl(out, index, source, accumulate):
-    # Mirror the input validation torch performs on `put`/`put_`/`put.out` so the
-    # GEMS path raises the same errors (and the same exception types) instead of
-    # silently casting or racing on bad inputs.
+def _validate_put_args(out, index, source):
+    """Mirror the input validation torch performs on ``put``/``put_``/``put.out``.
+
+    Kept separate from :func:`put_impl` so the ``out=`` overload can run it
+    *before* it copies ``self`` into ``out``: native leaves ``out`` untouched
+    when the arguments are rejected, and copying first would clobber a
+    caller-provided buffer on the error path.
+    """
     if index.dtype != torch.int64:
         raise RuntimeError(
             "put_(): Expected a long tensor for index, but got "
@@ -361,6 +389,13 @@ def put_impl(out, index, source, accumulate):
             "put_(): Expected source and index to have the same number of elements, "
             f"but got source.numel() = {source.numel()}, index.numel() = {index.numel()}"
         )
+
+
+def put_impl(out, index, source, accumulate):
+    # Validated up front so the GEMS path raises the same errors (and the same
+    # exception types) as native instead of silently casting or racing on bad
+    # inputs.
+    _validate_put_args(out, index, source)
 
     # `index` and `source` are read in row-major flatten order, so flatten them to
     # 1-D contiguous buffers (copying only when they are not already) and the
@@ -410,10 +445,17 @@ def put_out(self, index, source, accumulate=False, *, out=None):
         return put(self, index, source, accumulate)
 
     _check_same_device(self, index, source, out)
+
+    # Every validation runs before ``out`` is touched (native leaves a
+    # caller-provided buffer untouched on the error path). ATen's ordering is
+    # index dtype first, then the out dtype, then the source/numel checks;
+    # with several arguments wrong at once, native reports the first one in
+    # that sequence, so the order is observable and matched here.
+    _validate_put_args(self, index, source)
     if out.dtype != self.dtype:
         raise RuntimeError(
-            f"Expected out tensor to have dtype {_scalar_type_name(self.dtype)}, "
-            f"but got {_scalar_type_name(out.dtype)} instead"
+            f"Expected out tensor to have dtype {_type_name(self.dtype)}, "
+            f"but got {_type_name(out.dtype)} instead"
         )
 
     assert (

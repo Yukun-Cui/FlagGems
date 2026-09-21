@@ -554,6 +554,53 @@ def test_put_out_invalid():
         flag_gems.put_out(inp, index, source, False, out=torch.empty(16))
 
 
+@pytest.mark.put_out
+@pytest.mark.parametrize(
+    "bad_arg",
+    ["index_dtype", "source_dtype", "numel", "out_dtype"],
+)
+def test_put_out_error_leaves_out_untouched(bad_arg):
+    """A rejected call must not write anything into ``out``.
+
+    Native validates before it materializes anything, so a caller-provided
+    buffer keeps its data on the error path. The ``out=`` overload used to
+    copy ``self`` into ``out`` first, clobbering it before the dtype/numel
+    validation ran.
+    """
+    shape = (3, 4)
+    inp = gen_input(shape, torch.float32, flag_gems.device)
+    index = torch.tensor([0, 1], dtype=torch.int64, device=flag_gems.device)
+    source = gen_source(2, torch.float32, flag_gems.device)
+    out_dtype = torch.float32
+
+    if bad_arg == "index_dtype":
+        index = index.to(torch.int32)
+    elif bad_arg == "source_dtype":
+        source = source.to(torch.float64)
+    elif bad_arg == "numel":
+        source = source[:1]
+    else:
+        out_dtype = torch.float64
+
+    sentinel = 99.0
+    ref_out = torch.full(shape, sentinel, dtype=out_dtype, device=flag_gems.device)
+    ref_exc = None
+    try:
+        torch.ops.aten.put.out(inp, index, source, False, out=ref_out)
+    except (RuntimeError, IndexError) as e:
+        ref_exc = e
+
+    res_out = torch.full(shape, sentinel, dtype=out_dtype, device=flag_gems.device)
+    with pytest.raises(type(ref_exc)) as exc_info:
+        flag_gems.put_out(inp, index, source, False, out=res_out)
+
+    assert str(exc_info.value) == str(ref_exc)
+    assert torch.equal(
+        res_out, torch.full(shape, sentinel, dtype=out_dtype, device=flag_gems.device)
+    ), "out was mutated on the error path"
+    assert torch.equal(res_out, ref_out)
+
+
 @pytest.mark.put
 def test_put_complex32_rejected():
     # Native CUDA `put` has no ComplexHalf kernel. `complex32` used to be routed
