@@ -493,6 +493,33 @@ def test_quantize_per_channel_rejects_bad_axis(axis):
 
 
 @pytest.mark.quantize_per_channel
+@pytest.mark.parametrize("param", ["scales", "zero_points"])
+def test_quantize_per_channel_rejects_cpu_qparams(param):
+    """A CPU qparam tensor raises instead of being silently transferred.
+
+    Native's argument checker rejects the mismatch before any semantic
+    validation, so a CPU scales tensor must win over other input errors too
+    (here: over a bad axis), exactly as it does on native.
+    """
+    inp = torch.randn(4, 8, device=flag_gems.device)
+    scales = torch.rand(4, dtype=torch.float64, device=flag_gems.device) + 0.1
+    zero_points = torch.zeros(4, dtype=torch.int64, device=flag_gems.device)
+    params = {"scales": scales, "zero_points": zero_points}
+    params[param] = params[param].to("cpu")
+
+    with pytest.raises(RuntimeError, match=f"but got {param} is on cpu"):
+        flag_gems.quantize_per_channel(inp, **params, axis=0, dtype=torch.quint8)
+
+    # Device mismatch also takes precedence over a bad length, as on native;
+    # with both qparams misplaced, scales (the first argument) is reported.
+    short_cpu = torch.rand(3, dtype=torch.float64, device="cpu") + 0.1
+    bad = short_cpu if param == "scales" else scales.to("cpu")
+    other = zero_points if param == "scales" else short_cpu.to(torch.int64)
+    with pytest.raises(RuntimeError, match="is on cpu"):
+        flag_gems.quantize_per_channel(inp, bad, other, 0, torch.quint8)
+
+
+@pytest.mark.quantize_per_channel
 def test_quantize_per_channel_rejects_multi_dim_qparams():
     """scales/zero_points must be 1-D vectors."""
     inp = torch.randn(4, 8, device=flag_gems.device)
@@ -563,19 +590,6 @@ def test_quantize_per_channel_rejects_unsupported_dtype():
         flag_gems.quantize_per_channel(inp, scales, zero_points, 0, torch.quint4x2)
 
 
-_DEVICE_TRAP_CASE = textwrap.dedent("""
-    import torch
-    import flag_gems
-
-    input = torch.randn(4, 8, device=flag_gems.device)
-    scales = torch.full((4,), 0.1, dtype=torch.float64, device=flag_gems.device)
-    zero_points = torch.full((4,), {zp}, device=flag_gems.device, dtype={dtype})
-    flag_gems.quantize_per_channel(input, scales, zero_points, 0, torch.{qtype})
-    torch.cuda.synchronize()
-    print("no error")
-    """)
-
-
 @pytest.mark.quantize_per_channel
 @pytest.mark.parametrize(
     "qtype,zp,dtype",
@@ -584,60 +598,78 @@ _DEVICE_TRAP_CASE = textwrap.dedent("""
         ("qint8", "-129", "torch.int64"),
         ("quint8", "-0.5", "torch.float32"),
         ("qint8", "300.0", "torch.float32"),
+        ("quint8", "-1", "torch.int64"),  # below lower bound
+        ("qint8", "128", "torch.int64"),
     ],
 )
 def test_quantize_per_channel_rejects_out_of_range_zero_point(qtype, zp, dtype):
-    """Zero-points outside the target dtype's range fail on device.
+    """Zero-points outside the target dtype's range raise a catchable RuntimeError.
 
-    The check is a device-side trap because deciding it on the host would
-    require a synchronising read of the qparam tensor. A trap faults the CUDA
-    context, so the call runs in a subprocess and only its failure is asserted.
+    Mirroring ATen's ``check_zero_points_cuda``, the range check happens on the
+    host with a synchronising read, so the failure is a synchronous exception
+    (the CUDA context survives) rather than an asynchronous device fault.
     """
-    code = _DEVICE_TRAP_CASE.format(zp=zp, dtype=dtype, qtype=qtype)
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=600,
+    input = torch.randn(4, 8, device=flag_gems.device)
+    scales = torch.full((4,), 0.1, dtype=torch.float64, device=flag_gems.device)
+    zero_points = torch.full(
+        (4,),
+        float(zp) if "." in zp else int(zp),
+        device=flag_gems.device,
+        dtype=eval(dtype),
     )
-    assert (
-        proc.returncode != 0
-    ), f"out-of-range zero_point was accepted: {proc.stdout!r}"
-    assert "no error" not in proc.stdout
+    with pytest.raises(RuntimeError, match="zero_point is (above|below)"):
+        flag_gems.quantize_per_channel(
+            input, scales, zero_points, 0, getattr(torch, qtype)
+        )
 
 
 @pytest.mark.quantize_per_channel
-def test_quantize_per_channel_accepts_valid_zero_points_in_subprocess():
-    """The in-range zero-points used elsewhere do not trip the device trap."""
-    code = textwrap.dedent("""
-        import torch
-        import flag_gems
+def test_quantize_per_channel_zero_point_error_matches_native():
+    """The host check reproduces ATen's message and below-before-above order."""
+    input = torch.randn(4, 8, device=flag_gems.device)
+    scales = torch.full((4,), 0.1, dtype=torch.float64, device=flag_gems.device)
 
-        input = torch.randn(4, 8, device=flag_gems.device)
-        scales = torch.full((4,), 0.1, dtype=torch.float64, device=flag_gems.device)
-        for zp, dtype, qtype in [
-            (0, torch.int64, torch.quint8),
-            (255, torch.int64, torch.quint8),
-            (-128, torch.int64, torch.qint8),
-            (127, torch.int64, torch.qint8),
-            (0.0, torch.float32, torch.quint8),
-            (254.5, torch.float32, torch.quint8),
-            (-127.5, torch.float32, torch.qint8),
-        ]:
-            zero_points = torch.full((4,), zp, device=flag_gems.device, dtype=dtype)
-            flag_gems.quantize_per_channel(input, scales, zero_points, 0, qtype)
-        torch.cuda.synchronize()
-        print("no error")
-        """)
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=600,
+    # both bounds violated at once: ATen reports "below lower bound"
+    both = torch.tensor([-300, 300, 2, 3], dtype=torch.int64, device=flag_gems.device)
+    ref_err = None
+    try:
+        torch.quantize_per_channel(input, scales, both, 0, torch.quint8)
+    except RuntimeError as e:
+        ref_err = str(e)
+    with pytest.raises(RuntimeError) as exc_info:
+        flag_gems.quantize_per_channel(input, scales, both, 0, torch.quint8)
+    assert "zero_point is below lower bound." in str(exc_info.value)
+    if ref_err is not None:
+        assert str(exc_info.value) == ref_err
+
+    # float scheme uses the float_qparams kernel name
+    fp = torch.tensor(
+        [0.0, 300.0, 2.0, 3.0], dtype=torch.float32, device=flag_gems.device
     )
-    assert proc.returncode == 0, proc.stderr[-2000:]
-    assert "no error" in proc.stdout
+    with pytest.raises(RuntimeError, match="float_qparams_cuda"):
+        flag_gems.quantize_per_channel(input, scales, fp, 0, torch.quint8)
+
+    # a try/except around the call recovers, like native
+    try:
+        flag_gems.quantize_per_channel(input, scales, fp, 0, torch.quint8)
+    except RuntimeError:
+        pass
+    torch.cuda.synchronize()  # context intact
+
+
+@pytest.mark.quantize_per_channel
+def test_quantize_per_channel_accepts_valid_zero_points():
+    """The in-range zero-points used elsewhere pass the host range check."""
+    input = torch.randn(4, 8, device=flag_gems.device)
+    scales = torch.full((4,), 0.1, dtype=torch.float64, device=flag_gems.device)
+    for zp, dtype, qtype in [
+        (0, torch.int64, torch.quint8),
+        (255, torch.int64, torch.quint8),
+        (-128, torch.int64, torch.qint8),
+        (127, torch.int64, torch.qint8),
+        (0.0, torch.float32, torch.quint8),
+        (254.5, torch.float32, torch.quint8),
+        (-127.5, torch.float32, torch.qint8),
+    ]:
+        zero_points = torch.full((4,), zp, device=flag_gems.device, dtype=dtype)
+        flag_gems.quantize_per_channel(input, scales, zero_points, 0, qtype)

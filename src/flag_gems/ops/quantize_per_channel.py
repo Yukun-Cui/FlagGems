@@ -58,25 +58,6 @@ def _scalar_type_name(dtype):
     }.get(dtype, str(dtype))
 
 
-@triton.jit
-def _trap_if(cond):
-    """Trap the device unconditionally when ``cond`` is true.
-
-    ``tl.device_assert`` is stripped unless ``TRITON_DEBUG=1``, so an invalid
-    zero-point would be silently accepted in a normal build. Emitting the PTX
-    ``trap`` instruction directly keeps the check active in every build, which
-    is how the native CUDA kernel reports an out-of-range zero-point.
-    """
-    tl.inline_asm_elementwise(
-        asm="{ .reg .pred p; setp.ne.b32 p, $1, 0; @p trap; mov.u32 $0, 0; }",
-        constraints="=r,r",
-        args=[cond.to(tl.int32)],
-        dtype=tl.int32,
-        is_pure=False,
-        pack=1,
-    )
-
-
 @libentry()
 @triton.jit
 def quantize_per_channel_kernel(
@@ -115,10 +96,9 @@ def quantize_per_channel_kernel(
         #   q = lrintf(raw * (1.f / scale) + zero_point)
         # entirely in float32, adding the zero-point *before* rounding.
         zero_point_f = tl.load(zero_points_ptr + axis_coord, mask=mask, other=0.0)
-        # check_zero_points_cuda: the float zero-point must still lie inside the
-        # integer range of the target dtype (compared as floats, as ATen does).
-        zp_valid = (zero_point_f >= q_min) & (zero_point_f <= q_max)
-        _trap_if(tl.max((mask & (~zp_valid)).to(tl.int32)) > 0)
+        # The zero-point range itself is validated on the host
+        # (``_check_zero_points_on_host``), mirroring ATen's synchronous
+        # ``check_zero_points_cuda`` so the error stays catchable.
 
         # Reproduce the native arithmetic bit-for-bit:
         #   * ``div_rn`` is IEEE round-to-nearest, while Triton's ``/`` lowers to
@@ -132,11 +112,10 @@ def quantize_per_channel_kernel(
         q = tl_extra_shim.nearbyint(tl.math.fma(x_val, inv_scale, zero_point_f))
     else:
         # per_channel_affine: the zero-point is a genuine integer, stored as
-        # int64, and must be inside the target dtype's range
-        # (check_zero_points_cuda).
+        # int64 and validated on the host against the target dtype's range
+        # (check_zero_points_cuda). The host check mirrors ATen's synchronous
+        # RuntimeError; no device-side trap is needed.
         zero_point_i64 = tl.load(zero_points_ptr + axis_coord, mask=mask, other=0)
-        zp_valid = (zero_point_i64 >= q_min) & (zero_point_i64 <= q_max)
-        _trap_if(tl.max((mask & (~zp_valid)).to(tl.int32)) > 0)
 
         # Both the CPU and the CUDA kernel round the scaled value *first* and
         # then add the zero-point (quantize_val's
@@ -166,14 +145,26 @@ def _validate_qparams(input, scales, zero_points, axis, dtype):
     """Validate the input contract the way native ``make_per_channel_affine_quantizer`` does.
 
     Every check mirrors an ATen assertion, and it runs before the kernel is
-    launched so a malformed qparam vector can never be read out of bounds by the
-    kernel's per-element ``tl.load``.
+    launched so a malformed qparam vector can never be read out of bounds by
+    the kernel's per-element ``tl.load``.
     """
     if dtype not in _QRANGE:
         raise NotImplementedError(
             f'"quantize_tensor_per_channel_affine" not implemented for '
             f"'{_scalar_type_name(dtype)}'"
         )
+
+    # Device consistency first -- it is what ATen's argument checker reports
+    # before any semantic validation, for both qparam vectors. Native raises
+    # instead of silently transferring, so a CPU qparam tensor never reaches
+    # the kernel through an implicit H2D copy.
+    for name, param in (("scales", scales), ("zero_points", zero_points)):
+        if param.device != input.device:
+            raise RuntimeError(
+                f"Expected all tensors to be on the same device, but got {name} is on "
+                f"{param.device}, different from other tensors on {input.device} "
+                "(when checking argument in method wrapper_CUDA__quantize_per_channel)"
+            )
 
     # checkFloatTensor: only float32 inputs reach the native per-channel kernels.
     # The two quantizers phrase this differently -- the float-qparams quantizer
@@ -225,24 +216,51 @@ def _validate_qparams(input, scales, zero_points, axis, dtype):
     return _is_float_qparams(scales, zero_points)
 
 
+def _check_zero_points_on_host(zero_points, q_min, q_max, use_float_zero_point):
+    """Validate the zero-point range on the host, mirroring ``check_zero_points_cuda``.
+
+    ATen performs this check inside the CUDA kernel after an explicit device
+    synchronization, so the failure is a catchable synchronous RuntimeError
+    and the CUDA context survives. The previous device-side PTX ``trap`` turned
+    the same input error into an asynchronous, context-killing fault instead.
+
+    ATen checks the lower bound first: a vector that violates both bounds
+    reports "below lower bound".
+    """
+    scheme = "float_qparams" if use_float_zero_point else "affine"
+    prefix = f"quantize_tensor_per_channel_{scheme}_cuda"
+    if zero_points.numel() == 0:
+        return
+    zp_min = zero_points.min().item()
+    if zp_min < q_min:
+        raise RuntimeError(f"{prefix}zero_point is below lower bound.")
+    zp_max = zero_points.max().item()
+    if zp_max > q_max:
+        raise RuntimeError(f"{prefix}zero_point is above upper bound.")
+
+
 def _quantize_per_channel_impl(input, scales, zero_points, axis, dtype):
     use_float_zero_point = _validate_qparams(input, scales, zero_points, axis, dtype)
     int_dtype, q_min, q_max = _QRANGE[dtype]
 
     # The quantization params are 1-D vectors of length ``input.size(axis)``.
-    # Keep them contiguous and on the same device as the input.
+    # They are already guaranteed to be on the input's device by
+    # ``_validate_qparams`` -- no implicit transfer happens here.
     #
     # Integer schemes store scales as fp64 and zero-points as int64, and the
     # float scheme keeps both in fp32 -- the dtypes the two native quantizers
     # use internally. The kernel branches on ``USE_FLOAT_ZERO_POINT``, so the
     # two precisions never mix.
     input = input.contiguous()
+    # The zero-point range check syncs on the original dtype values, before
+    # any conversion, like ATen's ``check_zero_points_cuda``.
+    _check_zero_points_on_host(zero_points, q_min, q_max, use_float_zero_point)
     if use_float_zero_point:
-        scales_k = scales.to(input.device).to(torch.float32).contiguous()
-        zero_points_k = zero_points.to(input.device).to(torch.float32).contiguous()
+        scales_k = scales.to(torch.float32).contiguous()
+        zero_points_k = zero_points.to(torch.float32).contiguous()
     else:
-        scales_k = scales.to(input.device).to(torch.float64).contiguous()
-        zero_points_k = zero_points.to(input.device).to(torch.int64).contiguous()
+        scales_k = scales.to(torch.float64).contiguous()
+        zero_points_k = zero_points.to(torch.int64).contiguous()
 
     shape_axis = input.shape[axis]
     stride_axis = input.stride(axis)
