@@ -70,6 +70,7 @@ AUTOGRAD_DISPATCH_KEY = torch._C.DispatchKey.Autograd.name
 CONJUGATE_DISPATCH_KEY = torch._C.DispatchKey.Conjugate.name
 QUANTIZED_CUDA_DISPATCH_KEY = torch._C.DispatchKey.QuantizedCUDA.name
 SPARSE_CSR_DISPATCH_KEY = "SparseCsr" + backend_info.dispatch_key
+SPARSE_CUDA_DISPATCH_KEY = torch._C.DispatchKey.SparseCUDA.name
 SPARSE_DISPATCH_KEY = "Sparse" + backend_info.dispatch_key
 QUANTIZED_DISPATCH_KEY = "Quantized" + backend_info.dispatch_key
 
@@ -185,11 +186,15 @@ _FULL_CONFIG = (
         "_functional_sym_constrain_range_for_size",
         _functional_sym_constrain_range_for_size,
     ),
+    ("_fused_adagrad_", _fused_adagrad_),
     ("_fused_adam", _fused_adam),
     ("_fused_adam_", _fused_adam_),
     ("_fused_moving_avg_obs_fq_helper", _fused_moving_avg_obs_fq_helper),
     ("_fused_rms_norm", _fused_rms_norm),
     ("_fused_rms_norm_backward", _fused_rms_norm_backward),
+    ("_fused_sgd_", _fused_sgd_),
+    ("_fused_sgd_.tensor_lr", _fused_sgd__tensor_lr),
+    ("_gather_sparse_backward", _gather_sparse_backward),
     ("_grouped_mm", group_mm),
     (
         "_has_compatible_shallow_copy_type",
@@ -222,6 +227,7 @@ _FULL_CONFIG = (
     ("_log_softmax.out", log_softmax_out),
     ("_log_softmax_backward_data", log_softmax_backward),
     ("_log_softmax_backward_data.out", log_softmax_backward_out),
+    ("_lu_with_info", _lu_with_info),
     ("_make_dep_token", _make_dep_token),
     ("_masked_scale", _masked_scale),
     ("_masked_softmax", _masked_softmax),
@@ -481,6 +487,7 @@ _FULL_CONFIG = (
     ("baddbmm", baddbmm),
     ("baddbmm.out", baddbmm_out),
     ("baddbmm_", baddbmm_),
+    ("batch_norm_gather_stats", batch_norm_gather_stats),
     ("batch_norm_gather_stats_with_counts", batch_norm_gather_stats_with_counts),
     ("bernoulli", bernoulli),
     ("bernoulli_.float", bernoulli_),
@@ -846,6 +853,8 @@ _FULL_CONFIG = (
     ("index_reduce_", index_reduce_),
     ("index_select", index_select),
     ("index_select_backward", index_select_backward),
+    ("inner", inner),
+    ("inverse", inverse),
     ("is_nonzero", is_nonzero),
     ("is_same_size", is_same_size),
     ("isclose", isclose),
@@ -1165,6 +1174,18 @@ _FULL_CONFIG = (
     ("quantized_gru.input", quantized_gru_input),
     ("quantized_lstm.input", quantized_lstm),
     (
+        "quantized_max_pool1d",
+        quantized_max_pool1d,
+        None,
+        (QUANTIZED_CUDA_DISPATCH_KEY,),
+    ),
+    (
+        "quantized_max_pool1d.out",
+        quantized_max_pool1d_out,
+        None,
+        (QUANTIZED_CUDA_DISPATCH_KEY,),
+    ),
+    (
         "quantized_max_pool2d",
         quantized_max_pool2d,
         None,
@@ -1236,6 +1257,7 @@ _FULL_CONFIG = (
     ("repeat_interleave.Tensor", repeat_interleave_tensor),
     ("replication_pad1d", replication_pad1d),
     ("replication_pad1d.out", replication_pad1d_out),
+    ("replication_pad1d_backward", replication_pad1d_backward),
     ("replication_pad2d", replication_pad2d),
     ("replication_pad2d.out", replication_pad2d_out),
     ("replication_pad2d_backward", replication_pad2d_backward),
@@ -1257,6 +1279,9 @@ _FULL_CONFIG = (
     ("round", round),
     ("round.out", round_out),
     ("round_", round_),
+    ("row_indices", row_indices, None, (AUTOGRAD_DISPATCH_KEY,)),
+    ("row_stack", row_stack),
+    ("row_stack.out", row_stack_out),
     ("rrelu_with_noise", rrelu_with_noise),
     ("rrelu_with_noise_", rrelu_with_noise_),
     ("rrelu_with_noise_backward", rrelu_with_noise_backward),
@@ -1314,6 +1339,7 @@ _FULL_CONFIG = (
     ("slice_copy.Tensor_out", slice_copy_out),
     ("slice_scatter", slice_scatter),
     ("slogdet", slogdet),
+    ("smm", smm, None, (SPARSE_CUDA_DISPATCH_KEY,)),
     ("smooth_l1_loss", smooth_l1_loss),
     ("smooth_l1_loss.out", smooth_l1_loss_out),
     ("smooth_l1_loss_backward", smooth_l1_loss_backward),
@@ -1529,10 +1555,17 @@ _FULL_CONFIG = (
     ("unsqueeze_", unsqueeze_),
     ("upsample_bicubic2d", upsample_bicubic2d),
     ("upsample_bilinear2d", upsample_bilinear2d),
+    ("upsample_bilinear2d_backward", upsample_bilinear2d_backward),
+    (
+        "upsample_bilinear2d_backward.grad_input",
+        upsample_bilinear2d_backward_grad_input,
+    ),
     ("upsample_linear1d", upsample_linear1d),
     ("upsample_linear1d_backward", upsample_linear1d_backward),
     ("upsample_nearest1d", upsample_nearest1d),
     ("upsample_nearest2d", upsample_nearest2d),
+    ("upsample_nearest2d_backward", upsample_nearest2d_backward),
+    ("upsample_nearest2d_backward.grad_input", upsample_nearest2d_backward_grad_input),
     ("upsample_nearest3d", upsample_nearest3d),
     ("upsample_nearest3d_backward", upsample_nearest3d_backward),
     (
