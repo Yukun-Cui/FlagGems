@@ -254,6 +254,46 @@ def test_quantized_batch_norm_empty(shape, in_dtype):
 
 
 @pytest.mark.quantized_batch_norm
+@pytest.mark.parametrize("in_dtype", QBN_QUANT_DTYPES)
+@pytest.mark.parametrize("in_scale", [0.0, 0.1])
+@pytest.mark.parametrize("out_scale,out_zero_point", [(0.0, 0), (0.0, 10), (1e-30, 3)])
+def test_quantized_batch_norm_zero_output_scale(
+    in_dtype, in_scale, out_scale, out_zero_point
+):
+    """output_scale=0.0 must degrade like native, not crash on the host.
+
+    The fused parameters involve ``input_scale / output_scale`` and
+    ``(bias - inner) / output_scale``; C++ double division by zero yields
+    inf/NaN that the requantization clamp folds to a defined result, so ATen
+    computes normally. A host-side Python division would raise
+    ZeroDivisionError before the kernel launches.
+    """
+    shape = (2, 3, 4, 4)
+    C = shape[1]
+    res_qx = _make_quantized_input(shape, in_scale, 3, in_dtype, flag_gems.device)
+    ref_qx = _make_quantized_input(shape, in_scale, 3, in_dtype, "cpu")
+    weight, bias, mean, var = _qbn_params(C, flag_gems.device)
+
+    ref_out = torch.quantized_batch_norm(
+        ref_qx,
+        weight.to("cpu"),
+        bias.to("cpu"),
+        mean.to("cpu"),
+        var.to("cpu"),
+        1e-5,
+        out_scale,
+        out_zero_point,
+    )
+    res_out = flag_gems.quantized_batch_norm(
+        res_qx, weight, bias, mean, var, 1e-5, out_scale, out_zero_point
+    )
+
+    assert res_out.q_scale() == ref_out.q_scale()
+    assert res_out.q_zero_point() == ref_out.q_zero_point()
+    utils.gems_assert_equal(res_out.int_repr().to("cpu"), ref_out.int_repr())
+
+
+@pytest.mark.quantized_batch_norm
 @pytest.mark.parametrize("param", ["weight", "bias", "mean", "var"])
 @pytest.mark.parametrize("bad_size", [1, 2, 4])
 def test_quantized_batch_norm_bad_size(bad_size, param):

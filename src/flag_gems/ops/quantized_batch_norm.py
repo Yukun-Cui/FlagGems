@@ -66,9 +66,9 @@ def quantized_batch_norm_alpha_beta_kernel(
     alpha_ptr,
     beta_ptr,
     C,
+    INPUT_SCALE,
+    OUTPUT_SCALE,
     EPS: tl.constexpr,
-    SCALE_RATIO: tl.constexpr,
-    OUTPUT_SCALE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Fuse the per-channel BN affine map with the quantization scales.
@@ -109,7 +109,13 @@ def quantized_batch_norm_alpha_beta_kernel(
 
     # alpha = t * (input_scale / output_scale);        (float32 * double -> double)
     # beta = (bias - inner) / output_scale;            (float32 / double -> double)
-    alpha = (weighted.to(tl.float64) * SCALE_RATIO).to(tl.float32)
+    # Both scales are runtime float64 arguments and the ratio/division happens
+    # here in the kernel: C++ double division by 0.0 gives inf/NaN (which the
+    # requantization clamp degrades exactly like native), whereas a host-side
+    # Python ``in_scale / out_scale`` would raise ZeroDivisionError for
+    # output_scale == 0.
+    scale_ratio = INPUT_SCALE / OUTPUT_SCALE
+    alpha = (weighted.to(tl.float64) * scale_ratio).to(tl.float32)
     beta = ((bias - inner).to(tl.float64) / OUTPUT_SCALE).to(tl.float32)
 
     tl.store(alpha_ptr + offsets, alpha, mask=mask)
@@ -164,15 +170,23 @@ def quantized_batch_norm_kernel(
 
         x_int = tl.load(curr_in_ptr, mask=mask, other=0).to(tl.float32)
 
-        q_out = (
-            tl_extra_shim.nearbyint(alpha * (x_int - in_zero_point) + beta)
-            + out_zero_point
-        )
-        q_out = tl.minimum(tl.maximum(q_out, MIN_VAL), MAX_VAL)
+        q_out = tl_extra_shim.nearbyint(alpha * (x_int - in_zero_point) + beta)
+        # The reference converts through ``lrintf`` (long). On x86 a NaN or an
+        # out-of-range value yields the "integer indefinite" value INT64_MIN,
+        # which the clamp then folds to the dtype minimum (0 for quint8,
+        # -128 for qint8) -- exactly what native produces for degenerate
+        # scales such as output_scale == 0, where alpha/beta become inf/NaN.
+        # A plain float clamp would instead saturate +inf to MAX_VAL and cast
+        # NaN unpredictably, so reproduce the integer conversion explicitly.
+        q_int = q_out.to(tl.int64)
+        indefinite = (q_out != q_out) | (q_out >= 9.2233720368547758e18)
+        q_int = tl.where(indefinite, -(2**63), q_int)
+        q_int = q_int + out_zero_point
+        q_int = tl.minimum(tl.maximum(q_int, MIN_VAL), MAX_VAL)
         if IS_QUINT8:
-            q_out = q_out.to(tl.uint8)
+            q_out = q_int.to(tl.uint8)
         else:
-            q_out = q_out.to(tl.int8)
+            q_out = q_int.to(tl.int8)
 
         tl.store(curr_out_ptr, q_out, mask=mask)
 
@@ -379,7 +393,7 @@ def _quantized_batch_norm_impl(
             beta,
             channels,
             EPS=float(eps),
-            SCALE_RATIO=in_scale / out_scale,
+            INPUT_SCALE=in_scale,
             OUTPUT_SCALE=out_scale,
             BLOCK_SIZE=_ALPHA_BETA_BLOCK,
         )
