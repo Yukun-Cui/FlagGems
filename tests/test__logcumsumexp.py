@@ -435,3 +435,96 @@ def test__logcumsumexp_all_dims(dim):
     res_out = flag_gems._logcumsumexp(inp, dim)
 
     utils.gems_assert_close(res_out, ref_out, torch.float32, reduce_dim=inp.shape[dim])
+
+
+@pytest.mark.underscore_logcumsumexp
+@pytest.mark.parametrize(
+    "shape,dim",
+    [
+        ((1, 8192), 1),  # just past the single-block limit
+        ((1, 16384), 1),  # several chunks
+        ((2, 4097, 3), 1),  # K > 1 and a tail chunk
+        ((3, 12000), 1),
+    ],
+    ids=["2x-chunk", "long", "k-gt-1", "tail-chunk"],
+)
+def test__logcumsumexp_long_rows(shape, dim):
+    """Rows past the single-block limit must scan in chunks and still match ATen.
+
+    A whole-row block is what makes ``tl.associative_scan`` expensive to compile
+    as N grows, so long rows are split into fixed-size chunks with a two-pass
+    fan-in. The result must be identical to ATen's (within the usual fp32
+    tolerance) for every row length, chunk boundary and K.
+    """
+    inp = torch.randn(shape, dtype=torch.float32, device=flag_gems.device)
+    ref_inp = utils.to_reference(inp, True)
+
+    ref_out = torch.ops.aten._logcumsumexp(ref_inp, dim)
+    res_out = flag_gems._logcumsumexp(inp, dim)
+
+    assert res_out.shape == ref_out.shape
+    assert not torch.isnan(res_out).any()
+    utils.gems_assert_close(res_out, ref_out, torch.float32, reduce_dim=shape[dim])
+
+
+@pytest.mark.underscore_logcumsumexp
+@pytest.mark.parametrize(
+    "data",
+    [
+        [float("-inf"), float("inf"), 0.0],
+        [0.0, 1000.0],
+        [float("inf"), float("inf"), 1.0],
+        [float("-inf"), float("-inf"), 1.0],
+        [float("nan"), 1.0, 2.0],
+        [1.0, float("nan"), 2.0],
+    ],
+)
+def test__logcumsumexp_long_rows_special_values(data):
+    """NaN/+-Inf state must survive the chunk boundary.
+
+    The chunk total is what propagates a NaN (or the all-+-inf branch) into the
+    following chunks, so it is taken as the inclusive scan's last lane. A
+    ``tl.max`` reduction would drop the NaN there and silently un-poison the
+    elements after a chunk boundary.
+    """
+    n = 8192
+    x = torch.tensor(
+        (data * (n // len(data) + 1))[:n],
+        dtype=torch.float32,
+        device=flag_gems.device,
+    )
+    ref_x = utils.to_reference(x)
+
+    ref_out = torch.ops.aten._logcumsumexp(ref_x, 0)
+    res_out = flag_gems._logcumsumexp(x, 0)
+    ref_on_dev = ref_out.to(res_out.device)
+
+    # The branch structure is compared exactly; the finite prefixes only need
+    # fp32 rounding agreement (and the CPU/CUDA backends round differently, so
+    # the values are compared against the same-device reference only).
+    assert torch.isnan(res_out).equal(torch.isnan(ref_on_dev))
+    assert torch.isinf(res_out).equal(torch.isinf(ref_on_dev))
+    if not utils.TO_CPU:
+        utils.gems_assert_close(
+            res_out, ref_out, torch.float32, equal_nan=True, reduce_dim=1
+        )
+
+
+@pytest.mark.underscore_logcumsumexp
+def test__logcumsumexp_long_row_fp64():
+    """FP64 accumulation must stay FP64 on the chunked path."""
+    if not utils.fp64_is_supported:
+        pytest.skip("float64 not supported on this device")
+    inp = torch.randn(1, 8192, dtype=torch.float64, device=flag_gems.device) * 3
+    ref_inp = utils.to_reference(inp)
+
+    ref_out = torch.ops.aten._logcumsumexp(ref_inp, 1)
+    res_out = flag_gems._logcumsumexp(inp, 1)
+
+    assert res_out.dtype == torch.float64
+    max_err = (
+        (res_out.double() - ref_out.double().to(res_out.device)).abs().max().item()
+    )
+    assert (
+        max_err < 1e-9
+    ), f"fp32 accumulation leaked into the chunked fp64 path: {max_err}"

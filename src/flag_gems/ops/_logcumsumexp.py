@@ -143,6 +143,10 @@ def _logcumsumexp_kernel(
     The input is treated as a contiguous (M, N, K) tensor with ``S == K``, so
     the scanned row of program ``(m, k)`` starts at ``m*N*K + k`` and advances
     with stride ``K``.
+
+    Used for rows no longer than ``_MAX_SINGLE_BLOCK``. Longer rows are handled
+    by :func:`_logcumsumexp_chunk_kernel` + :func:`_logcumsumexp_fanin_kernel`,
+    which keep the per-program block fixed instead of growing it with N.
     """
     pid_m = tle.program_id(0)
     pid_k = tle.program_id(1)
@@ -160,6 +164,102 @@ def _logcumsumexp_kernel(
 
     result = tl.associative_scan(x, 0, _logaddexp)
     tl.store(out + base + offsets * S, result.to(out.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _row_base(pid_r, N, K):
+    """Start offset of the ``pid_r``-th scanned row of an (M, N, K) tensor.
+
+    The scanned axis is the middle one, so row ``r = m*K + k`` starts at
+    ``m*N*K + k``. Deriving it from ``r`` alone keeps the row factorization out
+    of the kernel signature.
+    """
+    return (pid_r // K) * N * K + (pid_r % K)
+
+
+@libentry()
+@triton.jit
+def _logcumsumexp_chunk_kernel(
+    inp,
+    out,
+    chunk_total,
+    N,
+    K,
+    num_chunks,
+    CHUNK: tl.constexpr,
+    IS_FP64: tl.constexpr,
+):
+    """Scan one chunk of one row and record the chunk's running total.
+
+    ``K`` is the trailing size (the row stride) and ``CHUNK`` the number of
+    elements per chunk, so the tile that is scanned is always ``CHUNK`` wide
+    regardless of the row length: a long row becomes more programs, not a bigger
+    -- and exponentially more expensive to compile -- block.
+
+    ``chunk_total[r, j]`` holds the logaddexp total of chunks ``0..j`` of row
+    ``r``, which is what the fan-in pass consumes.
+    """
+    pid_r = tle.program_id(0)
+    pid_j = tle.program_id(1)
+    base = _row_base(pid_r, N, K)
+
+    offsets = pid_j * CHUNK + tl.arange(0, CHUNK)
+    mask = offsets < N
+    x = tl.load(inp + base + offsets * K, mask=mask, other=0)
+    if IS_FP64:
+        x = x.to(tl.float64)
+    else:
+        x = x.to(tl.float32)
+    # Padding lanes are the identity of logaddexp, so the scan is unaffected.
+    x = tl.where(mask, x, float("-inf"))
+
+    res = tl.associative_scan(x, 0, _logaddexp)
+    tl.store(out + base + offsets * K, res.to(out.dtype.element_ty), mask=mask)
+    # The chunk total is the inclusive scan's last lane. It is picked by a
+    # masked sum rather than by ``tl.max``, which would be wrong here: max
+    # ignores NaN operands, and the chunk total is exactly what has to carry
+    # the NaN state (and the +-inf branches) into the following chunks. Adding
+    # the zeros of the masked-out lanes is exact, so the surviving lane is
+    # returned unchanged; chunks are full except possibly the tail one, whose
+    # padding lanes hold -inf and cannot be selected.
+    last_lane_mask = tl.arange(0, CHUNK) == (CHUNK - 1)
+    total = tl.sum(tl.where(last_lane_mask, res, 0.0), axis=0)
+    tl.store(chunk_total + pid_r * num_chunks + pid_j, total)
+
+
+@libentry()
+@triton.jit
+def _logcumsumexp_fanin_kernel(
+    out,
+    chunk_total,
+    N,
+    K,
+    num_chunks,
+    CHUNK: tl.constexpr,
+    IS_FP64: tl.constexpr,
+):
+    """Shift each chunk by the logaddexp of all preceding chunk totals.
+
+    Chunk ``j``'s carry-in is the running ``logaddexp`` of the totals of chunks
+    ``0..j-1``; because ``logaddexp`` is associative, applying that carry with a
+    single combine is exact, so the chunked result is the value a whole-row scan
+    would produce.
+    """
+    pid_r = tle.program_id(0)
+    pid_j = tle.program_id(1)
+    base = _row_base(pid_r, N, K)
+    acc_ty = tl.float64 if IS_FP64 else tl.float32
+
+    carry = tl.full((), float("-inf"), dtype=acc_ty)
+    for j in range(0, pid_j):
+        t = tl.load(chunk_total + pid_r * num_chunks + j)
+        carry = _logaddexp(carry, t.to(acc_ty))
+
+    offsets = pid_j * CHUNK + tl.arange(0, CHUNK)
+    mask = offsets < N
+    res = tl.load(out + base + offsets * K, mask=mask, other=0).to(acc_ty)
+    shifted = _logaddexp(carry, tl.where(mask, res, float("-inf")))
+    tl.store(out + base + offsets * K, shifted.to(out.dtype.element_ty), mask=mask)
 
 
 @libentry()
@@ -236,6 +336,61 @@ def _real_view(tensor):
     return tensor
 
 
+# Rows longer than this are scanned in fixed-size chunks. The value is the
+# largest block whose ``tl.associative_scan`` still compiles quickly (~1 s
+# measured on H20); above it compile time grows steeply for no benefit, since a
+# bigger block is not what makes the scan faster.
+_MAX_SINGLE_BLOCK = 4096
+
+# Elements per chunk on the chunked path. Each chunk scans one block of this
+# width, and the inter-chunk carry is applied by a second pass.
+_CHUNK_ELEMS = 4096
+
+
+def _chunked_scan(src_view, dst_view, N, K, M, acc_is_fp64, inp):
+    """Two-pass chunked scan for rows longer than ``_MAX_SINGLE_BLOCK``.
+
+    Pass 1 scans every chunk independently and records each chunk's running
+    total; pass 2 computes each chunk's carry-in from the totals of the chunks
+    before it and shifts the chunk by that carry. ``logaddexp`` is associative,
+    so this reproduces a whole-row scan exactly while keeping the compiled tile
+    at ``_CHUNK_ELEMS`` for any row length.
+
+    The scanned rows are the ``M*K`` pairs of the (M, N, K) factorization, so
+    the grid's first axis is that product and each program derives its own row
+    base from it.
+    """
+    rows = M * K
+    chunk = min(_CHUNK_ELEMS, triton.next_power_of_2(N))
+    num_chunks = triton.cdiv(N, chunk)
+    total_dtype = torch.float64 if acc_is_fp64 else torch.float32
+    chunk_total = torch.empty(rows, num_chunks, dtype=total_dtype, device=inp.device)
+
+    warps = 8 if chunk > 2048 else 4
+    with torch_device_fn.device(inp.device):
+        _logcumsumexp_chunk_kernel[(rows, num_chunks)](
+            src_view,
+            dst_view,
+            chunk_total,
+            N,
+            K,
+            num_chunks,
+            CHUNK=chunk,
+            IS_FP64=acc_is_fp64,
+            num_warps=warps,
+        )
+        _logcumsumexp_fanin_kernel[(rows, num_chunks)](
+            dst_view,
+            chunk_total,
+            N,
+            K,
+            num_chunks,
+            CHUNK=chunk,
+            IS_FP64=acc_is_fp64,
+            num_warps=warps,
+        )
+
+
 def _logcumsumexp_wrapper(inp, dim=1, dtype=None, out=None):
     if not isinstance(dim, int):
         raise TypeError(f"dim must be an int, but got {type(dim).__name__}")
@@ -296,25 +451,39 @@ def _logcumsumexp_wrapper(inp, dim=1, dtype=None, out=None):
     src_view = _real_view(inp)
     dst_view = _real_view(target)
 
-    BLOCK_SIZE = triton.next_power_of_2(N)
-    num_warps = 8 if BLOCK_SIZE > 2048 else 4
-    grid = (M, K)
-    with torch_device_fn.device(inp.device):
-        if is_complex:
-            _logcumsumexp_complex_kernel[grid](
-                src_view,
-                dst_view,
-                N,
-                K,
-                BLOCK_SIZE,
-                acc_is_fp64,
-                not inp.is_complex(),
-                num_warps=num_warps,
-            )
-        else:
-            _logcumsumexp_kernel[grid](
-                src_view, dst_view, N, K, BLOCK_SIZE, acc_is_fp64, num_warps=num_warps
-            )
+    # A single program would have to scan the whole row, and
+    # ``tl.associative_scan`` compile time grows steeply with the block size
+    # (measured: ~4 s at N=8192, ~24 s at 32768, ~5 min at 131072), so long rows
+    # are split into fixed-size chunks instead -- the row length then only
+    # selects the grid, not the compiled tile.
+    if N > _MAX_SINGLE_BLOCK:
+        _chunked_scan(src_view, dst_view, N, K, M, acc_is_fp64, inp)
+    else:
+        BLOCK_SIZE = triton.next_power_of_2(N)
+        num_warps = 8 if BLOCK_SIZE > 2048 else 4
+        grid = (M, K)
+        with torch_device_fn.device(inp.device):
+            if is_complex:
+                _logcumsumexp_complex_kernel[grid](
+                    src_view,
+                    dst_view,
+                    N,
+                    K,
+                    BLOCK_SIZE,
+                    acc_is_fp64,
+                    not inp.is_complex(),
+                    num_warps=num_warps,
+                )
+            else:
+                _logcumsumexp_kernel[grid](
+                    src_view,
+                    dst_view,
+                    N,
+                    K,
+                    BLOCK_SIZE,
+                    acc_is_fp64,
+                    num_warps=num_warps,
+                )
 
     if scratch is not None:
         scratch.copy_(target)
