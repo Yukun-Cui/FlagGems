@@ -131,6 +131,66 @@ def test_row_indices_copy_bsc():
 
 
 @pytest.mark.row_indices_copy
+@pytest.mark.row_indices_copy_out
+def test_row_indices_copy_batched():
+    # Batched CSC/BSC: row_indices() is a multi-dimensional buffer (e.g. shape
+    # (2, nnz), stride (nnz, 1)). The copy must read its row-major *logical*
+    # order; a per-first-dimension stride (or any stride(0) shortcut) reads
+    # out of bounds and returns zeros.
+    device = flag_gems.device
+    rows, cols, batches, nnz = 8, 16, 2, 20
+
+    def _make_batched(index_dtype):
+        ccol = torch.zeros(batches, cols + 1, dtype=index_dtype, device="cpu")
+        row = torch.zeros(batches, nnz, dtype=index_dtype, device="cpu")
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(7)
+        for b in range(batches):
+            # same nnz per column is required for a batched sparse tensor
+            per_col = nnz // cols
+            leftover = nnz - per_col * cols
+            ccol[b, 1:] = torch.tensor(
+                [per_col * (i + 1) + min(i + 1, leftover) for i in range(cols)]
+            )
+            for c in range(cols):
+                lo = int(ccol[b, c])
+                hi = int(ccol[b, c + 1])
+                if hi > lo:
+                    rs, _ = torch.sort(torch.randperm(rows, generator=gen)[: hi - lo])
+                    row[b, lo:hi] = rs.to(index_dtype)
+        vals = torch.randn(batches, nnz, device="cpu")
+        size = (batches, rows, cols)
+        return (
+            torch.sparse_csc_tensor(
+                ccol.to(device), row.to(device), vals.to(device), size=size
+            ),
+            torch.sparse_csc_tensor(ccol, row, vals, size=size),
+        )
+
+    for index_dtype in INDEX_DTYPES:
+        bsc_gpu, bsc_cpu = _make_batched(index_dtype)
+        ri = bsc_gpu.row_indices()
+        assert ri.dim() >= 2, "batched row_indices should be multi-dimensional"
+
+        ref_out = torch.row_indices_copy(bsc_cpu)
+        res_out = flag_gems.row_indices_copy(bsc_gpu)
+
+        assert res_out.shape == ref_out.shape
+        assert res_out.is_contiguous()
+        utils.gems_assert_equal(res_out.to("cpu"), ref_out)
+
+        # out= variant with a strided multi-dimensional destination
+        n = ri.numel()
+        ref_buf = torch.zeros(n * 2, dtype=index_dtype, device="cpu")
+        torch.row_indices_copy(bsc_cpu, out=ref_buf[::2].reshape(tuple(ref_out.shape)))
+        res_buf = torch.zeros(n * 2, dtype=index_dtype, device=device)
+        flag_gems.row_indices_copy_out(
+            bsc_gpu, out=res_buf[::2].reshape(tuple(ref_out.shape))
+        )
+        utils.gems_assert_equal(res_buf[::2].to("cpu"), ref_buf[::2])
+
+
+@pytest.mark.row_indices_copy
 def test_row_indices_copy_wrong_layout():
     device = flag_gems.device
     # CSR is row-compressed, not column-compressed -> should raise.

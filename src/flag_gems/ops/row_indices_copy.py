@@ -26,21 +26,35 @@ logger = logging.getLogger(__name__)
 def _row_indices_copy_kernel(
     src_ptr,
     dst_ptr,
-    src_stride,
-    dst_stride,
+    layout_ptr,  # flat sizes followed by flat strides of the logical shape
     n_elements,
+    RANK_DYN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Both buffers are 1-D, but neither is required to be contiguous: ``out``
-    # may arrive non-contiguous (ATen accepts it and honours its stride), and
-    # the source buffer is indexed with its own stride so no host-side
-    # materialization is needed. The strides are applied inside the kernel.
+    # The source buffer (``row_indices()``) is always stored row-major
+    # contiguous over its logical shape (verified for plain and batched
+    # CSC/BSC), so a flat unit stride reads it correctly regardless of rank --
+    # using ``stride(0)`` here would only be right for rank 1 and read out of
+    # bounds for batched shapes like (2, 6) with stride (6, 1). ``out`` may
+    # arrive non-contiguous (ATen accepts it and honours its strides), so its
+    # flat offset is decoded against the full stride vector in a RANK_DYN-trip
+    # loop; for a contiguous destination the loop multiplies every stride by 1
+    # and the decomposition drops out.
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    vals = tl.load(src_ptr + offsets * src_stride, mask=mask)
-    tl.store(dst_ptr + offsets * dst_stride, vals, mask=mask)
+    flat_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = flat_offsets < n_elements
+
+    vals = tl.load(src_ptr + flat_offsets, mask=mask)
+
+    cur = tl.where(mask, flat_offsets, 0).to(tl.int64)
+    dst_offsets = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+    for i in tl.static_range(RANK_DYN - 1, -1, -1):
+        dim_size = tl.load(layout_ptr + i).to(tl.int64)
+        dim_stride = tl.load(layout_ptr + RANK_DYN + i).to(tl.int64)
+        dst_offsets += (cur % dim_size) * dim_stride
+        cur = cur // dim_size
+    tl.store(dst_ptr + dst_offsets, vals, mask=mask)
 
 
 def _row_indices_copy_impl(self: torch.Tensor, *, out=None):
@@ -84,26 +98,26 @@ def _row_indices_copy_impl(self: torch.Tensor, *, out=None):
     if n_elements == 0:
         return dst
 
-    # Resolve the logical 1-D strides here (pure metadata reads, no host-side
-    # computation). The source buffer is 1-D, so ``src.stride(0)`` is the only
-    # stride that matters; ``src.contiguous()`` is deliberately avoided because
-    # host-side PyTorch computation operators are prohibited -- the kernel
-    # applies the stride instead.
-    if src.dim() == 0:
-        src_stride = 1
-    else:
-        src_stride = src.stride(0)
+    # Build the flat layout vector (sizes followed by strides of the logical
+    # shape) used by the kernel to map flat offsets to element addresses.
+    # ``row_indices()`` is always stored row-major contiguous (plain and
+    # batched CSC/BSC), so the source side reads with a flat unit stride and
+    # only the destination decomposition is needed here. The destination's
+    # real strides (contiguous or not) are read as pure metadata; host-side
+    # ``.contiguous()`` materialization is deliberately avoided.
+    layout = [int(d) for d in dst.shape] + [int(s) for s in dst.stride()]
     if dst.dim() == 0:
-        dst_stride = 1
-    else:
-        dst_stride = dst.stride(0)
+        # A 0-dim destination has no strides to decompose.
+        layout = [1, 1]
+    rank = len(layout) // 2
+    layout_buf = torch.tensor(layout, dtype=torch.int64, device=src.device)
     # A larger block keeps the launch grid small (<= a few blocks) for the
     # buffer sizes typical of sparse index arrays, reducing launch overhead
     # relative to the amount of data actually copied.
     BLOCK_SIZE = 4096
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     _row_indices_copy_kernel[grid](
-        src, dst, src_stride, dst_stride, n_elements, BLOCK_SIZE=BLOCK_SIZE
+        src, dst, layout_buf, n_elements, RANK_DYN=rank, BLOCK_SIZE=BLOCK_SIZE
     )
     return dst
 
