@@ -21,6 +21,12 @@ from flag_gems.ops.svd import svd
 
 logger = logging.getLogger(__name__)
 
+# Drivers the native CUDA op accepts. Measured against `aten::_linalg_svd` on
+# CUDA: "gesvd" and "gesvda" are accepted and "gesdd" is not (the CPU backend
+# rejects every driver at dispatch time, so the CUDA set is the relevant one).
+# The strings are case-sensitive on native.
+_VALID_DRIVERS = ("gesvd", "gesvda")
+
 
 def _linalg_svd(A, full_matrices=False, compute_uv=True, *, driver=None):
     """Triton implementation of ``aten::_linalg_svd``.
@@ -41,6 +47,18 @@ def _linalg_svd(A, full_matrices=False, compute_uv=True, *, driver=None):
     here.
     """
     logger.debug("GEMS _LINALG_SVD")
+    # ``driver`` is validated before anything else, matching the CUDA native op,
+    # which rejects an unknown driver regardless of the input dtype. The Triton
+    # kernels have no driver concept -- they always compute the reduced SVD and
+    # expand to the full factors, which is what both cuSOLVER drivers do from
+    # the caller's point of view -- so a valid driver only has to be accepted,
+    # not acted on.
+    if driver is not None and driver not in _VALID_DRIVERS:
+        raise RuntimeError(
+            f"torch.linalg.svd: unknown svd driver {driver} in svd_cusolver "
+            "computation. Check doc at "
+            "https://pytorch.org/docs/stable/generated/torch.linalg.svd.html"
+        )
     # The Triton SVD kernels only implement float32; higher/lower precision
     # matrices (e.g. float16/bfloat16) are not supported by the backend.
     if A.dtype != torch.float32:
