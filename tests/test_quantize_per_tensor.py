@@ -228,6 +228,85 @@ def test_quantize_per_tensor_memory_format(memory_format, shape):
 
 
 @pytest.mark.quantize_per_tensor
+@pytest.mark.parametrize(
+    "memory_format,shape",
+    [
+        (torch.contiguous_format, (2, 3, 4, 5)),
+        (torch.channels_last, (2, 3, 4, 5)),
+        (torch.channels_last_3d, (2, 3, 4, 5, 6)),
+    ],
+    ids=["contig", "cl", "cl3d"],
+)
+def test_quantize_per_tensor_public_entry_keeps_layout(memory_format, shape):
+    """The public result must keep the suggested memory format end to end.
+
+    The tensor-building step must not re-lay the storage out to contiguous:
+    a channels-last input yields a channels-last ``int_repr`` on native, and
+    the public entry point is what the memory-format contract has to hold on.
+    """
+    utils.init_seed(0)
+    inp = torch.randn(shape, dtype=torch.float32, device=flag_gems.device).contiguous(
+        memory_format=memory_format
+    )
+
+    ref = torch.quantize_per_tensor(utils.to_reference(inp), 0.1, 0, torch.qint8)
+    res = flag_gems.quantize_per_tensor(inp, 0.1, 0, torch.qint8)
+
+    assert res.int_repr().stride() == ref.int_repr().stride(), (
+        f"public int_repr strides differ: got {tuple(res.int_repr().stride())}, "
+        f"expected {tuple(ref.int_repr().stride())}"
+    )
+    utils.gems_assert_equal(res.int_repr(), utils.to_reference(ref.int_repr()))
+    assert res.q_scale() == ref.q_scale()
+    assert res.q_zero_point() == ref.q_zero_point()
+    # The wrapped tensor is a functioning quantized tensor downstream (checked
+    # only against the CUDA reference: the CPU and CUDA quantizers round the
+    # dequantized float differently, the same disagreement that makes
+    # test_quantize_per_tensor_half_way_values skip under --ref=cpu).
+    if not utils.TO_CPU:
+        utils.gems_assert_equal(res.dequantize(), utils.to_reference(ref.dequantize()))
+
+
+@pytest.mark.quantize_per_tensor
+@pytest.mark.parametrize(
+    "dtype,zp,word",
+    [
+        (torch.quint8, 300, "above"),
+        (torch.quint8, -1, "below"),
+        (torch.qint8, 128, "above"),
+        (torch.qint8, -129, "below"),
+    ],
+)
+def test_quantize_per_tensor_zero_point_range(dtype, zp, word):
+    """An out-of-range zero_point raises ATen's message instead of clamping.
+
+    Native rejects the value synchronously with
+    'quantize_tensor_per_tensor_affine zero_point <zp> is above/below upper/
+    lower bound.'; it does not silently clamp it into the valid bin.
+    """
+    inp = _cuda_input((2, 3, 4, 4))
+
+    ref_err = None
+    try:
+        torch.quantize_per_tensor(utils.to_reference(inp), 0.1, zp, dtype)
+    except RuntimeError as e:
+        ref_err = str(e)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        flag_gems.quantize_per_tensor(inp, 0.1, zp, dtype)
+    assert f"zero_point {zp} is {word}" in str(exc_info.value)
+    if ref_err is not None:
+        assert str(exc_info.value) == ref_err
+
+    # The out= overload performs the same check.
+    out = torch._empty_affine_quantized(
+        (2, 3, 4, 4), scale=0.1, zero_point=0, dtype=dtype, device=flag_gems.device
+    )
+    with pytest.raises(RuntimeError, match=f"zero_point {zp} is {word}"):
+        flag_gems.quantize_per_tensor_out(inp, 0.1, zp, dtype, out=out)
+
+
+@pytest.mark.quantize_per_tensor
 @pytest.mark.parametrize("shape", [(2, 3, 4, 5), (2, 3, 4, 5, 6)], ids=["4d", "5d"])
 def test_quantize_per_tensor_contiguous_unchanged(shape):
     # A default-layout input must keep producing default-layout output.

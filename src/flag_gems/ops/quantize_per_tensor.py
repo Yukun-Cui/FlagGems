@@ -239,6 +239,11 @@ _QINT_DTYPES = {
     torch.qint32: torch.int32,
 }
 
+# Inverse of ``_QINT_DTYPES``: the quantized dtype owning an integer storage
+# dtype. Needed because ``_empty_affine_quantized`` requires a quantized dtype
+# (it is registered only for the quantized backends).
+_QDTYPE_FROM_INT = {v: k for k, v in _QINT_DTYPES.items()}
+
 
 def _validate_quant_args(a, dtype):
     """ATen's input validation for the quantized dtype and the float input.
@@ -258,6 +263,26 @@ def _validate_quant_args(a, dtype):
             f"quantize_per_tensor: expected input of dtype torch.float32, got {a.dtype}"
         )
     return _QUANT_INFO[dtype]
+
+
+def _check_zero_point_range(zero_point, dtype):
+    """ATen's zero-point range check (``quantize_tensor_per_tensor_affine``).
+
+    Native rejects an out-of-range zero-point with a synchronous RuntimeError
+    naming the value instead of silently clamping it into a valid bin.
+    """
+    _, qmin, qmax = _QUANT_INFO[dtype]
+    zero_point = int(zero_point)
+    if zero_point < qmin:
+        raise RuntimeError(
+            f"quantize_tensor_per_tensor_affine zero_point {zero_point} is below "
+            "lower bound."
+        )
+    if zero_point > qmax:
+        raise RuntimeError(
+            f"quantize_tensor_per_tensor_affine zero_point {zero_point} is above "
+            "upper bound."
+        )
 
 
 def _int_view(qtensor):
@@ -466,16 +491,43 @@ def _quantize_per_tensor_impl(a, scale, zero_point, dtype):
     return _launch_quantize_kernel(a, out, scale, zero_point, qmin, qmax)
 
 
+def _make_per_tensor_from_int(int_repr, scale, zero_point):
+    """Wrap ``int_repr`` as a per-tensor quantized tensor, preserving its layout.
+
+    ``torch._make_per_tensor_quantized_tensor`` silently normalises the
+    strides of its argument to contiguous on CUDA, which would lose the
+    channels-last (or channels-last-3d) layout the kernel produced from a
+    channels-last input -- native keeps it. Building the tensor through
+    ``_empty_affine_quantized`` + ``set_`` (the same trick
+    :func:`_adopt_quantizer` uses) shares ``int_repr``'s storage and keeps
+    its sizes, strides and layout untouched.
+    """
+    result = torch._empty_affine_quantized(
+        0,
+        scale=float(scale),
+        zero_point=int(zero_point),
+        dtype=_QDTYPE_FROM_INT[int_repr.dtype],
+        device=int_repr.device,
+    )
+    result.set_(
+        int_repr.untyped_storage(),
+        int_repr.storage_offset(),
+        tuple(int_repr.shape),
+        int_repr.stride(),
+    )
+    return result
+
+
 def quantize_per_tensor(a, scale, zero_point, dtype):
     logger.debug("GEMS QUANTIZE_PER_TENSOR")
+    _check_zero_point_range(zero_point, dtype)
     int_repr = _quantize_per_tensor_impl(a, scale, zero_point, dtype)
-    return torch._make_per_tensor_quantized_tensor(
-        int_repr, float(scale), int(zero_point)
-    )
+    return _make_per_tensor_from_int(int_repr, float(scale), int(zero_point))
 
 
 def quantize_per_tensor_out(a, scale, zero_point, dtype, *, out=None):
     logger.debug("GEMS QUANTIZE_PER_TENSOR_OUT")
+    _check_zero_point_range(zero_point, dtype)
     if out is None:
         raise RuntimeError("quantize_per_tensor.out: argument 'out' is required")
 
