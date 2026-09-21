@@ -57,21 +57,87 @@ _SCALAR_TYPE_NAMES = {
 
 
 @libentry()
-@triton.jit(do_not_specialize=["N", "src_numel"])
+@triton.jit(do_not_specialize=["N"])
 def put_stage_widen_kernel(
-    dst_ptr, src_ptr, src_numel, N, TO_BOOL: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    dst_ptr,
+    src_ptr,
+    layout_ptr,
+    N,
+    src_shape0,
+    src_shape1,
+    src_shape2,
+    src_shape3,
+    src_shape4,
+    src_shape5,
+    src_shape6,
+    src_shape7,
+    src_stride0,
+    src_stride1,
+    src_stride2,
+    src_stride3,
+    src_stride4,
+    src_stride5,
+    src_stride6,
+    src_stride7,
+    TO_BOOL: tl.constexpr,
+    RANK: tl.constexpr,
+    IS_CONTIGUOUS: tl.constexpr,
+    HAS_PRECOMPUTED_OFFSETS: tl.constexpr,
+    RANK_DYN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    """Widen ``src`` into an int32 staging buffer, on the device.
+    """Widen ``src`` into an int32 staging buffer holding its row-major order.
 
-    ``dst`` is the row-major flattening of the operand (``N`` elements);
-    ``src`` may be a strided view, so it is read through its own flat order
-    (``src_numel`` == N for every caller here). ``bool`` is normalized to 0/1
-    explicitly rather than relying on the element-wise cast.
+    ``dst`` is the row-major flattening of the operand (``N`` elements) and
+    ``src`` is that same operand, which may be a strided view: the flat offset
+    is decoded against ``src``'s real strides (``_collapse_dims`` output passed
+    as the unrolled shape/stride arguments, or the layout vector for a rank past
+    ``MAX_UNROLL_RANK``) rather than read as if it were contiguous storage.
+    ``bool`` is normalized to 0/1 explicitly rather than relying on the
+    element-wise cast.
     """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < N
-    value = tl.load(src_ptr + offsets, mask=mask, other=0)
+
+    if HAS_PRECOMPUTED_OFFSETS:
+        cur = offsets
+        src_offsets = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+        for i in tl.static_range(RANK_DYN - 1, -1, -1):
+            dim_size = tl.load(layout_ptr + i).to(tl.int64)
+            dim_stride = tl.load(layout_ptr + RANK_DYN + i).to(tl.int64)
+            src_offsets += (cur % dim_size) * dim_stride
+            cur = cur // dim_size
+    elif IS_CONTIGUOUS:
+        src_offsets = offsets
+    else:
+        cur = offsets
+        src_offsets = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+        if RANK > 7:
+            src_offsets += (cur % src_shape7) * src_stride7
+            cur = cur // src_shape7
+        if RANK > 6:
+            src_offsets += (cur % src_shape6) * src_stride6
+            cur = cur // src_shape6
+        if RANK > 5:
+            src_offsets += (cur % src_shape5) * src_stride5
+            cur = cur // src_shape5
+        if RANK > 4:
+            src_offsets += (cur % src_shape4) * src_stride4
+            cur = cur // src_shape4
+        if RANK > 3:
+            src_offsets += (cur % src_shape3) * src_stride3
+            cur = cur // src_shape3
+        if RANK > 2:
+            src_offsets += (cur % src_shape2) * src_stride2
+            cur = cur // src_shape2
+        if RANK > 1:
+            src_offsets += (cur % src_shape1) * src_stride1
+            cur = cur // src_shape1
+        if RANK > 0:
+            src_offsets += cur * src_stride0
+
+    value = tl.load(src_ptr + src_offsets, mask=mask, other=0)
     if TO_BOOL:
         value = tl.where(value != 0, 1, 0)
     tl.store(dst_ptr + offsets, value.to(tl.int32), mask=mask)
@@ -80,22 +146,88 @@ def put_stage_widen_kernel(
 @libentry()
 @triton.jit(do_not_specialize=["N"])
 def put_stage_narrow_kernel(
-    dst_ptr, src_ptr, N, TO_BOOL: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    dst_ptr,
+    src_ptr,
+    layout_ptr,
+    N,
+    dst_shape0,
+    dst_shape1,
+    dst_shape2,
+    dst_shape3,
+    dst_shape4,
+    dst_shape5,
+    dst_shape6,
+    dst_shape7,
+    dst_stride0,
+    dst_stride1,
+    dst_stride2,
+    dst_stride3,
+    dst_stride4,
+    dst_stride5,
+    dst_stride6,
+    dst_stride7,
+    TO_BOOL: tl.constexpr,
+    RANK: tl.constexpr,
+    IS_CONTIGUOUS: tl.constexpr,
+    HAS_PRECOMPUTED_OFFSETS: tl.constexpr,
+    RANK_DYN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """Narrow a contiguous int32 accumulator back into the destination dtype.
 
-    A truncating store reproduces ATen's two's-complement wrap for int8, uint8
-    and int16. ``bool`` saturates instead (``True + True`` is ``True``), so it
+    ``src`` holds the destination's values in row-major logical order, but
+    ``dst`` may be a strided view, so the store decodes the flat offset against
+    ``dst``'s real strides -- the same decomposition the scatter uses. A
+    truncating store reproduces ATen's two's-complement wrap for int8, uint8
+    and int16; ``bool`` saturates instead (``True + True`` is ``True``), so it
     compares against zero rather than keeping the low bit.
     """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < N
     value = tl.load(src_ptr + offsets, mask=mask, other=0)
-    if TO_BOOL:
-        tl.store(dst_ptr + offsets, value != 0, mask=mask)
+
+    if HAS_PRECOMPUTED_OFFSETS:
+        cur = offsets
+        dst_offsets = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+        for i in tl.static_range(RANK_DYN - 1, -1, -1):
+            dim_size = tl.load(layout_ptr + i).to(tl.int64)
+            dim_stride = tl.load(layout_ptr + RANK_DYN + i).to(tl.int64)
+            dst_offsets += (cur % dim_size) * dim_stride
+            cur = cur // dim_size
+    elif IS_CONTIGUOUS:
+        dst_offsets = offsets
     else:
-        tl.store(dst_ptr + offsets, value, mask=mask)
+        cur = offsets
+        dst_offsets = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+        if RANK > 7:
+            dst_offsets += (cur % dst_shape7) * dst_stride7
+            cur = cur // dst_shape7
+        if RANK > 6:
+            dst_offsets += (cur % dst_shape6) * dst_stride6
+            cur = cur // dst_shape6
+        if RANK > 5:
+            dst_offsets += (cur % dst_shape5) * dst_stride5
+            cur = cur // dst_shape5
+        if RANK > 4:
+            dst_offsets += (cur % dst_shape4) * dst_stride4
+            cur = cur // dst_shape4
+        if RANK > 3:
+            dst_offsets += (cur % dst_shape3) * dst_stride3
+            cur = cur // dst_shape3
+        if RANK > 2:
+            dst_offsets += (cur % dst_shape2) * dst_stride2
+            cur = cur // dst_shape2
+        if RANK > 1:
+            dst_offsets += (cur % dst_shape1) * dst_stride1
+            cur = cur // dst_shape1
+        if RANK > 0:
+            dst_offsets += cur * dst_stride0
+
+    if TO_BOOL:
+        tl.store(dst_ptr + dst_offsets, value != 0, mask=mask)
+    else:
+        tl.store(dst_ptr + dst_offsets, value, mask=mask)
 
 
 @triton.jit
@@ -395,19 +527,58 @@ def _launch(inp, index_flat, source_flat, accumulate):
         )
 
 
+def _stage_layout(src):
+    """Layout vector + launch geometry decoding ``src``'s flat logical order.
+
+    Shared by the widen and narrow staging kernels: ``put_`` addresses the
+    *row-major flattening* of the tensor, so every flat offset has to be turned
+    into a real element address with this decomposition whenever the tensor is
+    not contiguous.
+    """
+    N = src.numel()
+    if src.is_contiguous():
+        shape, stride, rank = [N], [1], 1
+    else:
+        shape, stride = _collapse_dims(list(src.shape), list(src.stride()))
+        rank = len(shape)
+    has_precomputed = rank > MAX_UNROLL_RANK
+    dyn_rank = rank if has_precomputed else 0
+    if has_precomputed:
+        layout_arg = torch.tensor(shape + stride, dtype=torch.int64, device=src.device)
+    else:
+        # Unused on this path; pass `src` so no allocation happens at all.
+        layout_arg = src
+    shape = (shape + [1] * MAX_UNROLL_RANK)[:MAX_UNROLL_RANK]
+    stride = (stride + [0] * MAX_UNROLL_RANK)[:MAX_UNROLL_RANK]
+    return layout_arg, shape, stride, rank, has_precomputed, dyn_rank
+
+
 def _stage_to_int32(src, bool_normalize=False):
-    """Device-side widen of ``src`` into a contiguous int32 buffer."""
+    """Device-side widen of ``src`` into a contiguous int32 buffer.
+
+    The staging buffer holds ``src``'s values in row-major logical order, which
+    is the order ``put_`` indexes ``self`` in. ``src`` may be a strided view, so
+    the read decodes the flat offset against its real strides -- reading it as
+    contiguous storage would pick up the wrong elements.
+    """
     out = torch.empty(src.numel(), dtype=torch.int32, device=src.device)
     N = out.numel()
     if N == 0:
         return out
+    layout_arg, shape, stride, rank, has_precomputed, dyn_rank = _stage_layout(src)
     BLOCK_SIZE = 1024
     put_stage_widen_kernel[(triton.cdiv(N, BLOCK_SIZE),)](
         out,
         src,
-        src.numel(),
+        layout_arg,
         N,
+        *shape,
+        *stride,
         TO_BOOL=bool_normalize,
+        RANK=rank if not has_precomputed else 0,
+        IS_CONTIGUOUS=(rank == 1 and stride[0] == 1),
+        HAS_PRECOMPUTED_OFFSETS=has_precomputed,
+        RANK_DYN=dyn_rank,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=4,
     )
@@ -417,15 +588,30 @@ def _stage_to_int32(src, bool_normalize=False):
 def _stage_back(dst, staged, to_bool=False):
     """Device-side narrow of a contiguous int32 ``staged`` back into ``dst``.
 
-    ``dst`` and ``staged`` are the row-major flattenings of the same element
-    set, so a flat element-wise store reproduces ``dst``'s layout exactly.
+    ``staged`` holds ``dst``'s values in row-major logical order, which is the
+    order ``put_`` indexes ``self`` in -- but ``dst`` itself may be a strided
+    view, so the narrowing store decodes the flat offset against ``dst``'s real
+    strides (the same layout handling ``_launch`` uses for the scatter).
     """
     N = staged.numel()
     if N == 0:
         return dst
+    layout_arg, shape, stride, rank, has_precomputed, dyn_rank = _stage_layout(dst)
     BLOCK_SIZE = 1024
     put_stage_narrow_kernel[(triton.cdiv(N, BLOCK_SIZE),)](
-        dst, staged, N, TO_BOOL=to_bool, BLOCK_SIZE=BLOCK_SIZE, num_warps=4
+        dst,
+        staged,
+        layout_arg,
+        N,
+        *shape,
+        *stride,
+        TO_BOOL=to_bool,
+        RANK=rank if not has_precomputed else 0,
+        IS_CONTIGUOUS=(rank == 1 and stride[0] == 1),
+        HAS_PRECOMPUTED_OFFSETS=has_precomputed,
+        RANK_DYN=dyn_rank,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
     )
     return dst
 

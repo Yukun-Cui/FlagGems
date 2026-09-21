@@ -125,6 +125,46 @@ def test_put__non_contiguous(shape, dtype):
 
 
 @pytest.mark.put_
+@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8, torch.int16, torch.bool])
+@pytest.mark.parametrize(
+    "layout",
+    ["transpose", "slice", "narrow_perm", "row_slice"],
+)
+def test_put__non_contiguous_narrow_accumulate(dtype, layout):
+    """Non-contiguous narrow int/bool under ``accumulate=True``.
+
+    These dtypes accumulate through an int32 staging buffer because Triton has
+    no atomic for them. ``put_`` indexes ``self`` by its row-major *logical*
+    flattening, so both the widen (reading ``self``) and the narrow (writing it
+    back) must decode that flat offset against the real strides -- staging a
+    strided ``self`` as if it were contiguous corrupts exactly the indexed
+    elements.
+    """
+    utils.init_seed(0)
+    base = _gen_typed((16, 24), dtype, flag_gems.device)
+    inp = {
+        "transpose": lambda t: t.t(),
+        "slice": lambda t: t[:, ::2],
+        "narrow_perm": lambda t: t[3:11, 2:18].t(),
+        "row_slice": lambda t: t[::2],
+    }[layout](base)
+    assert not inp.is_contiguous()
+    ref_inp = utils.to_reference(inp.clone())
+
+    numel = inp.numel()
+    index = torch.randint(
+        0, numel, (numel * 3,), dtype=torch.int64, device=flag_gems.device
+    )
+    source = _gen_typed((index.numel(),), dtype, flag_gems.device)
+
+    ref_inp.put_(utils.to_reference(index), utils.to_reference(source), accumulate=True)
+    res = flag_gems.put_(inp, index, source, accumulate=True)
+
+    assert res is inp
+    utils.gems_assert_equal(inp, ref_inp)
+
+
+@pytest.mark.put_
 @pytest.mark.parametrize("shape", [(64,), (64, 64)])
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_put__index_source_diff_shapes(shape, dtype):
