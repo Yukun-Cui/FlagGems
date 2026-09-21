@@ -173,6 +173,12 @@ def histogramdd_col_range_kernel(
 
     acc_min = tl.full((BLOCK_N,), float("inf"), dtype=ACC_DTYPE)
     acc_max = tl.full((BLOCK_N,), float("-inf"), dtype=ACC_DTYPE)
+    # Whether each column has seen a NaN anywhere. Tracked separately from the
+    # min/max accumulators so the NaN state is never carried through a float
+    # reduction: ``tl.min``/``tl.max``/``tl.minimum``/``tl.maximum`` all lower
+    # to fmin/fmax, which *ignore* a NaN operand, so a NaN folded into the
+    # accumulator would simply be dropped by the identity +inf/-inf.
+    nan_seen = tl.zeros((BLOCK_N,), dtype=tl.int1)
 
     for row_base in range(0, M, BLOCK_M):
         rows = row_base + tl.arange(0, BLOCK_M)
@@ -182,10 +188,19 @@ def histogramdd_col_range_kernel(
             mask=row_mask[:, None] & col_mask[None, :],
             other=float("nan"),
         ).to(ACC_DTYPE)
-        # minimum/maximum propagate NaN, matching aminmax, so a column holding a
-        # NaN yields a NaN range rather than silently ignoring the value.
+        # Covariant with ``aminmax``: a column holding a NaN gets a NaN range,
+        # not the min/max of the remaining values. The masked-off lanes carry
+        # NaN as well but are not part of the data, hence the ``row_mask``.
+        nan_seen = nan_seen | (
+            tl.sum((row_mask[:, None] & (vals != vals)).to(tl.int32), axis=0) > 0
+        )
         acc_min = tl.minimum(acc_min, tl.min(vals, axis=0))
         acc_max = tl.maximum(acc_max, tl.max(vals, axis=0))
+
+    # A NaN column's range is NaN in both bounds; NaN == NaN is false, so the
+    # degenerate-range expansion below leaves it alone, exactly as ATen does.
+    acc_min = tl.where(nan_seen, float("nan"), acc_min)
+    acc_max = tl.where(nan_seen, float("nan"), acc_max)
 
     # A dimension whose min equals max is expanded, as torch.histogramdd does.
     same = acc_min == acc_max
@@ -351,6 +366,16 @@ def histogramdd_log_volume_kernel(
     tl.store(sign_ptr, tl.where(negatives % 2 == 0, 1.0, -1.0).to(ACC_DTYPE))
 
 
+def _format_bound(value):
+    """Format a range bound the way ATen's range messages do.
+
+    ATen uses the default C++ stream formatting, which is ``%g`` (six
+    significant digits, scientific notation outside a fixed exponent window),
+    so ``0.123456789`` prints as ``0.123457`` and ``1e7`` as ``1e+07``.
+    """
+    return "%g" % value
+
+
 def _resolve_range(inp, range_, N, acc_dtype):
     """Return (lefts, rights) tensors of shape (N,) on the input device.
 
@@ -371,6 +396,16 @@ def _resolve_range(inp, range_, N, acc_dtype):
                 f"torch.histogramdd: for a {N}-dimensional histogram range should "
                 f"have {2 * N} elements, but got {len(rng)}"
             )
+        # ATen validates the explicit range per dimension and rejects an
+        # inverted one instead of silently returning an all-zero histogram.
+        for d in range(N):
+            lo, hi = rng[2 * d], rng[2 * d + 1]
+            if lo > hi:
+                raise RuntimeError(
+                    f"torch.histogramdd: min should not exceed max, but got "
+                    f"min {_format_bound(lo)} max {_format_bound(hi)} for "
+                    f"dimension {d}"
+                )
         lefts = torch.tensor(rng[0::2], dtype=torch.float64, device=inp.device)
         rights = torch.tensor(rng[1::2], dtype=torch.float64, device=inp.device)
         return lefts, rights
@@ -398,7 +433,29 @@ def _resolve_range(inp, range_, N, acc_dtype):
             BLOCK_M=128,
             BLOCK_N=BLOCK_N,
         )
+    # A NaN or +-Inf anywhere in a column makes its auto-range non-finite, and
+    # ATen refuses to build edges from that instead of silently returning a
+    # garbage histogram. The reduction above runs on the device, so the check
+    # is a single synchronising read of the N lefts/rights.
+    _check_finite_auto_range(lefts, rights, N)
     return lefts, rights
+
+
+def _check_finite_auto_range(lefts, rights, N):
+    """Reject a non-finite auto-range, with ATen's message.
+
+    The bound is printed for the offending dimension, so the failing index has
+    to be found before raising; ``%g`` reproduces ATen's formatting.
+    """
+    finite = torch.isfinite(lefts) & torch.isfinite(rights)
+    if bool(finite.all()):
+        return
+    dim = int((~finite).nonzero()[0].item())
+    raise RuntimeError(
+        f"torch.histogramdd: dimension {dim}'s range "
+        f"[{_format_bound(lefts[dim].item())}, {_format_bound(rights[dim].item())}] "
+        "is not finite"
+    )
 
 
 def _histogramdd_from_bin_cts_impl(

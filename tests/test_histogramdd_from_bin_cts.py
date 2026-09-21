@@ -225,6 +225,88 @@ def test_histogramdd_from_bin_cts_empty_input():
     _assert_close(res_out, ref_out, torch.float32)
 
 
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize(
+    "range_",
+    [
+        [1.5, -0.5, 0.0, 1.0],  # dimension 0 inverted
+        [0.0, 1.0, 1.5, -0.5],  # dimension 1 inverted
+        [0.0, 1.0, 1.5, -0.5, 0.0, 1.0],  # inverted in a 3-D range
+    ],
+)
+def test_histogramdd_from_bin_cts_rejects_inverted_range(range_):
+    """An inverted explicit range must raise, not return an all-zero histogram.
+
+    ATen validates ``left <= right`` per dimension and reports
+    'min should not exceed max, but got min <lo> max <hi> for dimension <d>'.
+    """
+    ndim = len(range_) // 2
+    inp = torch.randn(8, ndim, dtype=torch.float32, device=flag_gems.device)
+    ref_inp = _to_cpu_ref(inp)
+
+    with pytest.raises(RuntimeError) as ref_err:
+        torch._histogramdd_from_bin_cts(ref_inp, [3] * ndim, range=range_)
+
+    with pytest.raises(RuntimeError) as res_err:
+        flag_gems._histogramdd_from_bin_cts(inp, [3] * ndim, range=range_)
+
+    assert str(res_err.value) == str(ref_err.value)
+    assert "min should not exceed max" in str(res_err.value)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+def test_histogramdd_from_bin_cts_range_bound_formatting():
+    """Bounds are printed with ATen's ``%g`` formatting (six significant digits)."""
+    inp = torch.randn(8, 2, dtype=torch.float32, device=flag_gems.device)
+    ref_inp = _to_cpu_ref(inp)
+    range_ = [0.123456789, -0.5, 0.0, 1.0]
+
+    with pytest.raises(RuntimeError) as ref_err:
+        torch._histogramdd_from_bin_cts(ref_inp, [3, 3], range=range_)
+    with pytest.raises(RuntimeError) as res_err:
+        flag_gems._histogramdd_from_bin_cts(inp, [3, 3], range=range_)
+
+    assert "min 0.123457 max -0.5" in str(res_err.value)
+    assert str(res_err.value) == str(ref_err.value)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("row", [0, 150, 299])
+def test_histogramdd_from_bin_cts_auto_range_must_be_finite(bad, row):
+    """A non-finite auto-range must raise like ATen.
+
+    With ``range=None`` the range comes from the data's per-dimension min/max,
+    so a NaN or +-Inf anywhere makes it non-finite. ATen raises
+    "dimension <d>'s range [<lo>, <hi>] is not finite" rather than building a
+    histogram from a garbage range. Reaching the failing row also exercises the
+    cross-tile NaN propagation in the range kernel (BLOCK_M is 128 rows).
+    """
+    inp = torch.randn(300, 3, dtype=torch.float32, device=flag_gems.device)
+    inp[row, 1] = bad
+    ref_inp = _to_cpu_ref(inp)
+
+    with pytest.raises(RuntimeError) as ref_err:
+        torch._histogramdd_from_bin_cts(ref_inp, [3, 3, 3])
+
+    with pytest.raises(RuntimeError) as res_err:
+        flag_gems._histogramdd_from_bin_cts(inp, [3, 3, 3])
+
+    assert str(res_err.value) == str(ref_err.value)
+    assert "is not finite" in str(res_err.value)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+def test_histogramdd_from_bin_cts_finite_auto_range_unchanged():
+    """The finiteness check must not reject ordinary finite data."""
+    inp = torch.randn(300, 3, dtype=torch.float32, device=flag_gems.device)
+    ref_inp = _to_cpu_ref(inp)
+
+    ref_out = torch._histogramdd_from_bin_cts(ref_inp, [3, 3, 3])
+    res_out = flag_gems._histogramdd_from_bin_cts(inp, [3, 3, 3])
+    _assert_close(res_out, ref_out, torch.float32)
+
+
 # ---------------------------------------------------------------------------
 # Out variant: aten::_histogramdd_from_bin_cts.out
 # ---------------------------------------------------------------------------
