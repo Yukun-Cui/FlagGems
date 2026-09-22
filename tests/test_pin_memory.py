@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import flag_gems
+from flag_gems import _FULL_CONFIG
 
 from . import accuracy_utils as utils
 
@@ -42,3 +43,18 @@ def test_pin_memory(shape, dtype):
 
     # Verify content matches
     utils.gems_assert_equal(res_out, ref_out)
+
+
+@pytest.mark.pin_memory
+def test_pin_memory_registered_on_composite_key():
+    """``pin_memory`` must be registered under CompositeImplicitAutograd.
+
+    The native op is a math kernel that decomposes into ``_pin_memory`` before
+    reaching any backend key, so the composite key is the only place the
+    registration can take effect. The accuracy test above calls the
+    implementation directly and passes regardless of the key.
+    """
+    entry = next(e for e in _FULL_CONFIG if e[0] == "pin_memory")
+
+    assert len(entry) == 4, "pin_memory needs an explicit dispatch key list"
+    assert list(entry[3]) == ["CompositeImplicitAutograd"]

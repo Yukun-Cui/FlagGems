@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import flag_gems
+from flag_gems import _FULL_CONFIG
 
 from . import accuracy_utils as utils
 
@@ -37,3 +38,19 @@ def test__pin_memory(shape, dtype):
 
     assert res_out.is_pinned()
     utils.gems_assert_equal(res_out, ref_out)
+
+
+@pytest.mark.underscore_pin_memory
+def test__pin_memory_registered_on_cpu_key():
+    """``_pin_memory`` must be registered under the CPU dispatch key.
+
+    Its input is always a CPU tensor and the native op is
+    CompositeExplicitAutograd, so it dispatches on CPU rather than on the
+    accelerator key. Registering it under the backend key leaves the native
+    kernel in charge and the impl never runs. The accuracy test above calls the
+    implementation directly, so it passes either way and cannot catch this.
+    """
+    entry = next(e for e in _FULL_CONFIG if e[0] == "_pin_memory")
+
+    assert len(entry) == 4, "_pin_memory needs an explicit dispatch key list"
+    assert list(entry[3]) == ["CPU"]
