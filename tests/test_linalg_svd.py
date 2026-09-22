@@ -4,6 +4,7 @@ import torch
 import flag_gems
 
 from . import accuracy_utils as utils
+from . import conftest as cfg
 
 
 def _make_spectrum_input(shape, singular_values, seed=0):
@@ -326,6 +327,9 @@ def test__linalg_svd_orthonormal(shape, dtype):
 
 
 @pytest.mark.underscore_linalg_svd
+@pytest.mark.skipif(
+    cfg.TO_CPU, reason="the driver= contract is CUDA-only; a CPU reference rejects all"
+)
 @pytest.mark.parametrize("driver", ["gesvd", "gesvda", "gesdd", "bogus", "", "GESVD"])
 def test__linalg_svd_driver(driver):
     """The ``driver`` argument is validated like native, though it is otherwise unused.
@@ -335,6 +339,11 @@ def test__linalg_svd_driver(driver):
     driver. The Triton kernels have no driver concept, so a valid driver only
     has to be accepted; silently dropping an *invalid* one would compute a
     result where native raises.
+
+    The expected outcome depends on the device the reference runs on, so this
+    cannot be checked against a CPU reference: the CPU backend rejects the
+    ``driver=`` keyword itself ("only supported on CUDA inputs with cuSOLVER")
+    for *every* value, including the two that are valid on CUDA.
     """
     inp = torch.randn(8, 8, dtype=torch.float32, device=flag_gems.device)
     ref_inp = utils.to_reference(inp, False)
