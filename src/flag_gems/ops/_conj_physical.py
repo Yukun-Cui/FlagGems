@@ -16,91 +16,135 @@
 import logging
 
 import torch
-import triton
-import triton.language as tl
 
-from flag_gems import runtime
-from flag_gems.utils import libentry, libtuner
+from flag_gems.ops.conj_physical import launch_conj_physical
+from flag_gems.ops.copy import copy_
 
 logger = logging.getLogger(__name__)
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("_conj_physical"),
-    key=["n_elements"],
-)
-@triton.jit
-def _conj_physical_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+def _resolved(input: torch.Tensor) -> torch.Tensor:
+    """Return a tensor whose stored values equal ``input``'s logical values.
 
-    # Complex numbers are stored as interleaved real/imaginary pairs
-    # (real, imag, real, imag, ...); each complex element spans 2 float slots.
-    base = offsets * 2
-    real = tl.load(in_ptr + base, mask=mask)
-    imag = tl.load(in_ptr + base + 1, mask=mask)
+    A tensor carrying the conjugate bit stores ``conj(logical)``, and
+    ``_conj_physical`` conjugates the *logical* value, so the bit has to be
+    materialized before the kernel reads raw storage. FlagGems' own ``copy_``
+    already resolves the bit while copying, so this needs no native
+    ``resolve_conj``.
+    """
+    if not input.is_conj():
+        return input
 
-    # Conjugate: real part unchanged, imaginary part negated.
-    tl.store(out_ptr + base, real, mask=mask)
-    tl.store(out_ptr + base + 1, -imag, mask=mask)
+    resolved = torch.empty_like(input)
+    if resolved.numel() != 0:
+        copy_(resolved, input)
+    return resolved
+
+
+def _materialize(input: torch.Tensor) -> torch.Tensor:
+    """Copy ``input`` into a fresh tensor with the layout ATen would produce.
+
+    For a non-complex input the conjugate is the value itself, but ATen's
+    ``_conj_physical`` still returns a newly allocated tensor, so the values
+    have to be copied rather than aliased. ``empty_like`` defaults to
+    ``preserve_format``, the same rule ATen applies: dense inputs (including
+    channels-last) keep their strides, while non-dense ones (gappy slices,
+    expanded views) come back contiguous.
+    """
+    out = torch.empty_like(input)
+    if out.numel() != 0:
+        copy_(out, input)
+    return out
 
 
 def _conj_physical(input: torch.Tensor) -> torch.Tensor:
     logger.debug("GEMS _CONJ_PHYSICAL")
+    input = _resolved(input)
+
     if not input.is_complex():
-        return input
+        # Unlike the public `conj_physical`, which may return `input` itself,
+        # ATen's `_conj_physical` always hands back a new tensor. Returning the
+        # input would alias it and break that contract.
+        return _materialize(input)
 
-    # If input has the conjugate bit set, resolve it first so view_as_real
-    # won't crash on unresolved conjugated tensors.
-    if input.is_conj():
-        input = input.resolve_conj()
-
-    n_elements = input.numel()
+    # Allocate from the *original* input so the layout is preserved; building
+    # the output from a contiguous temporary would force channels-last and other
+    # dense-but-strided inputs into the default contiguous layout.
+    output = torch.empty_like(input)
     src = input if input.is_contiguous() else input.contiguous()
-    output = torch.empty_like(src)
-    in_real_ptr = torch.view_as_real(src)
-    out_real_ptr = torch.view_as_real(output)
 
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-
-    _conj_physical_kernel[grid](in_real_ptr, out_real_ptr, n_elements)
+    if output.is_contiguous():
+        launch_conj_physical(src, output)
+    else:
+        # The kernel walks a flat interleaved float stream, so it needs a
+        # contiguous destination; conjugate into a temporary and restride via
+        # the FlagGems copy.
+        tmp = torch.empty_like(src)
+        launch_conj_physical(src, tmp)
+        if tmp.numel() != 0:
+            copy_(output, tmp)
 
     return output
 
 
 def _conj_physical_out(input: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
     logger.debug("GEMS _CONJ_PHYSICAL_OUT")
+    _check_out(out, input)
+
+    # ATen resizes a mismatched `out`; this is metadata-only.
+    if tuple(out.shape) != tuple(input.shape):
+        out.resize_(input.shape)
+
+    input = _resolved(input)
+
     if not input.is_complex():
-        # Non-complex input is identity; copy into out when requested.
-        if out is not None:
-            return out.copy_(input)
-        return input
+        if out.numel() != 0:
+            copy_(out, input)
+        return out
 
-    if input.is_conj():
-        input = input.resolve_conj()
-
-    if out is not None:
-        if out.dtype != input.dtype:
-            raise RuntimeError(
-                f"_conj_physical expected out dtype {input.dtype}, but got {out.dtype}"
-            )
-        if out.shape != input.shape:
-            out.resize_(input.shape)
-        output = out if out.is_contiguous() else torch.empty_like(input)
-    else:
-        output = torch.empty_like(input)
-
-    n_elements = input.numel()
     src = input if input.is_contiguous() else input.contiguous()
-    in_real_ptr = torch.view_as_real(src)
-    out_real_ptr = torch.view_as_real(output)
 
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    if out.is_contiguous():
+        launch_conj_physical(src, out)
+    else:
+        # `out` may be an arbitrary strided view (ATen accepts those and writes
+        # through them), which the flat kernel cannot address directly.
+        tmp = torch.empty_like(src)
+        launch_conj_physical(src, tmp)
+        if tmp.numel() != 0:
+            copy_(out, tmp)
 
-    _conj_physical_kernel[grid](in_real_ptr, out_real_ptr, n_elements)
+    return out
 
-    if out is not None and output is not out:
-        out.copy_(output)
-    return out if out is not None else output
+
+def _check_out(out: torch.Tensor, input: torch.Tensor) -> None:
+    """Validate ``out`` the way ATen's structured-kernel wrapper does."""
+    if out.dtype != input.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {_dtype_name(input.dtype)}, "
+            f"but got {_dtype_name(out.dtype)} instead"
+        )
+    if out.device != input.device:
+        raise RuntimeError(
+            f"Expected out tensor to have device {input.device}, "
+            f"but got {out.device} instead"
+        )
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    """Spell a dtype the way ATen's `out=` dtype check does (TypeName, not ScalarType)."""
+    names = {
+        torch.float32: "float",
+        torch.float64: "double",
+        torch.float16: "c10::Half",
+        torch.bfloat16: "c10::BFloat16",
+        torch.complex64: "c10::complex<float>",
+        torch.complex128: "c10::complex<double>",
+        torch.uint8: "unsigned char",
+        torch.int8: "signed char",
+        torch.int16: "short",
+        torch.int32: "int",
+        torch.int64: "long int",
+        torch.bool: "bool",
+    }
+    return names.get(dtype, str(dtype))
