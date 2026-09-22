@@ -61,7 +61,17 @@ def _assert_weighted_close(res, ref, dtype, num_points):
     difference while keeping the relative tolerance tight for large bins.
     """
     reduce_dim = num_points
-    atol = 1e-4 if dtype == torch.float32 else 1e-3
+    if dtype == torch.float32:
+        atol = 1e-4
+    else:
+        # The difference tracks the magnitude of each bin sum rather than the
+        # point count: measured over 200 trials per configuration, the largest
+        # bin is off by <= 0.2% (float16) and <= 2% (bfloat16) across point
+        # counts from 64 to 1000, i.e. roughly 2 * eps(dtype) either way. A flat
+        # atol is too tight for the biggest bins (a float16 bin summing to ~53
+        # is off by 0.09), so scale it by the reference's largest magnitude.
+        largest = ref.abs().max().item() if ref.numel() else 0.0
+        atol = max(1e-3, 4.0 * torch.finfo(dtype).eps * max(largest, 1.0))
     utils.gems_assert_close(res.to("cpu"), ref, dtype, reduce_dim=reduce_dim, atol=atol)
 
 
@@ -158,6 +168,63 @@ def test_histogramdd_from_bin_tensors_non_uniform_bins():
     res_out = flag_gems._histogramdd_from_bin_tensors(inp, bins)
 
     utils.gems_assert_close(res_out.to("cpu"), ref_out, torch.float32)
+
+
+@pytest.mark.histogramdd_from_bin_tensors
+@pytest.mark.parametrize("num_edges", [1025, 2001, 5001])
+def test_histogramdd_from_bin_tensors_many_bins(num_edges):
+    """A dimension with many bins must compile and count correctly.
+
+    The per-dimension comparison is a (points x edges) broadcast, and a Triton
+    tensor may hold at most 2**20 elements, so a dimension with >= ~1024 bins
+    exceeds that limit and the kernel fails to compile. The edge axis is walked
+    in slabs instead; this covers the boundary and a few larger sizes.
+    """
+    inp = torch.rand(400, 1, dtype=torch.float64, device=flag_gems.device)
+    bins = (
+        torch.linspace(
+            0.0, 1.0, num_edges, dtype=torch.float64, device=flag_gems.device
+        ),
+    )
+
+    ref_out = _ref_histogramdd(inp, bins)
+    res_out = flag_gems._histogramdd_from_bin_tensors(inp, bins)
+
+    # Exact integer counts: the comparison is against the CPU reference, which
+    # assigns bins with the same edges.
+    assert torch.equal(res_out.to("cpu").double(), ref_out.double())
+
+
+@pytest.mark.histogramdd_from_bin_tensors
+def test_histogramdd_from_bin_tensors_many_bins_multidim():
+    """The per-dimension slab loop composes with other dimensions."""
+    inp = torch.rand(300, 2, dtype=torch.float32, device=flag_gems.device)
+    bins = (
+        torch.linspace(0.0, 1.0, 1501, device=flag_gems.device),
+        torch.linspace(0.0, 1.0, 8, device=flag_gems.device),
+    )
+
+    ref_out = _ref_histogramdd(inp, bins)
+    res_out = flag_gems._histogramdd_from_bin_tensors(inp, bins)
+
+    assert torch.equal(res_out.to("cpu"), ref_out)
+
+
+@pytest.mark.histogramdd_from_bin_tensors
+def test_histogramdd_from_bin_tensors_many_bins_density_weighted():
+    """The slab loop must not change the weighted/density reductions."""
+    inp = torch.rand(400, 1, dtype=torch.float64, device=flag_gems.device)
+    bins = (
+        torch.linspace(0.0, 1.0, 2001, dtype=torch.float64, device=flag_gems.device),
+    )
+    weight = torch.rand(400, dtype=torch.float64, device=flag_gems.device)
+
+    ref_out = _ref_histogramdd(inp, bins, weight=weight, density=True)
+    res_out = flag_gems._histogramdd_from_bin_tensors(
+        inp, bins, weight=weight, density=True
+    )
+
+    utils.gems_assert_close(res_out.to("cpu"), ref_out, torch.float64, atol=1e-10)
 
 
 @pytest.mark.histogramdd_from_bin_tensors

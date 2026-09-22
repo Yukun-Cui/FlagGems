@@ -34,7 +34,7 @@ def histogramdd_from_bin_tensors_kernel(
     out_strides,  # tl.constexpr tuple of ints, one per dim
     bin_counts,  # tl.constexpr tuple of ints, one per dim
     edge_ptrs,  # tl.constexpr tuple of pointers, one per dim
-    EDGE_BLOCK: tl.constexpr,
+    EDGE_CHUNK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     D_CONST: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
@@ -60,8 +60,6 @@ def histogramdd_from_bin_tensors_kernel(
     valid = mask
     out_index = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
 
-    e_offs = tl.arange(0, EDGE_BLOCK)
-
     for d in tl.static_range(D_CONST):
         bin_count_d = bin_counts[d]
         stride_d = out_strides[d]
@@ -78,15 +76,20 @@ def histogramdd_from_bin_tensors_kernel(
         coord = tl.load(in_ptr + offsets * D_CONST + d, mask=mask, other=0.0).to(
             ACC_DTYPE
         )
-        # Load (padded) edges for this dimension.  Padding edges are +inf so
-        # they never satisfy ``edges <= coord`` and do not affect le_count.
-        e_mask = e_offs < bin_count_d
-        edges = tl.load(edge_ptr_d + e_offs, mask=e_mask, other=float("inf")).to(
-            ACC_DTYPE
-        )
-        # Count edges <= coord for every point (broadcast points x edges).
-        le = (edges[None, :] <= coord[:, None]).to(tl.int64)
-        le_count = tl.sum(le, axis=1)
+        # Load (padded) edges for this dimension and count how many are <= the
+        # coordinate. The comparison is a (points x edges) broadcast, which
+        # exceeds Triton's maximum tensor numel (2**20) as soon as a dimension
+        # has ~1024 bins, so the edge axis is walked in EDGE_CHUNK-wide slabs
+        # and the counts are accumulated. Padding edges are +inf so they never
+        # satisfy ``edges <= coord`` and do not affect le_count.
+        le_count = tl.zeros((BLOCK_SIZE,), dtype=tl.int64)
+        for e_base in range(0, bin_count_d, EDGE_CHUNK):
+            e_offs = e_base + tl.arange(0, EDGE_CHUNK)
+            e_mask = e_offs < bin_count_d
+            edges = tl.load(edge_ptr_d + e_offs, mask=e_mask, other=float("inf")).to(
+                ACC_DTYPE
+            )
+            le_count += tl.sum((edges[None, :] <= coord[:, None]).to(tl.int64), axis=1)
         # Each bin i covers [edges[i], edges[i+1]); the rightmost bin also
         # includes its right edge.  For a coordinate in [edges[i], edges[i+1])
         # exactly i+1 edges are <= coord, so the bin index is le_count - 1.
@@ -228,11 +231,16 @@ def _run_histogram(self, bins, weight, density, out):
     else:
         acc = torch.zeros(out_shape, dtype=acc_dtype, device=self.device)
 
-    max_edges = max(bin_counts) if bin_counts else 1
-    edge_block = triton.next_power_of_2(max(2, max_edges))
     # One program per point-tile; 1024 points amortizes launch overhead while
     # keeping occupancy high for typical point-cloud sizes.
     BLOCK_SIZE = 1024
+    # The per-dimension edge comparison is a (points x edges) broadcast, and a
+    # tensor may hold at most 2**20 elements, so the edge axis has to be
+    # walked in slabs for any dimension with more than a few hundred bins. A
+    # wider slab would shrink the loop for large bin counts but risk exceeding
+    # the limit for the smaller blocks that do not need chunking at all, so the
+    # slab is capped at the largest power of two that always fits.
+    EDGE_CHUNK = min(1024, 2**20 // BLOCK_SIZE)
     grid = (triton.cdiv(M, BLOCK_SIZE),)
 
     if M > 0:
@@ -244,7 +252,7 @@ def _run_histogram(self, bins, weight, density, out):
             out_strides=tuple(acc.stride()),
             bin_counts=tuple(bin_counts),
             edge_ptrs=tuple(edges),
-            EDGE_BLOCK=edge_block,
+            EDGE_CHUNK=EDGE_CHUNK,
             BLOCK_SIZE=BLOCK_SIZE,
             D_CONST=D,
             HAS_WEIGHT=has_weight,
