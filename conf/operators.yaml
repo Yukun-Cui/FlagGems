@@ -12199,7 +12199,7 @@ ops:
   kind:
   - NeuralNetwork
   stages:
-  - alpha: '5.4'
+  - alpha: '5.5'
 - id: quantized_batch_norm_out
   description: |
     A variant of quantized_batch_norm() that writes the result into the out tensor.
