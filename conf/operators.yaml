@@ -39,7 +39,7 @@ ops:
   kind:
   - Reduction
   stages:
-  - alpha: '5.4'
+  - alpha: '5.5'
 - id: _aminmax_out
   description: 'A variant of _aminmax() that writes the result into the out tensor.
 
@@ -52,7 +52,7 @@ ops:
   kind:
   - Reduction
   stages:
-  - alpha: '5.4'
+  - alpha: '5.5'
 - id: _flash_attention_forward
   description: Run the canonical FlashAttention forward operator.
   for:
