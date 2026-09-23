@@ -13211,7 +13211,7 @@ ops:
   kind:
   - Math
   stages:
-  - alpha: '5.4'
+  - alpha: '5.5'
 - id: row_stack
   description: |
     Stack tensors in sequence vertically (row wise). Alias of vstack.
