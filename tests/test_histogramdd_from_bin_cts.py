@@ -307,6 +307,144 @@ def test_histogramdd_from_bin_cts_finite_auto_range_unchanged():
     _assert_close(res_out, ref_out, torch.float32)
 
 
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("col", [0, 1, 2])
+def test_histogramdd_from_bin_cts_auto_range_reports_lowest_dimension(bad, col):
+    """The reported dimension is the lowest offending one, not just any of them.
+
+    The non-finite flag is written by the range kernel (a per-column reduction
+    plus an atomic min), so a regression that reported the wrong column -- the
+    last one, or a tile-local one -- would still raise, but with the wrong
+    dimension in the message. Poisoning two columns at once pins the ordering.
+    """
+    inp = torch.randn(64, 3, dtype=torch.float32, device=flag_gems.device)
+    for c in range(col, 3):
+        inp[0, c] = bad
+    ref_inp = _to_cpu_ref(inp)
+
+    with pytest.raises(RuntimeError) as ref_err:
+        torch._histogramdd_from_bin_cts(ref_inp, [3, 3, 3])
+    with pytest.raises(RuntimeError) as res_err:
+        flag_gems._histogramdd_from_bin_cts(inp, [3, 3, 3])
+
+    assert f"dimension {col}'s range" in str(res_err.value)
+    assert str(res_err.value) == str(ref_err.value)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize("nbins", [1, 2, 3, 4, 5, 7, 10])
+def test_histogramdd_from_bin_cts_zero_width_explicit_range(nbins):
+    """An explicit zero-width range is widened, not folded into the last bin.
+
+    ATen expands a degenerate range before building the edges ("Expand empty
+    range to match numpy behavior and avoid division by 0 in normalization"), so
+    ``range=[1.0, 1.0]`` behaves like the degenerate auto-range case: the edges
+    become ``linspace(0.5, 1.5, nbins + 1)`` and a point at exactly 1.0 lands in
+    the middle bin (``nbins // 2``) rather than the last one. The neighbouring
+    point at 5.0 is outside the widened range and must stay uncounted.
+    """
+    pts = torch.tensor(
+        [[1.0], [1.0], [5.0]], dtype=torch.float32, device=flag_gems.device
+    )
+    ref_inp = _to_cpu_ref(pts)
+
+    ref_out = torch._histogramdd_from_bin_cts(ref_inp, [nbins], range=[1.0, 1.0])
+    res_out = flag_gems._histogramdd_from_bin_cts(pts, [nbins], range=[1.0, 1.0])
+
+    # Counts are integers, so this must agree exactly, not approximately.
+    utils.gems_assert_equal(res_out.to(ref_out.device), ref_out)
+    assert res_out.sum().item() == 2.0, "the out-of-range point must stay uncounted"
+    assert res_out[nbins // 2].item() == 2.0, "the points at 1.0 share the middle bin"
+
+
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize(
+    "range_,dim",
+    [
+        ([float("inf"), float("inf")], 0),
+        ([float("-inf"), float("inf")], 0),
+        ([float("nan"), 1.0], 0),
+        ([0.0, 1.0, float("inf"), 1.0], 1),
+        ([0.0, 1.0, 1.0, float("-inf")], 1),
+    ],
+)
+def test_histogramdd_from_bin_cts_rejects_non_finite_explicit_range(range_, dim):
+    """An explicit non-finite bound must raise, like the auto-range case.
+
+    ATen applies the same finiteness check to a caller-supplied ``range``, and it
+    runs *before* the ``min <= max`` check: ``[inf, -inf]`` reports "is not
+    finite" rather than "min should not exceed max".
+    """
+    ndim = len(range_) // 2
+    inp = torch.randn(8, ndim, dtype=torch.float32, device=flag_gems.device)
+    ref_inp = _to_cpu_ref(inp)
+
+    with pytest.raises(RuntimeError) as ref_err:
+        torch._histogramdd_from_bin_cts(ref_inp, [3] * ndim, range=range_)
+    with pytest.raises(RuntimeError) as res_err:
+        flag_gems._histogramdd_from_bin_cts(inp, [3] * ndim, range=range_)
+
+    assert str(res_err.value) == str(ref_err.value)
+    assert f"dimension {dim}'s range" in str(res_err.value)
+    assert "is not finite" in str(res_err.value)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+def test_histogramdd_from_bin_cts_finite_check_precedes_min_max():
+    """The finiteness error wins over the inverted-range error, as in ATen."""
+    inp = torch.randn(8, dtype=torch.float32, device=flag_gems.device).reshape(-1, 1)
+    ref_inp = _to_cpu_ref(inp)
+    range_ = [float("inf"), float("-inf")]
+
+    with pytest.raises(RuntimeError) as ref_err:
+        torch._histogramdd_from_bin_cts(ref_inp, [3], range=range_)
+    with pytest.raises(RuntimeError) as res_err:
+        flag_gems._histogramdd_from_bin_cts(inp, [3], range=range_)
+
+    assert "is not finite" in str(res_err.value)
+    assert "min should not exceed max" not in str(res_err.value)
+    assert str(res_err.value) == str(ref_err.value)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+@pytest.mark.parametrize("nbins", [4, 5, 7])
+def test_histogramdd_from_bin_cts_zero_width_explicit_range_2d(nbins):
+    """One degenerate dimension must not disturb the other dimension's binning."""
+    pts = torch.tensor(
+        [[1.0, 0.0], [1.0, 0.5], [1.0, 0.5], [1.0, 1.0]],
+        dtype=torch.float32,
+        device=flag_gems.device,
+    )
+    ref_inp = _to_cpu_ref(pts)
+    range_ = [1.0, 1.0, 0.0, 1.0]
+
+    ref_out = torch._histogramdd_from_bin_cts(ref_inp, [nbins, 4], range=range_)
+    res_out = flag_gems._histogramdd_from_bin_cts(pts, [nbins, 4], range=range_)
+    utils.gems_assert_equal(res_out.to(ref_out.device), ref_out)
+
+
+@pytest.mark.histogramdd_from_bin_cts
+def test_histogramdd_from_bin_cts_zero_width_edges_match_linspace():
+    """The widened edges themselves must match ATen's ``linspace(lo-.5, hi+.5)``.
+
+    Placement is by exact comparison against the edges, so a point on the widened
+    boundaries is the sensitive probe: 0.5 and 1.5 are *inside* ATen's range for
+    ``range=[1.0, 1.0]`` even though they are outside the caller's nominal range.
+    """
+    nbins = 8
+    edges = torch.linspace(0.5, 1.5, nbins + 1, dtype=torch.float32)
+    probes = edges.tolist() + [edges[0].item() - 0.5, edges[-1].item() + 0.5]
+    pts = torch.tensor(probes, dtype=torch.float32, device=flag_gems.device).reshape(
+        -1, 1
+    )
+    ref_inp = _to_cpu_ref(pts)
+
+    ref_out = torch._histogramdd_from_bin_cts(ref_inp, [nbins], range=[1.0, 1.0])
+    res_out = flag_gems._histogramdd_from_bin_cts(pts, [nbins], range=[1.0, 1.0])
+    utils.gems_assert_equal(res_out.to(ref_out.device), ref_out)
+
+
 # ---------------------------------------------------------------------------
 # Out variant: aten::_histogramdd_from_bin_cts.out
 # ---------------------------------------------------------------------------
