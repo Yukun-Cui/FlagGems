@@ -10281,7 +10281,7 @@ ops:
   kind:
   - Tensor
   stages:
-  - alpha: '5.4'
+  - alpha: '5.5'
 - id: put_out
   description: |
     A variant of `put()` that writes the result into the `out` tensor.
