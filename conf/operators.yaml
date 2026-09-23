@@ -13199,7 +13199,7 @@ ops:
   kind:
   - Math
   stages:
-  - alpha: '5.4'
+  - alpha: '5.5'
 - id: row_indices_copy_out
   description: |
     A variant of row_indices_copy() that writes the result into the out tensor.
