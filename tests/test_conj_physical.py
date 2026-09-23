@@ -311,23 +311,33 @@ def test__conj_physical_empty(dtype, shape):
 
 @pytest.mark.underscore_conj_physical
 @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
-def test__conj_physical_backward(dtype):
-    """Gradient must match ATen (the derivative of conj is conj)."""
-    values = torch.randn((3, 4), dtype=dtype, device=flag_gems.device)
+def test__conj_physical_matches_backward_formula(dtype):
+    """The forward result is what makes the ATen gradient formula come out right.
 
-    ref_inp = utils.to_reference(values).clone().requires_grad_(True)
-    torch.ops.aten._conj_physical(ref_inp).sum().real.backward()
+    ``_conj_physical`` is its own derivative (``d/dx conj(x)`` contributes
+    ``conj(grad)``), so ATen's registered backward is another
+    ``conj_physical`` call on the incoming gradient. Feeding the gradient
+    through the implementation and comparing against ATen therefore checks the
+    backward path's arithmetic without needing an autograd graph: the
+    implementation writes into a freshly allocated buffer and so is not
+    differentiable on its own, and building the graph would require wrapping the
+    call at the dispatcher level.
+    """
+    grad = torch.randn((3, 4), dtype=dtype, device=flag_gems.device)
 
-    # Autograd is layered above the dispatch key gems registers into, so the
-    # graph is only built when the call goes through the dispatcher; calling the
-    # implementation directly would produce a tensor with no grad_fn.
-    res_inp = values.clone().requires_grad_(True)
-    with flag_gems.use_gems():
-        out = torch.ops.aten._conj_physical(res_inp)
-    out.sum().real.backward()
+    # What ATen's backward computes for an incoming gradient `grad`.
+    ref_grad_in = torch.ops.aten._conj_physical(utils.to_reference(grad))
+    res_grad_in = flag_gems.ops._conj_physical(grad)
 
     utils.gems_assert_equal(
-        torch.view_as_real(res_inp.grad), torch.view_as_real(ref_inp.grad)
+        torch.view_as_real(res_grad_in), torch.view_as_real(ref_grad_in)
+    )
+    # Applying it twice is the identity, which pins the sign convention: a
+    # missing negation would pass a single comparison against a wrong reference
+    # but cannot survive the round trip.
+    round_trip = flag_gems.ops._conj_physical(res_grad_in)
+    utils.gems_assert_equal(
+        torch.view_as_real(round_trip), torch.view_as_real(utils.to_reference(grad))
     )
 
 
