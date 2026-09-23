@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 
@@ -528,3 +530,128 @@ def test__logcumsumexp_long_row_fp64():
     assert (
         max_err < 1e-9
     ), f"fp32 accumulation leaked into the chunked fp64 path: {max_err}"
+
+
+# ---------------------------------------------------------------------------
+# Long complex rows must take the chunked *complex* scan (review comment).
+# ---------------------------------------------------------------------------
+
+
+def _wrap_to_pi(delta):
+    """Map an angular difference into (-pi, pi].
+
+    A complex ``log`` returns its argument in (-pi, pi], so two implementations
+    that agree on the value may still print arguments that differ by exactly
+    ``2*pi`` when the true value sits on the branch cut (measured: gem returns
+    ``0.6952714920043945-3.006592273712158j`` where ATen returns the same
+    modulus with ``+3.2765932083129883j``). Comparing the wrapped difference
+    checks the value rather than which side of the cut each rounding chose. This
+    is a property of the ATen contract, not of the chunked path: the identical
+    discrepancy reproduces on the untouched single-block complex kernel.
+    """
+    two_pi = 2.0 * math.pi
+    return (delta + math.pi) % two_pi - math.pi
+
+
+def _assert_complex_scan_close(res_out, ref_out):
+    """Compare a complex scan to ATen, tolerating only the 2*pi branch cut.
+
+    NaNs are compared as a mask (they must appear in the same places); only the
+    entries where both sides are *finite* are checked for value agreement, so an
+    ``inf - inf`` in the difference cannot turn into a spurious NaN.
+    """
+    assert torch.isnan(res_out).equal(torch.isnan(ref_out))
+    both_finite = torch.isfinite(res_out) & torch.isfinite(ref_out)
+    if bool(both_finite.any()):
+        dr = (res_out.real - ref_out.real)[both_finite]
+        di = _wrap_to_pi((res_out.imag - ref_out.imag)[both_finite])
+        # Finite results must agree to fp32 rounding, not merely in branch
+        # structure: 1e-3 still catches the ~9.6 / ~5.5e5 disagreements the real
+        # chunk kernels produce while leaving the fp32 ulp noise an order of
+        # magnitude of room.
+        assert dr.abs().max().item() < 1e-3, "real part diverges from ATen"
+        assert di.abs().max().item() < 1e-3, "imaginary part diverges beyond 2*pi"
+    # Non-finite entries must agree in sign too, which the wrapped difference
+    # above deliberately skips.
+    assert torch.isinf(res_out.real).equal(torch.isinf(ref_out.real))
+    assert torch.isinf(res_out.imag).equal(torch.isinf(ref_out.imag))
+    assert (res_out.real[torch.isinf(res_out.real)] > 0).equal(
+        ref_out.real[torch.isinf(ref_out.real)] > 0
+    )
+    assert (res_out.imag[torch.isinf(res_out.imag)] > 0).equal(
+        ref_out.imag[torch.isinf(ref_out.imag)] > 0
+    )
+
+
+@pytest.mark.underscore_logcumsumexp
+@pytest.mark.parametrize(
+    "shape,dim",
+    [
+        ((5000,), 0),  # just past the single-block limit
+        ((8192,), 0),  # exact chunk boundary
+        ((1, 12288), 1),  # several chunks
+        ((2, 5000, 3), 1),  # K > 1 and a tail chunk
+    ],
+    ids=["past-limit", "chunk-boundary", "several-chunks", "k-gt-1-tail"],
+)
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test__logcumsumexp_long_complex_rows(shape, dim, dtype):
+    """Complex rows past the single-block limit must scan as complex pairs.
+
+    ``out`` is the interleaved ``(..., 2)`` real view on the chunked path, so
+    reusing the *real* chunk kernels there scans each re/im part as an
+    independent real number instead of combining complex pairs -- measured
+    disagreement with ATen was up to 6.283 in the imaginary part (a full 2*pi
+    branch wrap, since the interleaved parts are scanned as separate reals), and
+    values like ``~5.5e5`` for complex128. The chunked path therefore needs its
+    own complex kernels.
+    """
+    if dtype == torch.complex128 and not utils.fp64_is_supported:
+        pytest.skip("complex128 not supported on this device")
+
+    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    ref_inp = utils.to_reference(inp, True)
+
+    ref_out = torch.ops.aten._logcumsumexp(ref_inp, dim)
+    res_out = flag_gems._logcumsumexp(inp, dim)
+
+    assert res_out.shape == ref_out.shape
+    _assert_complex_scan_close(res_out, ref_out.to(res_out.device))
+
+
+@pytest.mark.underscore_logcumsumexp
+@pytest.mark.parametrize(
+    "data",
+    [
+        [complex(float("nan"), 0), complex(1, 0), complex(0, 0)],
+        [complex(float("inf"), 0), complex(float("inf"), 0), complex(0, 0)],
+        [complex(float("-inf"), 0), complex(float("-inf"), 0), complex(0, 0)],
+        [complex(float("-inf"), 0), complex(float("inf"), 0), complex(1, 2)],
+    ],
+)
+def test__logcumsumexp_long_complex_rows_special_values(data):
+    """NaN/+-Inf state must survive the chunked complex path's chunk boundary.
+
+    The chunk totals are taken as the inclusive scan's last lane on both the real
+    and imaginary parts, so a NaN or a branch-selecting infinity has to carry
+    across chunks exactly as it does on the single-block complex path.
+    """
+    n = 8192
+    x = torch.tensor(
+        (data * (n // len(data) + 1))[:n],
+        dtype=torch.complex64,
+        device=flag_gems.device,
+    )
+    ref_x = utils.to_reference(x)
+
+    ref_out = torch.ops.aten._logcumsumexp(ref_x, 0)
+    res_out = flag_gems._logcumsumexp(x, 0)
+    ref_on_dev = ref_out.to(res_out.device)
+
+    # The branch structure is compared exactly; finite prefixes only need fp32
+    # rounding agreement.
+    assert torch.isnan(res_out).equal(torch.isnan(ref_on_dev))
+    assert torch.isinf(res_out.real).equal(torch.isinf(ref_on_dev.real))
+    assert torch.isinf(res_out.imag).equal(torch.isinf(ref_on_dev.imag))
+    if not utils.TO_CPU:
+        _assert_complex_scan_close(res_out, ref_on_dev)

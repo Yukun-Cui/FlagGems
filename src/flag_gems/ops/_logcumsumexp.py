@@ -264,6 +264,106 @@ def _logcumsumexp_fanin_kernel(
 
 @libentry()
 @triton.jit
+def _logcumsumexp_complex_chunk_kernel(
+    inp,
+    out,
+    chunk_total_r,
+    chunk_total_i,
+    N,
+    K,
+    num_chunks,
+    CHUNK: tl.constexpr,
+    IS_FP64: tl.constexpr,
+    REAL_INPUT: tl.constexpr,
+):
+    """Complex counterpart of :func:`_logcumsumexp_chunk_kernel`.
+
+    The chunked path needs its own complex kernel: ``out`` is the real view
+    ``(..., 2)`` here, so running the *real* chunk kernels over that buffer would
+    scan the interleaved re/im parts as independent real numbers and produce
+    garbage (complex64 N=8192 disagreed with ATen by ~9.6, complex128 N=5000 by
+    ~5.5e5). Each chunk therefore scans pairs through ``_complex_logaddexp``.
+    """
+    pid_r = tle.program_id(0)
+    pid_j = tle.program_id(1)
+    base = _row_base(pid_r, N, K)
+
+    offsets = pid_j * CHUNK + tl.arange(0, CHUNK)
+    mask = offsets < N
+    src = base + offsets * K
+    dst = src * 2
+    if REAL_INPUT:
+        xr = tl.load(inp + src, mask=mask, other=0)
+        xi = xr * 0.0
+    else:
+        xr = tl.load(inp + dst, mask=mask, other=0)
+        xi = tl.load(inp + dst + 1, mask=mask, other=0)
+    if IS_FP64:
+        xr = xr.to(tl.float64)
+        xi = xi.to(tl.float64)
+    else:
+        xr = xr.to(tl.float32)
+        xi = xi.to(tl.float32)
+    # (-inf, 0) is an identity of ``_complex_logaddexp`` on both sides: it is
+    # ordered last by real part, so the generic branch gives
+    # ``hi + log1p(exp(lo - hi)) == hi`` exactly, and the +-inf branch returns
+    # ``lo`` verbatim. Padding is therefore invisible to the scan.
+    xr = tl.where(mask, xr, float("-inf"))
+    xi = tl.where(mask, xi, 0.0)
+
+    res_r, res_i = tl.associative_scan((xr, xi), 0, _complex_logaddexp)
+    tl.store(out + dst, res_r.to(out.dtype.element_ty), mask=mask)
+    tl.store(out + dst + 1, res_i.to(out.dtype.element_ty), mask=mask)
+    # Same masked-sum extraction of the last lane as the real chunk kernel: a
+    # ``tl.max`` would drop the NaN state (and pick the wrong branch) at the
+    # chunk boundary. The tail chunk's padding lane makes this total useless,
+    # but the fan-in never reads the last chunk's total.
+    last_lane_mask = tl.arange(0, CHUNK) == (CHUNK - 1)
+    total_r = tl.sum(tl.where(last_lane_mask, res_r, 0.0), axis=0)
+    total_i = tl.sum(tl.where(last_lane_mask, res_i, 0.0), axis=0)
+    tl.store(chunk_total_r + pid_r * num_chunks + pid_j, total_r)
+    tl.store(chunk_total_i + pid_r * num_chunks + pid_j, total_i)
+
+
+@libentry()
+@triton.jit
+def _logcumsumexp_complex_fanin_kernel(
+    out,
+    chunk_total_r,
+    chunk_total_i,
+    N,
+    K,
+    num_chunks,
+    CHUNK: tl.constexpr,
+    IS_FP64: tl.constexpr,
+):
+    """Shift each complex chunk by the complex logaddexp of the earlier chunks."""
+    pid_r = tle.program_id(0)
+    pid_j = tle.program_id(1)
+    base = _row_base(pid_r, N, K)
+    acc_ty = tl.float64 if IS_FP64 else tl.float32
+
+    carry_r = tl.full((), float("-inf"), dtype=acc_ty)
+    carry_i = tl.zeros((), dtype=acc_ty)
+    for j in range(0, pid_j):
+        tr = tl.load(chunk_total_r + pid_r * num_chunks + j).to(acc_ty)
+        ti = tl.load(chunk_total_i + pid_r * num_chunks + j).to(acc_ty)
+        carry_r, carry_i = _complex_logaddexp(carry_r, carry_i, tr, ti)
+
+    offsets = pid_j * CHUNK + tl.arange(0, CHUNK)
+    mask = offsets < N
+    dst = (base + offsets * K) * 2
+    res_r = tl.load(out + dst, mask=mask, other=0).to(acc_ty)
+    res_i = tl.load(out + dst + 1, mask=mask, other=0).to(acc_ty)
+    res_r = tl.where(mask, res_r, float("-inf"))
+    res_i = tl.where(mask, res_i, 0.0)
+    sh_r, sh_i = _complex_logaddexp(carry_r, carry_i, res_r, res_i)
+    tl.store(out + dst, sh_r.to(out.dtype.element_ty), mask=mask)
+    tl.store(out + dst + 1, sh_i.to(out.dtype.element_ty), mask=mask)
+
+
+@libentry()
+@triton.jit
 def _logcumsumexp_complex_kernel(
     inp,
     out,
@@ -346,8 +446,17 @@ _MAX_SINGLE_BLOCK = 4096
 # width, and the inter-chunk carry is applied by a second pass.
 _CHUNK_ELEMS = 4096
 
+# The complex chunked path uses a narrower tile: the complex combine's compile
+# time grows much more steeply with the block width than the real one's (~20 s
+# at 1024 vs ~100 s at 4096, measured on H20), and the smaller tile is also
+# slightly faster to run (0.0003 s vs 0.0006 s warm at N=16384). The real path
+# keeps the wide tile because there the compile is ~1 s either way.
+_CHUNK_ELEMS_COMPLEX = 1024
 
-def _chunked_scan(src_view, dst_view, N, K, M, acc_is_fp64, inp):
+
+def _chunked_scan(
+    src_view, dst_view, N, K, M, acc_is_fp64, inp, is_complex, real_input
+):
     """Two-pass chunked scan for rows longer than ``_MAX_SINGLE_BLOCK``.
 
     Pass 1 scans every chunk independently and records each chunk's running
@@ -359,15 +468,54 @@ def _chunked_scan(src_view, dst_view, N, K, M, acc_is_fp64, inp):
     The scanned rows are the ``M*K`` pairs of the (M, N, K) factorization, so
     the grid's first axis is that product and each program derives its own row
     base from it.
+
+    Complex inputs need the complex kernels: ``dst_view`` is then the ``(..., 2)``
+    real view, and the real kernels would scan the interleaved re/im parts as
+    independent real numbers instead of combining complex pairs.
     """
     rows = M * K
-    chunk = min(_CHUNK_ELEMS, triton.next_power_of_2(N))
+    chunk = min(
+        _CHUNK_ELEMS_COMPLEX if is_complex else _CHUNK_ELEMS,
+        triton.next_power_of_2(N),
+    )
     num_chunks = triton.cdiv(N, chunk)
     total_dtype = torch.float64 if acc_is_fp64 else torch.float32
     chunk_total = torch.empty(rows, num_chunks, dtype=total_dtype, device=inp.device)
 
     warps = 8 if chunk > 2048 else 4
     with torch_device_fn.device(inp.device):
+        if is_complex:
+            # The imaginary totals are a separate buffer rather than a second
+            # row of ``chunk_total``: the two are consumed as distinct kernel
+            # arguments by the fan-in.
+            chunk_total_i = torch.empty(
+                rows, num_chunks, dtype=total_dtype, device=inp.device
+            )
+            _logcumsumexp_complex_chunk_kernel[(rows, num_chunks)](
+                src_view,
+                dst_view,
+                chunk_total,
+                chunk_total_i,
+                N,
+                K,
+                num_chunks,
+                CHUNK=chunk,
+                IS_FP64=acc_is_fp64,
+                REAL_INPUT=real_input,
+                num_warps=warps,
+            )
+            _logcumsumexp_complex_fanin_kernel[(rows, num_chunks)](
+                dst_view,
+                chunk_total,
+                chunk_total_i,
+                N,
+                K,
+                num_chunks,
+                CHUNK=chunk,
+                IS_FP64=acc_is_fp64,
+                num_warps=warps,
+            )
+            return
         _logcumsumexp_chunk_kernel[(rows, num_chunks)](
             src_view,
             dst_view,
@@ -457,7 +605,17 @@ def _logcumsumexp_wrapper(inp, dim=1, dtype=None, out=None):
     # are split into fixed-size chunks instead -- the row length then only
     # selects the grid, not the compiled tile.
     if N > _MAX_SINGLE_BLOCK:
-        _chunked_scan(src_view, dst_view, N, K, M, acc_is_fp64, inp)
+        _chunked_scan(
+            src_view,
+            dst_view,
+            N,
+            K,
+            M,
+            acc_is_fp64,
+            inp,
+            is_complex,
+            not inp.is_complex(),
+        )
     else:
         BLOCK_SIZE = triton.next_power_of_2(N)
         num_warps = 8 if BLOCK_SIZE > 2048 else 4
