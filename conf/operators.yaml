@@ -10293,7 +10293,7 @@ ops:
   kind:
   - Tensor
   stages:
-  - alpha: '5.4'
+  - alpha: '5.5'
 - id: quantile
   description: Computes the q-th quantiles of each row of the `input` tensor along
     the dimension `dim`.
