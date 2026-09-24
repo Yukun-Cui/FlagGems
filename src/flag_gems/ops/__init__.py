@@ -914,6 +914,7 @@ from flag_gems.ops.quantize_per_tensor import (
 from flag_gems.ops.quantized_batch_norm import (
     quantized_batch_norm,
     quantized_batch_norm_out,
+)
 from flag_gems.ops.quantized_gru import (
     quantized_gru_data,
     quantized_gru_impl,
