@@ -910,6 +910,7 @@ from flag_gems.ops.quantile import quantile
 from flag_gems.ops.quantize_per_channel import (
     quantize_per_channel,
     quantize_per_channel_out,
+)
 from flag_gems.ops.quantize_per_tensor import (
     quantize_per_tensor,
     quantize_per_tensor_out,
