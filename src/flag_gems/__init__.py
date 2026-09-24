@@ -282,6 +282,7 @@ _FULL_CONFIG = (
     ("_nested_view_from_jagged", _nested_view_from_jagged),
     ("_nested_view_from_jagged_copy", _nested_view_from_jagged_copy),
     ("_pad_circular", _pad_circular, None, ["CompositeImplicitAutograd"]),
+    ("_pad_enum", _pad_enum),
     ("_pad_packed_sequence", _pad_packed_sequence),
     ("_padded_dense_to_jagged_forward", _padded_dense_to_jagged_forward),
     ("_pdist_backward", _pdist_backward),
@@ -331,6 +332,7 @@ _FULL_CONFIG = (
         _scaled_dot_product_fused_attention_overrideable,
     ),
     ("_scaled_grouped_mm", scaled_grouped_mm, lambda: torch_ge("2.8")),
+    ("_scaled_grouped_mm_v2", _scaled_grouped_mm_v2),
     ("_scaled_mm", scaled_mm, lambda: torch_ge("2.5")),
     ("_scaled_mm.out", scaled_mm_out, lambda: torch_ge("2.5")),
     ("_segment_reduce_backward", _segment_reduce_backward),
@@ -852,6 +854,8 @@ _FULL_CONFIG = (
     ("hamming_window.periodic_alpha_beta", hamming_window_periodic_alpha_beta),
     ("hardshrink", hardshrink),
     ("hardshrink.out", hardshrink_out),
+    ("hardshrink_backward", hardshrink_backward),
+    ("hardshrink_backward.grad_input", hardshrink_backward_grad_input),
     ("hardsigmoid", hardsigmoid),
     ("hardsigmoid.out", hardsigmoid_out),
     ("hardsigmoid_", hardsigmoid_),
@@ -904,6 +908,10 @@ _FULL_CONFIG = (
     ("index_reduce_", index_reduce_),
     ("index_select", index_select),
     ("index_select_backward", index_select_backward),
+    (
+        "infinitely_differentiable_gelu_backward",
+        infinitely_differentiable_gelu_backward,
+    ),
     ("inner", inner),
     ("inverse", inverse),
     ("is_nonzero", is_nonzero),
@@ -924,6 +932,7 @@ _FULL_CONFIG = (
     ("kaiser_window.periodic", kaiser_window_periodic),
     ("kron", kron),
     ("kthvalue", kthvalue),
+    ("l1_loss", l1_loss),
     ("lcm", lcm),
     ("lcm_", lcm_),
     ("ldexp.out", ldexp_out),
@@ -1015,6 +1024,7 @@ _FULL_CONFIG = (
     ("linalg_qr.out", linalg_qr_out),
     ("linalg_slogdet", linalg_slogdet),
     ("linalg_solve", linalg_solve),
+    ("linalg_solve_ex", linalg_solve_ex),
     ("linalg_solve_triangular", linalg_solve_triangular),
     ("linalg_solve_triangular.out", linalg_solve_triangular_out),
     ("linalg_svd", linalg_svd),
@@ -1175,6 +1185,15 @@ _FULL_CONFIG = (
     ("neg_", neg_),
     ("negative", negative),
     ("negative_", negative_),
+    # nested_to_padded_tensor is a CompositeImplicitAutograd op; it decomposes before
+    # reaching the backend key, so we must also register the CompositeImplicitAutograd
+    # key for use_gems() to intercept it instead of silently running the decomposition.
+    (
+        "nested_to_padded_tensor",
+        nested_to_padded_tensor,
+        None,
+        ["CompositeImplicitAutograd"],
+    ),
     ("new_full", new_full),
     ("new_ones", new_ones),
     ("nextafter", nextafter),
@@ -1315,6 +1334,7 @@ _FULL_CONFIG = (
     ("reflection_pad3d_backward", reflection_pad3d_backward),
     ("relu", relu),
     ("relu6", relu6),
+    ("relu6_", relu6_),
     ("relu_", relu_),
     ("remainder", remainder),
     ("remainder.Scalar", remainder),
@@ -1429,6 +1449,7 @@ _FULL_CONFIG = (
     ("softplus_backward", softplus_backward),
     ("softshrink", softshrink),
     ("softshrink.out", softshrink_out),
+    ("softshrink_backward", softshrink_backward),
     ("sort", sort),
     ("sort.stable", sort_stable),
     ("sparse_sampled_addmm", sparse_sampled_addmm, None, (SPARSE_CSR_DISPATCH_KEY,)),
@@ -1703,10 +1724,12 @@ for _item in _FULL_CONFIG:
 
 # Friendly names for only_enable(include=[...]) when the registered impl is *.out
 for _alias, _target in (
+    ("_philox_normal_", _philox_normal_),
     ("softmax", "softmax_out"),
     ("softmax_backward", "softmax_backward_out"),
     ("log_softmax", "log_softmax_out"),
     ("log_softmax_backward", "log_softmax_backward_out"),
+    ("rrelu_", rrelu_),
 ):
     if _target in FULL_CONFIG_BY_FUNC:
         FULL_CONFIG_BY_FUNC.setdefault(_alias, []).extend(FULL_CONFIG_BY_FUNC[_target])

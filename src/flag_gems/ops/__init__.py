@@ -153,9 +153,11 @@ from flag_gems.ops._nested_view_from_buffer_copy import _nested_view_from_buffer
 from flag_gems.ops._nested_view_from_jagged import _nested_view_from_jagged
 from flag_gems.ops._nested_view_from_jagged_copy import _nested_view_from_jagged_copy
 from flag_gems.ops._pad_circular import _pad_circular
+from flag_gems.ops._pad_enum import _pad_enum
 from flag_gems.ops._pad_packed_sequence import _pad_packed_sequence
 from flag_gems.ops._pdist_backward import _pdist_backward
 from flag_gems.ops._pdist_forward import _pdist_forward
+from flag_gems.ops._philox_normal_ import _philox_normal_
 from flag_gems.ops._pin_memory import _pin_memory
 from flag_gems.ops._prelu_kernel import _prelu_kernel
 from flag_gems.ops._prelu_kernel_backward import _prelu_kernel_backward
@@ -183,6 +185,7 @@ from flag_gems.ops._scaled_dot_product_flash_attention import (
 from flag_gems.ops._scaled_dot_product_fused_attention_overrideable import (
     _scaled_dot_product_fused_attention_overrideable,
 )
+from flag_gems.ops._scaled_grouped_mm_v2 import _scaled_grouped_mm_v2
 from flag_gems.ops._sobol_engine_ff_ import _sobol_engine_ff_
 from flag_gems.ops._sobol_engine_initialize_state_ import (
     _sobol_engine_initialize_state_,
@@ -602,6 +605,10 @@ from flag_gems.ops.hamming_window import (
     hamming_window_periodic_alpha_beta,
 )
 from flag_gems.ops.hardshrink import hardshrink, hardshrink_out
+from flag_gems.ops.hardshrink_backward import (
+    hardshrink_backward,
+    hardshrink_backward_grad_input,
+)
 from flag_gems.ops.hardsigmoid import hardsigmoid, hardsigmoid_out
 from flag_gems.ops.hardsigmoid_ import hardsigmoid_
 from flag_gems.ops.hardsigmoid_backward import hardsigmoid_backward
@@ -638,6 +645,9 @@ from flag_gems.ops.index_put import _index_put_impl_, index_put, index_put_
 from flag_gems.ops.index_reduce import index_reduce, index_reduce_, index_reduce_out
 from flag_gems.ops.index_select import index_select
 from flag_gems.ops.index_select_backward import index_select_backward
+from flag_gems.ops.infinitely_differentiable_gelu_backward import (
+    infinitely_differentiable_gelu_backward,
+)
 from flag_gems.ops.inner import inner
 from flag_gems.ops.int_mm import int_mm, int_mm_out
 from flag_gems.ops.inverse import inverse
@@ -659,6 +669,7 @@ from flag_gems.ops.kaiser_window import (
 )
 from flag_gems.ops.kron import kron
 from flag_gems.ops.kthvalue import kthvalue
+from flag_gems.ops.l1_loss import l1_loss
 from flag_gems.ops.layernorm import layer_norm, layer_norm_backward
 from flag_gems.ops.lcm import lcm, lcm_
 from flag_gems.ops.ldexp import ldexp, ldexp_out
@@ -721,6 +732,7 @@ from flag_gems.ops.linalg_polar import linalg_polar, linalg_polar_out
 from flag_gems.ops.linalg_qr import linalg_qr, linalg_qr_out
 from flag_gems.ops.linalg_slogdet import linalg_slogdet
 from flag_gems.ops.linalg_solve import linalg_solve
+from flag_gems.ops.linalg_solve_ex import linalg_solve_ex
 from flag_gems.ops.linalg_solve_triangular import (
     linalg_solve_triangular,
     linalg_solve_triangular_out,
@@ -856,6 +868,7 @@ from flag_gems.ops.ne_ import ne_, ne_scalar_
 from flag_gems.ops.neg import neg, neg_
 from flag_gems.ops.negative import negative
 from flag_gems.ops.negative_ import negative_
+from flag_gems.ops.nested_to_padded_tensor import nested_to_padded_tensor
 from flag_gems.ops.new_full import new_full
 from flag_gems.ops.new_ones import new_ones
 from flag_gems.ops.nextafter import nextafter, nextafter_
@@ -957,6 +970,7 @@ from flag_gems.ops.reflection_pad3d import reflection_pad3d, reflection_pad3d_ou
 from flag_gems.ops.reflection_pad3d_backward import reflection_pad3d_backward
 from flag_gems.ops.relu import relu, relu_
 from flag_gems.ops.relu6 import relu6
+from flag_gems.ops.relu6_ import relu6_
 from flag_gems.ops.remainder import remainder, remainder_
 from flag_gems.ops.renorm import renorm
 from flag_gems.ops.renorm_ import renorm_
@@ -989,6 +1003,7 @@ from flag_gems.ops.round import round, round_, round_out
 from flag_gems.ops.row_indices import row_indices
 from flag_gems.ops.row_indices_copy import row_indices_copy, row_indices_copy_out
 from flag_gems.ops.row_stack import row_stack, row_stack_out
+from flag_gems.ops.rrelu_ import rrelu_
 from flag_gems.ops.rrelu_with_noise import rrelu_with_noise, rrelu_with_noise_
 from flag_gems.ops.rrelu_with_noise_backward import rrelu_with_noise_backward
 from flag_gems.ops.rrelu_with_noise_functional import rrelu_with_noise_functional
@@ -1056,6 +1071,7 @@ from flag_gems.ops.softmax import (
 )
 from flag_gems.ops.softplus import softplus, softplus_backward
 from flag_gems.ops.softshrink import softshrink, softshrink_out
+from flag_gems.ops.softshrink_backward import softshrink_backward
 from flag_gems.ops.sort import sort, sort_stable
 from flag_gems.ops.sparse_sampled_addmm import (
     sparse_sampled_addmm,
@@ -1411,10 +1427,12 @@ __all__ = [
     "_nested_view_from_jagged",
     "_nested_view_from_jagged_copy",
     "_pad_circular",
+    "_pad_enum",
     "_pad_packed_sequence",
     "_padded_dense_to_jagged_forward",
     "_pdist_backward",
     "_pdist_forward",
+    "_philox_normal_",
     "_pin_memory",
     "_prelu_kernel",
     "_prelu_kernel_backward",
@@ -1430,6 +1448,7 @@ __all__ = [
     "_scaled_dot_product_efficient_attention",
     "_scaled_dot_product_flash_attention",
     "_scaled_dot_product_fused_attention_overrideable",
+    "_scaled_grouped_mm_v2",
     "_segment_reduce_backward",
     "_segment_reduce_backward_out",
     "_sobol_engine_ff_",
@@ -1874,6 +1893,8 @@ __all__ = [
     "hamming_window_periodic_alpha",
     "hamming_window_periodic_alpha_beta",
     "hardshrink",
+    "hardshrink_backward",
+    "hardshrink_backward_grad_input",
     "hardshrink_out",
     "hardsigmoid",
     "hardsigmoid_",
@@ -1924,6 +1945,7 @@ __all__ = [
     "index_reduce_out",
     "index_select",
     "index_select_backward",
+    "infinitely_differentiable_gelu_backward",
     "inner",
     "int_mm",
     "int_mm_out",
@@ -1945,6 +1967,7 @@ __all__ = [
     "kaiser_window_periodic",
     "kron",
     "kthvalue",
+    "l1_loss",
     "layer_norm",
     "layer_norm_backward",
     "lcm",
@@ -2022,6 +2045,7 @@ __all__ = [
     "linalg_qr_out",
     "linalg_slogdet",
     "linalg_solve",
+    "linalg_solve_ex",
     "linalg_solve_triangular",
     "linalg_solve_triangular_out",
     "linalg_svd",
@@ -2173,6 +2197,7 @@ __all__ = [
     "neg_",
     "negative",
     "negative_",
+    "nested_to_padded_tensor",
     "new_full",
     "new_ones",
     "nextafter",
@@ -2275,6 +2300,7 @@ __all__ = [
     "reflection_pad3d_out",
     "relu",
     "relu6",
+    "relu6_",
     "relu_",
     "remainder",
     "remainder_",
@@ -2317,6 +2343,7 @@ __all__ = [
     "row_indices_copy_out",
     "row_stack",
     "row_stack_out",
+    "rrelu_",
     "rrelu_with_noise",
     "rrelu_with_noise_",
     "rrelu_with_noise_backward",
@@ -2398,6 +2425,7 @@ __all__ = [
     "softplus",
     "softplus_backward",
     "softshrink",
+    "softshrink_backward",
     "softshrink_out",
     "sort",
     "sort_stable",
