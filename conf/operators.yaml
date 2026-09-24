@@ -7385,7 +7385,7 @@ ops:
   - Reduction
   stages:
   - alpha: '5.5'
-- id: histogramdd_from_bin_cts  
+- id: histogramdd_from_bin_cts
   description: 'Computes a multi-dimensional histogram of the values in a tensor using a
     sequence of per-dimension bin counts (equal-width bins).
 
