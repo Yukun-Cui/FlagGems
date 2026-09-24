@@ -12790,17 +12790,18 @@ ops:
   stages:
   - alpha: '5.5'
 - id: quantized_gru
-  description: |
-    Quantizes a float32 tensor to a quantized tensor (torch.quint8 / qint8 / qint32)
-    with the given scale and zero point, using round-half-to-even rounding and
-    clamping to the representable integer range.
+  description: 'Quantized GRU (Gated Recurrent Unit) implementation using Triton fused
+    gate kernel for efficient RNN inference.
+
+    '
   for:
-  - quantize_per_tensor
+  - quantized_gru.input
+  - quantized_gru.data
   labels:
   - aten
   - KernelGen
   kind:
-  - Math
+  - NeuralNetwork
   stages:
   - alpha: '5.5'
 - id: quantized_lstm
