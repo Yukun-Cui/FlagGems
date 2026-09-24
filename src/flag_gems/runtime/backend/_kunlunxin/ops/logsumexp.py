@@ -19,19 +19,18 @@ import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import dim_compress, libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-# Redispatch key used to reach PyTorch's native (vendor) logsumexp. On this XPU
-# the vendor's fused logsumexp kernel beats any Triton path we can express for a
-# middle-dim (K>1) reduction (see the module docstring / solution doc), so the
-# K>1 branch defers to it instead of materializing a slow transpose copy.
-_FALLBACK_KEYSET = torch._C.DispatchKeySet(
-    torch._C.DispatchKey.CompositeImplicitAutograd
-)
-
+# 2026-09-14: the K>1 / N==1 / multi-dim branches used to redispatch to the
+# native (vendor) logsumexp. That is banned for metric integrity -- under the
+# official benchmark (dim=1 over 3-D shapes) the gem *became* the reference
+# implementation, so its ratio was ~1.0 by construction (an artifact of how the
+# measurement was set up). They now go through a gems-side dim compression + the
+# contiguous inner-dim kernels.
+#
 # Inner-dim (K==1) reduction tiers:
 #  - N <= _MULTIROW_MAX_N:   one multirow tile kernel (N constexpr, block DMA,
 #    order-preserving uint32-key max). The uint32 key turns the XPU fp32
@@ -56,10 +55,16 @@ def logsumexp_kernel_multirow(
 ):
     """Reduce the innermost dim N for many rows per program.
 
-    Order-preserving uint32 key trick: float32 bits -> key = bits ^
-    (0x80000000 | (bits >> 31)) is strictly increasing (radix sort family), so
+    Order-preserving uint32 key trick: float32 bits -> key = bits | 0x80000000
+    for non-negative, key = ~bits (bits ^ 0xFFFFFFFF) for negative, is strictly
+    increasing (radix sort family: -inf < ... < -0 < +0 < ... < +inf), so
     `tl.max(key, axis=1)` finds the per-row max on the fast integer reduction
-    path. Decode with `bits = key ^ (0x80000000 | ((key >> 31) ^ 1))`.
+    path. Decode with bits = key ^ 0x80000000 (key >= 0x80000000, non-negative)
+    or bits = ~key = key ^ 0xFFFFFFFF (key < 0x80000000, negative).  A plain
+    XOR form `bits ^ (0x80000000 | (bits >> 31))` does NOT work here: on
+    uint32 the `>> 31` is a logical shift yielding 1, which maps negatives to
+    a *decreasing* key order (-inf gets the largest key) and mis-computes
+    every all-negative row.
 
     N is a constexpr so ``tl.arange(0, N)`` spans exactly [0, N) and the
     ``[TILE_M, N]`` tile is one stride-1 contiguous block -> block DMA on XPU
@@ -78,9 +83,15 @@ def logsumexp_kernel_multirow(
     else:
         inp = tl.load(input_ptr + offsets).to(tl.float32)
     bits = inp.to(tl.uint32, bitcast=True)
-    key = bits ^ (tl.full([TILE_M, N], 0x80000000, tl.uint32) | (bits >> 31))
+    # Order-preserving key via bit ops only -- a tile-wide `tl.where` here
+    # scalarizes (vselect expands to per-lane select chains) and costs ~40%
+    # end-to-end on this backend. The int32 arithmetic shift supplies the
+    # all-ones mask for negatives, giving the exact same encoding:
+    # non-negatives -> bits | 0x80000000, negatives -> ~bits.
+    neg = (bits.to(tl.int32, bitcast=True) >> 31).to(tl.uint32, bitcast=True)
+    key = bits ^ (0x80000000 | (neg & 0x7FFFFFFF))
     m_key = tl.max(key, axis=1)
-    bits_m = m_key ^ (tl.full([TILE_M], 0x80000000, tl.uint32) | ((m_key >> 31) ^ 1))
+    bits_m = tl.where(m_key < 0x80000000, m_key ^ 0xFFFFFFFF, m_key ^ 0x80000000)
     m = bits_m.to(tl.float32, bitcast=True)
     safe_m = tl.where(m == float("-inf"), 0.0, m)
     z = tl.sum(tl.exp(inp - safe_m[:, None]), axis=1)
@@ -90,6 +101,127 @@ def logsumexp_kernel_multirow(
         m == float("-inf"), m, tl.where(m == float("inf"), m, safe_m + tl.log(z))
     )
     tl.store(output_ptr + m_offsets, res, mask=m_mask)
+
+
+@libentry()
+@triton.jit
+def logsumexp_kernel_fused2(
+    output_ptr,
+    input_ptr,
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+    NEED_COLMASK: tl.constexpr,
+):
+    """Fused two-pass logsumexp for the fp32 inner-dim range (64 < N).
+
+    Used for fp32 (and any non-16-bit dtype) where a [TILE_M, N] tile exceeds
+    register capacity and the compiler spills it to local memory and re-reads
+    it for each reduction (3 reads/element -> ~190GB/s). Instead, both
+    reductions use the mean_dim-style persisted [BLOCK_M, BLOCK_N] fp32
+    accumulator:
+
+      - Pass 1 (max): elementwise ``tl.maximum`` accumulate over N in BLOCK_N
+        chunks + a single narrow ``tl.max`` reduce over BLOCK_N. Plain float
+        max here is as fast as ``tl.sum`` (~550GB/s at BLOCK_M=64/512) -- the
+        uint32-key trick is a *liability* in this structure (int key ops + the
+        old wide-row reduce are ~3.5x slower than plain float max), so it is
+        dropped.
+      - Pass 2 (exp-sum): elementwise ``z_acc += exp(a - safe_m)`` accumulate
+        + a single narrow reduce over BLOCK_N.
+
+    This reads each element from global memory twice (once per pass) instead
+    of three times, and never materializes the full [BLOCK_M, N] tile. At
+    BLOCK_M=64/BLOCK_N=512 this reaches ~0.32ms for [4096,4096] fp32 vs the
+    old ~0.53ms (per-op split: plain float max == plain sum == 550GB/s, exp is
+    the irreducible vexpf ~70Gelem/s cost).
+
+    Single-pass online variants are all worse on this backend for fp32:
+    elementwise online needs 2x exp (1.22ms), chunked-with-scalar-rescale
+    needs per-chunk wide reduces (~3 Gelem/s/reduce, 0.38ms). The two-pass
+    elementwise structure is the measured optimum here.
+    """
+    pid = ext.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    X = input_ptr + pid * N
+    row_mask = pid < M
+    # ---- Pass 1: max (plain float elementwise accumulate + narrow reduce) ----
+    m_acc = tl.full([BLOCK_M, BLOCK_N], float("-inf"), tl.float32)
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        mask = row_mask & (cols < N)
+        a = tl.load(X + cols, mask, other=-float("inf")).to(tl.float32)
+        m_acc = tl.maximum(m_acc, a)
+    m = tl.max(m_acc, axis=1)[:, None]
+    safe_m = tl.where(m == float("-inf"), 0.0, m)
+    # ---- Pass 2: exp-sum (elementwise accumulate + narrow reduce) ----
+    z_acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        mask = row_mask & (cols < N)
+        a = tl.load(X + cols, mask, other=-float("inf")).to(tl.float32)
+        z_acc += tl.exp(a - safe_m)
+    z = tl.sum(z_acc, axis=1)[:, None]
+    res = tl.where(
+        m == float("-inf"),
+        m,
+        tl.where(m == float("inf"), m, safe_m + tl.log(z)),
+    )
+    tl.store(output_ptr + pid, res, row_mask)
+
+
+@libentry()
+@triton.jit
+def logsumexp_kernel_chunked(
+    output_ptr,
+    input_ptr,
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+    NEED_COLMASK: tl.constexpr,
+):
+    """Single-read online logsumexp for fp16/bf16, 64 < N <= _MULTIROW_MAX_N.
+
+    For the 2-byte dtypes the fused two-pass kernel re-reads and re-converts
+    the data (fp16/bf16 -> fp32) a second time, and that extra convert+read
+    costs more than a single pass with per-chunk wide reduces. This variant
+    reads each element from global memory exactly once:
+
+      per chunk: m_c = max(a, axis=1)  (wide reduce over BLOCK_N)
+                 z_c = sum(exp(a - m_new), axis=1)
+                 online scalar rescale per row (z_row * exp(m_row - m_new))
+      final:     out = m + log(z)
+
+    The per-chunk wide reduce is cheap relative to the fp16/bf16 memory saved:
+    measured [1024,1024] fp16 0.70 vs fused2 0.49, [4096,4096] fp16 0.44 vs
+    0.37, bf16 0.70/0.45 vs 0.45/0.31. For fp32 (4-byte) the wide reduce cost
+    outweighs the single-read saving, so fp32 keeps the fused two-pass kernel.
+    """
+    pid = ext.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    X = input_ptr + pid * N
+    row_mask = pid < M
+    m_row = tl.full([BLOCK_M, 1], float("-inf"), tl.float32)
+    z_row = tl.full([BLOCK_M, 1], 0.0, tl.float32)
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        mask = row_mask & (cols < N)
+        a = tl.load(X + cols, mask, other=-float("inf")).to(tl.float32)
+        m_c = tl.max(a, axis=1)[:, None]
+        m_new = tl.maximum(m_row, m_c)
+        z_c = tl.sum(tl.exp(a - m_new), axis=1)[:, None]
+        all_neg = m_new == float("-inf")
+        z_row = tl.where(all_neg, z_row, z_row * tl.exp(m_row - m_new) + z_c)
+        m_row = m_new
+    safe_m = tl.where(m_row == float("-inf"), 0.0, m_row)
+    res = tl.where(
+        m_row == float("-inf"),
+        m_row,
+        tl.where(m_row == float("inf"), m_row, safe_m + tl.log(z_row)),
+    )
+    tl.store(output_ptr + pid, res, row_mask)
 
 
 @libentry()
@@ -124,9 +256,11 @@ def logsumexp_kernel_partial(
     else:
         a = tl.load(input_ptr + offsets).to(tl.float32)
     bits = a.to(tl.uint32, bitcast=True)
-    key = bits ^ (tl.full([TILE_R, BN], 0x80000000, tl.uint32) | (bits >> 31))
+    # Same select-free key construction as `logsumexp_kernel_multirow`.
+    neg = (bits.to(tl.int32, bitcast=True) >> 31).to(tl.uint32, bitcast=True)
+    key = bits ^ (0x80000000 | (neg & 0x7FFFFFFF))
     m_key = tl.max(key, axis=1)
-    bits_m = m_key ^ (tl.full([TILE_R], 0x80000000, tl.uint32) | ((m_key >> 31) ^ 1))
+    bits_m = tl.where(m_key < 0x80000000, m_key ^ 0xFFFFFFFF, m_key ^ 0x80000000)
     m = bits_m.to(tl.float32, bitcast=True)
     safe_m = tl.where(m == float("-inf"), 0.0, m)
     z = tl.sum(tl.exp(a - safe_m[:, None]), axis=1)
@@ -213,27 +347,69 @@ def logsumexp_kernel_tail_partials(
 
 
 def _reduce_inner_small(inp, rows, N, out):
-    """Single-tile multirow kernel for N <= _MULTIROW_MAX_N."""
+    """Inner-dim reduction for N <= _MULTIROW_MAX_N.
+
+    N <= 64 keeps the uint32-key multirow kernel (measured 1.0x for the small
+    [64,64] official shape; the other kernels are ~0.88x there). 64 < N splits
+    by dtype: fp32 -> fused two-pass (persisted fp32 accumulator + narrow
+    reduce), fp16/bf16 -> single-read chunked online. Both beat the multirow
+    kernel for every larger N we measured: [256,256] 0.83, [512,512] 0.85,
+    [1024,1024] 0.67 vs 0.46, [4096,4096] 0.50 vs 0.29 (fp32 fused2; fp16/bf16
+    chunked ~0.42-0.44 on [4096,4096]).
+    """
     if N <= 64:
         TILE_M = 16
-    elif N <= 256:
-        TILE_M = 64
-    elif N <= 1024:
-        TILE_M = 32
+        need_mask = 1 if rows % TILE_M else 0
+        grid = (triton.cdiv(rows, TILE_M), 1, 1)
+        logsumexp_kernel_multirow[grid](
+            out,
+            inp,
+            rows,
+            N=N,
+            TILE_M=TILE_M,
+            NEED_MASK=need_mask,
+            num_warps=4,
+            buffer_size_limit=2048,
+        )
+        return
+    # Fused two-pass (fp32) or single-read chunked (fp16/bf16):
+    # BLOCK_M=64 saturates the device for grid>=64 (verified 550GB/s on
+    # plain-sum at BM=64/BN=512); BLOCK_N=min(next_pow2(N), 512) keeps the
+    # [64,512] persisted accumulator at the register/LM sweet spot (BN=1024
+    # measured ~0.1ms slower per pass). fp16/bf16 use the single-read chunked
+    # kernel because their re-conversion in the two-pass kernel costs more
+    # than the wide-reduce overhead of one pass.
+    BLOCK_M = 64
+    BLOCK_N = min(triton.next_power_of_2(N), 512)
+    need_mask = 1 if rows % BLOCK_M else 0
+    need_colmask = 1 if N % BLOCK_N else 0
+    grid = (triton.cdiv(rows, BLOCK_M), 1, 1)
+    if inp.dtype in (torch.float16, torch.bfloat16):
+        logsumexp_kernel_chunked[grid](
+            out,
+            inp,
+            rows,
+            N,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            NEED_MASK=need_mask,
+            NEED_COLMASK=need_colmask,
+            num_warps=4,
+            buffer_size_limit=2048,
+        )
     else:
-        TILE_M = 8
-    need_mask = 1 if rows % TILE_M else 0
-    grid = (triton.cdiv(rows, TILE_M), 1, 1)
-    logsumexp_kernel_multirow[grid](
-        out,
-        inp,
-        rows,
-        N=N,
-        TILE_M=TILE_M,
-        NEED_MASK=need_mask,
-        num_warps=4,
-        buffer_size_limit=2048,
-    )
+        logsumexp_kernel_fused2[grid](
+            out,
+            inp,
+            rows,
+            N,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            NEED_MASK=need_mask,
+            NEED_COLMASK=need_colmask,
+            num_warps=4,
+            buffer_size_limit=2048,
+        )
 
 
 def _reduce_tail_partials(mrow, zrow, inp, rows, row_stride, tail_n):
@@ -276,10 +452,10 @@ def _reduce_inner(inp, rows, N):
             R = rows * C_full
             TILE_R = 32
             need_mask = 1 if R % TILE_R else 0
-            full_view = torch.ops.aten.slice(inp, 1, 0, C_full * BN)
+            full_view = inp[:, : C_full * BN]
             # reshape may copy only when the slice is non-contiguous (tail
             # cases with N % BN != 0); the aligned path is a null-op view.
-            flat = torch.ops.aten.reshape(full_view, (R, BN))
+            flat = full_view.reshape(R, BN)
             grid = (triton.cdiv(R, TILE_R), 1, 1)
             logsumexp_kernel_partial[grid](
                 mrow,
@@ -310,7 +486,7 @@ def _reduce_inner(inp, rows, N):
             zrow = torch.zeros((rows, TILE_C), dtype=torch.float32, device=inp.device)
         if TAIL:
             # tail slice view: [rows, TAIL] strided by N (no copy)
-            tail_view = torch.ops.aten.slice(inp, 1, C_full * BN, N)
+            tail_view = inp[:, C_full * BN : N]
             mtail = torch.empty((rows,), dtype=torch.float32, device=inp.device)
             ztail = torch.empty_like(mtail)
             _reduce_tail_partials(mtail, ztail, tail_view, rows, N, TAIL)
@@ -334,11 +510,35 @@ def _reduce_inner(inp, rows, N):
     return out
 
 
-def _native_logsumexp(inp, dim, keepdim):
-    """Reach PyTorch's native (vendor) logsumexp, bypassing the gems override."""
-    return torch.ops.aten.logsumexp.default.redispatch(
-        _FALLBACK_KEYSET, inp, dim, keepdim
-    )
+def _reduce_middle(inp, dim, keepdim):
+    """Reduce a non-innermost dim with the gems' own machinery.
+
+    The reduced dim is compressed innermost (``dim_compress`` -> permute +
+    contiguous, materialized by the FlagGems copy_, never the vendor engine),
+    then the contiguous inner-dim kernels run as usual. Measured on
+    [64,512,512] fp32 dim=1: 0.61 ms vs torch 0.78 ms (~1.26x), where the old
+    native delegation reported 0.98 by construction.
+    """
+    N = inp.shape[dim]
+    perm = dim_compress(inp, dim)
+    M = perm.numel() // N
+    # _reduce_inner views its input as a contiguous [rows, N] matrix; the
+    # permuted tensor is contiguous, so the reshape is a free view. (Passing the
+    # N-D tensor directly made the N > _MULTIROW_MAX_N chunk-split path slice
+    # the wrong dim -> "shape [6000, 4096] is invalid for input of size
+    # 24599400" on [200, 40999, 3].)
+    out = _reduce_inner(perm.reshape(M, N), M, N)
+    shape = list(perm.shape)
+    shape[-1] = 1
+    out = out.view(shape)
+    order = [i for i in range(inp.ndim) if i != dim] + [dim]
+    inverse = [0] * inp.ndim
+    for pos, src in enumerate(order):
+        inverse[src] = pos
+    out = out.permute(inverse)
+    if not keepdim:
+        out = out.squeeze(dim=dim)
+    return out
 
 
 def logsumexp(inp, dim, keepdim=False):
@@ -349,9 +549,17 @@ def logsumexp(inp, dim, keepdim=False):
             # Empty dim list means no reduction, just return the input.
             return inp.clone()
         if len(dim) != 1:
-            # Multi-dim reduction: the vendor's native kernel beats a sequence
-            # of Triton reductions on this XPU.
-            return _native_logsumexp(inp, list(dim), keepdim)
+            # Multi-dim reduction: fold single-dim reductions (innermost
+            # first so the dim indices stay valid), same as the generic
+            # implementation.
+            sorted_dims = sorted([d % inp.ndim for d in dim], reverse=True)
+            result = inp
+            for d in sorted_dims:
+                result = logsumexp(result, d, keepdim=True)
+            if not keepdim:
+                for d in sorted(sorted_dims, reverse=True):
+                    result = result.squeeze(d)
+            return result
         dim = dim[0]
 
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
@@ -362,14 +570,11 @@ def logsumexp(inp, dim, keepdim=False):
     for i in range(dim + 1, inp.ndim):
         K *= inp.shape[i]
 
-    # Middle-dim reduction (K > 1) or a size-1 reduction: defer to the native
-    # vendor kernel. A Triton middle reduction on XPU is a dead end -- a physical
-    # transpose+contiguous can't reach the vendor's fast copy once gems overrides
-    # copy_, and a direct strided/discrete reduction either overflows uni_sram or
-    # mis-computes (2D axis=0 reduce here). N==1 is a trivial identity that
-    # the native kernel does faster than a gems copy.
+    # Middle-dim reduction (K > 1) or a size-1 reduction: compress the reduced
+    # dim innermost and use the contiguous inner-dim kernels (see the module
+    # header note on why the native redispatch was removed).
     if K > 1 or N == 1:
-        return _native_logsumexp(inp, [dim], keepdim)
+        return _reduce_middle(inp, dim, keepdim)
 
     # K == 1: innermost-dim reduction -> fast contiguous Triton kernels.
     M = 1
