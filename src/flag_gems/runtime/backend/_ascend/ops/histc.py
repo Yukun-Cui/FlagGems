@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 from triton.runtime import driver
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -100,12 +104,30 @@ def _reduce_hist_kernel(
     )
     totals = tl.sum(values, axis=0)
     store_offsets = tl.arange(0, BIN_BLOCK)
-    tl.store(out_ptr + store_offsets, totals.to(tl.float32), mask=store_offsets < bins)
+    # Store through the output's own dtype: forcing fp32 would round counts
+    # above 2**24 before they reach an integral output tensor.
+    tl.store(
+        out_ptr + store_offsets,
+        totals.to(out_ptr.dtype.element_ty),
+        mask=store_offsets < bins,
+    )
 
 
 def histc(inp, bins=100, min=0, max=0):
+    logger.debug("GEMS HISTC")
+    # Both kernels walk the input linearly, so a non-dense view (e.g. x[::2])
+    # would read the wrong elements and an expanded view could run past its
+    # storage.
+    inp = inp.contiguous()
+
     out = torch.empty((bins,), dtype=inp.dtype, device=inp.device)
     n_elements = inp.numel()
+    # ATen returns `bins` zeros for an empty input. Launching here would build a
+    # zero-sized grid (which aborts the process on Ascend) and call
+    # next_power_of_2(0).
+    if n_elements == 0:
+        return out.zero_()
+
     block = 128 if n_elements <= 4096 else 1024
     max_programs = driver.active.utils.get_device_properties(
         torch.npu.current_device()
