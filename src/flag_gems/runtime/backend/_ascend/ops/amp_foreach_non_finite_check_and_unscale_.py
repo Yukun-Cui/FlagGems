@@ -31,16 +31,16 @@ def _unscale_check_kernel(
     program_id = tl.program_id(0)
     block_start = program_id * BLOCK_SIZE
     program_stride = tl.num_programs(0) * BLOCK_SIZE
-    scale = tl.load(inv_scale_ptr)
-    if IS_FP16:
-        scale = scale.to(tl.float16)
+    # Keep inv_scale in fp32: narrowing it to fp16 perturbs inexact scales
+    # (e.g. 1/3) and diverges from ATen, which uses fp32 opmath.
+    scale = tl.load(inv_scale_ptr).to(tl.float32)
     found = 0
 
     while block_start < n_elements:
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-        y = x * scale
+        y = (x.to(tl.float32) * scale).to(x.dtype)
         tl.store(x_ptr + offsets, y, mask=mask)
         max_abs = tl.max(tl.abs(x), axis=0)
         if IS_FP16:
@@ -71,9 +71,9 @@ def _unscale_check_two_kernel(
 ):
     program_id = tl.program_id(0)
     program_stride = tl.num_programs(0) * BLOCK_SIZE
-    scale = tl.load(inv_scale_ptr)
-    if IS_FP16:
-        scale = scale.to(tl.float16)
+    # Keep inv_scale in fp32: narrowing it to fp16 perturbs inexact scales
+    # (e.g. 1/3) and diverges from ATen, which uses fp32 opmath.
+    scale = tl.load(inv_scale_ptr).to(tl.float32)
     found = 0
 
     block_start = program_id * BLOCK_SIZE
@@ -81,7 +81,7 @@ def _unscale_check_two_kernel(
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n0
         x = tl.load(x0_ptr + offsets, mask=mask, other=0.0)
-        tl.store(x0_ptr + offsets, x * scale, mask=mask)
+        tl.store(x0_ptr + offsets, (x.to(tl.float32) * scale).to(x.dtype), mask=mask)
         max_abs = tl.max(tl.abs(x), axis=0)
         if IS_FP16:
             finite_limit = tl.full((), 65504.0, tl.float16)
@@ -99,7 +99,7 @@ def _unscale_check_two_kernel(
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n1
         x = tl.load(x1_ptr + offsets, mask=mask, other=0.0)
-        tl.store(x1_ptr + offsets, x * scale, mask=mask)
+        tl.store(x1_ptr + offsets, (x.to(tl.float32) * scale).to(x.dtype), mask=mask)
         max_abs = tl.max(tl.abs(x), axis=0)
         if IS_FP16:
             finite_limit = tl.full((), 65504.0, tl.float16)
