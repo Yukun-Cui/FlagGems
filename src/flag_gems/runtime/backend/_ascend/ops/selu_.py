@@ -12,10 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 from triton.runtime import driver
+
+logger = logging.getLogger(__name__)
+
+_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 
 @triton.jit
@@ -43,7 +49,26 @@ def _selu_inplace_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
 
 def selu_(self):
+    logger.debug("GEMS SELU_")
+    # ATen dispatches selu_ to elu_, which only implements floating types;
+    # integral/bool inputs must raise rather than being computed in fp32 and
+    # silently written back in the original dtype.
+    if self.dtype not in _FLOAT_DTYPES:
+        raise RuntimeError(f"\"selu_\" not implemented for '{self.dtype}'")
+
+    # The kernel indexes storage linearly, so a non-dense view (e.g. x[::2])
+    # would update the wrong elements.
+    if not self.is_contiguous():
+        raise ValueError(
+            "selu_ Triton kernel currently supports only contiguous tensors."
+        )
+
     n_elements = self.numel()
+    # An empty tensor is a valid no-op for ATen, but a zero-sized grid aborts
+    # the process on Ascend (coreDim must not be 0).
+    if n_elements == 0:
+        return self
+
     properties = driver.active.utils.get_device_properties(torch.npu.current_device())
     if n_elements <= 4096:
         block_size = 1024
