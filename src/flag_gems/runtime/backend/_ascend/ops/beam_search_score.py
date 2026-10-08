@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 from triton.runtime.driver import driver
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -39,8 +43,27 @@ def _beam_search_score_kernel(
 
 
 def beam_search_score(log_probs, beam_scores):
-    out = torch.empty_like(log_probs)
+    logger.debug("GEMS BEAM_SEARCH_SCORE")
+    # Match the generic implementation's DEFAULT promotion: the result dtype is
+    # promote_types(log_probs, beam_scores), not simply the log_probs dtype.
+    out_dtype = torch.promote_types(log_probs.dtype, beam_scores.dtype)
+
+    # The kernel addresses rows as row * vocab_size, which assumes dense
+    # row-major storage for both inputs and the output.
+    log_probs = log_probs.contiguous()
+    beam_scores = beam_scores.contiguous()
+    if log_probs.dtype != out_dtype:
+        log_probs = log_probs.to(out_dtype)
+    if beam_scores.dtype != out_dtype:
+        beam_scores = beam_scores.to(out_dtype)
+
+    out = torch.empty(log_probs.shape, dtype=out_dtype, device=log_probs.device)
     vocab_size = log_probs.shape[-1]
+    # An empty input is valid; vocab_size == 0 would divide by zero below and a
+    # zero row count would produce a zero-sized grid.
+    if log_probs.numel() == 0:
+        return out
+
     n_rows = log_probs.numel() // vocab_size
     block_size = triton.next_power_of_2(vocab_size)
     properties = driver.active.utils.get_device_properties(torch.npu.current_device())
