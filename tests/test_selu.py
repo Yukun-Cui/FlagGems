@@ -63,25 +63,37 @@ def test_selu__empty(dtype):
     utils.gems_assert_close(res_out, ref_out, dtype)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="contiguity guard is specific to the Ascend kernel",
+)
 @pytest.mark.selu_
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_selu__non_contiguous_rejected(dtype):
     # A strided view would be traversed linearly by the kernel and corrupt
     # neighbouring elements, so it must be rejected instead.
+    from flag_gems.runtime.backend._ascend.ops import selu_ as ascend_selu_
+
     base = torch.randn(16, dtype=dtype, device=flag_gems.device)
     view = base[::2]
     assert not view.is_contiguous()
 
     with pytest.raises(ValueError):
-        flag_gems.runtime.backend._ascend.ops.selu_(view)
+        ascend_selu_(view)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="dtype validation is specific to the Ascend kernel",
+)
 @pytest.mark.selu_
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool])
 def test_selu__integral_rejected(dtype):
     # ATen's elu_ has no integral kernel; we must raise rather than compute in
     # fp32 and write the result back in the original dtype.
+    from flag_gems.runtime.backend._ascend.ops import selu_ as ascend_selu_
+
     inp = torch.ones(4, dtype=dtype, device=flag_gems.device)
 
     with pytest.raises(RuntimeError):
-        flag_gems.runtime.backend._ascend.ops.selu_(inp)
+        ascend_selu_(inp)
