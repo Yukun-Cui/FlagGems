@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -114,9 +118,43 @@ def batch_norm_no_update(
     momentum=0.1,
     eps=1e-05,
 ):
+    logger.debug("GEMS _BATCH_NORM_NO_UPDATE")
+    if input.dim() < 2:
+        raise RuntimeError(
+            f"_batch_norm_no_update expects at least a 2D input, got {input.dim()}D"
+        )
+
+    channels = input.shape[1]
+    # Validate the per-channel tensors up front: a short statistics tensor
+    # would otherwise be indexed out of bounds on the device instead of
+    # producing the deterministic shape error F.batch_norm raises.
+    for name, tensor in (
+        ("weight", weight),
+        ("bias", bias),
+        ("running_mean", running_mean),
+        ("running_var", running_var),
+    ):
+        if tensor is None:
+            continue
+        if tensor.dim() != 1 or tensor.numel() != channels:
+            raise RuntimeError(
+                f"{name} should contain {channels} elements not {tensor.numel()}"
+            )
+
+    # The kernels compute offsets for dense NCHW storage, so non-contiguous or
+    # channels-last inputs have to be staged through a contiguous buffer.
+    input = input.contiguous()
+
     output = torch.empty_like(input)
     batch_dim = input.shape[0]
-    channels = input.shape[1]
+    # An empty batch (or empty spatial extent) is valid for ATen BatchNorm, but
+    # the spatial_dim division below would fail and the grid would be empty.
+    if input.numel() == 0:
+        save_mean = torch.empty((0,), dtype=input.dtype, device=input.device)
+        save_var = torch.empty((0,), dtype=input.dtype, device=input.device)
+        reserved = torch.empty((0,), dtype=torch.uint8, device=input.device)
+        return output, save_mean, save_var, reserved
+
     spatial_dim = input.numel() // (batch_dim * channels)
     weight_arg = weight if weight is not None else input
     bias_arg = bias if bias is not None else input
