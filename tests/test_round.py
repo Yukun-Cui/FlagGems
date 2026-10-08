@@ -116,18 +116,23 @@ def test_round__empty(dtype):
     utils.gems_assert_equal(res_out, ref_out)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="contiguity guard is specific to the Ascend kernel",
+)
 @pytest.mark.round_
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_round__non_contiguous_rejected(dtype):
     # A strided view would be traversed linearly by the kernel and corrupt
     # neighbouring elements, so it must be rejected rather than silently wrong.
+    from flag_gems.runtime.backend._ascend.ops import round_ as ascend_round_
+
     base = torch.randn(16, dtype=dtype, device=flag_gems.device)
     view = base[::2]
     assert not view.is_contiguous()
 
-    with flag_gems.use_gems():
-        with pytest.raises(ValueError):
-            flag_gems.runtime.backend._ascend.ops.round_(view)
+    with pytest.raises(ValueError):
+        ascend_round_(view)
 
 
 @pytest.mark.round_out
