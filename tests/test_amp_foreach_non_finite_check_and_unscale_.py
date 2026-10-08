@@ -139,6 +139,10 @@ def test_amp_foreach_non_finite_check_and_unscale__nan(dtype):
     utils.gems_assert_equal(res_found_inf, ref_found_inf)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="FP32 opmath for the unscale is specific to the Ascend kernel",
+)
 @pytest.mark.amp_foreach_non_finite_check_and_unscale_
 @pytest.mark.parametrize("dtype", PRIMARY_FLOAT_DTYPES)
 @pytest.mark.parametrize("inv_scale_value", [1.0 / 3.0, 1.0 / 7.0, 0.1])
@@ -151,6 +155,10 @@ def test_amp_foreach_non_finite_check_and_unscale__inexact_scale(
     values such as 1/3; the other cases all use 2.0, which is exact in FP16
     and therefore hides the difference.
     """
+    from flag_gems.runtime.backend._ascend.ops import (
+        _amp_foreach_non_finite_check_and_unscale_ as ascend_unscale_,
+    )
+
     inv_scale = torch.tensor(
         inv_scale_value, device=flag_gems.device, dtype=torch.float32
     )
@@ -170,10 +178,7 @@ def test_amp_foreach_non_finite_check_and_unscale__inexact_scale(
 
     res_tensors = [t.clone() for t in tensors]
     res_found_inf = found_inf.clone()
-    with flag_gems.use_gems():
-        getattr(torch, "_amp_foreach_non_finite_check_and_unscale_")(
-            res_tensors, res_found_inf, inv_scale
-        )
+    ascend_unscale_(res_tensors, res_found_inf, inv_scale)
 
     # Compared exactly, not with gems_assert_close: FP32 opmath reproduces
     # ATen bit-for-bit, while an FP16-narrowed scale is off by ~1e-3 relative,
