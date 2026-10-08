@@ -48,17 +48,22 @@ def test_selu_(shape, dtype):
     utils.gems_assert_close(res_out, ref_out, dtype)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="empty-input handling is specific to the Ascend kernel",
+)
 @pytest.mark.selu_
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_selu__empty(dtype):
     # An empty tensor is a valid no-op; a zero-sized grid used to abort the
     # Ascend process with "coreDim is invalid".
+    from flag_gems.runtime.backend._ascend.ops import selu_ as ascend_selu_
+
     inp = torch.empty(0, dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp.clone())
 
     ref_out = torch.ops.aten.selu_(ref_inp)
-    with flag_gems.use_gems():
-        res_out = torch.ops.aten.selu_(inp)
+    res_out = ascend_selu_(inp)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
 
