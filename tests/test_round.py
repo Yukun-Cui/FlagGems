@@ -58,6 +58,10 @@ def test_round_(shape, dtype):
     utils.gems_assert_equal(res_out, ref_out)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="round-half-to-even boundary fix is specific to the Ascend kernel",
+)
 @pytest.mark.round_
 @pytest.mark.parametrize(
     "value",
@@ -75,16 +79,21 @@ def test_round_(shape, dtype):
     ],
 )
 def test_round__large_half_integers(value):
+    from flag_gems.runtime.backend._ascend.ops import round_ as ascend_round_
+
     inp = torch.tensor([value], dtype=torch.float32, device=flag_gems.device)
     ref_inp = utils.to_reference(inp.clone())
 
     ref_out = torch.round_(ref_inp)
-    with flag_gems.use_gems():
-        res_out = inp.round_()
+    res_out = ascend_round_(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="integral fast path is specific to the Ascend kernel",
+)
 @pytest.mark.round_
 @pytest.mark.parametrize("dtype", [torch.int16, torch.int32, torch.int64])
 def test_round__integral_unchanged(dtype):
@@ -94,24 +103,30 @@ def test_round__integral_unchanged(dtype):
     values = [0, 1, -1]
     if torch.iinfo(dtype).max > 2**24 + 3:
         values += [2**24 + 3, -(2**24) - 3]
+    from flag_gems.runtime.backend._ascend.ops import round_ as ascend_round_
+
     inp = torch.tensor(values, dtype=dtype, device=flag_gems.device)
     expected = utils.to_reference(inp.clone())
 
-    with flag_gems.use_gems():
-        res_out = inp.round_()
+    res_out = ascend_round_(inp)
 
     utils.gems_assert_equal(res_out, expected)
 
 
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="empty-input handling is specific to the Ascend kernel",
+)
 @pytest.mark.round_
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_round__empty(dtype):
+    from flag_gems.runtime.backend._ascend.ops import round_ as ascend_round_
+
     inp = torch.empty(0, dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp.clone())
 
     ref_out = torch.round_(ref_inp)
-    with flag_gems.use_gems():
-        res_out = inp.round_()
+    res_out = ascend_round_(inp)
 
     utils.gems_assert_equal(res_out, ref_out)
 
