@@ -13474,7 +13474,7 @@ ops:
   - aten
   - KernelGen
   kind:
-  - Sparse
+  - Tensor
   stages:
   - alpha: '5.5'
 - id: mkldnn_rnn_layer
